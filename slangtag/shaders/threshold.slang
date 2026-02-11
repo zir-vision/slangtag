@@ -1,7 +1,7 @@
 
 
-void decimate(uint2 tid, Texture2D<uint1> input_texture,
-              RWTexture2D<uint1> decimated_texture)
+void decimate(uint2 tid, Texture2D<uint8_t1> input_texture,
+              RWTexture2D<uint8_t1> decimated_texture)
 {
     uint2 dim;
     input_texture.GetDimensions(dim.x, dim.y);
@@ -16,21 +16,21 @@ void decimate(uint2 tid, Texture2D<uint1> input_texture,
     }
 }
 
-uint2 minmax_row(uint4 row)
+uint8_t2 minmax_row(uint8_t4 row)
 {
-    uint min_val = min(min(row.x, row.y), min(row.z, row.w));
-    uint max_val = max(max(row.x, row.y), max(row.z, row.w));
-    return uint2(min_val, max_val);
+    uint8_t min_val = min(min(row.x, row.y), min(row.z, row.w));
+    uint8_t max_val = max(max(row.x, row.y), max(row.z, row.w));
+    return uint8_t2(min_val, max_val);
 }
 
-uint2 minmax_minmax(uint2 a, uint2 b)
+uint8_t2 minmax_minmax(uint8_t2 a, uint8_t2 b)
 {
-    return uint2(min(a.x, b.x), max(a.y, b.y));
+    return uint8_t2(min(a.x, b.x), max(a.y, b.y));
 }
 
 // [numthreads(16, 16, 1)]
-void minmax(uint2 tid, Texture2D<uint1> input_texture,
-            RWTexture2D<uint2> minmax_texture)
+void minmax(uint2 tid, Texture2D<uint8_t1> input_texture,
+            RWTexture2D<uint8_t2> minmax_texture)
 {
     uint2 dim;
     input_texture.GetDimensions(dim.x, dim.y);
@@ -38,11 +38,11 @@ void minmax(uint2 tid, Texture2D<uint1> input_texture,
     if (any(pixel >= dim))
         return;
 
-    uint2 vals[4];
+    uint8_t2 vals[4];
 
     for (int i = 0; i < 4; ++i)
     {
-        uint4 row = input_texture[(pixel * 4) + uint2(0, i)];
+        uint8_t4 row = input_texture[(pixel * 4) + uint2(0, i)];
         vals[i] = minmax_row(row);
     }
 
@@ -51,8 +51,8 @@ void minmax(uint2 tid, Texture2D<uint1> input_texture,
         minmax_minmax(vals[2], vals[3]));
 }
 
-void filter_minmax(uint2 tid, Texture2D<uint2> minmax_texture,
-                   RWTexture2D<uint2> filtered_texture)
+void filter_minmax(uint2 tid, Texture2D<uint8_t2> minmax_texture,
+                   RWTexture2D<uint8_t2> filtered_texture)
 {
     uint2 dim;
     minmax_texture.GetDimensions(dim.x, dim.y);
@@ -60,7 +60,7 @@ void filter_minmax(uint2 tid, Texture2D<uint2> minmax_texture,
     if (any(pixel >= dim))
         return;
 
-    uint2 result = uint2(255, 0);
+    uint8_t2 result = uint8_t2(255, 0);
 
     [ForceUnroll]
     for (int i = -1; i <= 1; ++i)
@@ -72,7 +72,7 @@ void filter_minmax(uint2 tid, Texture2D<uint2> minmax_texture,
             if (any(neighbor_pixel >= dim))
                 continue;
 
-            uint2 neighbor_minmax = minmax_texture[neighbor_pixel];
+            uint8_t2 neighbor_minmax = minmax_texture[neighbor_pixel];
 
             result = minmax_minmax(result, neighbor_minmax);
         }
@@ -82,9 +82,9 @@ void filter_minmax(uint2 tid, Texture2D<uint2> minmax_texture,
 }
 
 void threshold(uint2 tid,
-               Texture2D<uint1> decimated_texture,
-               Texture2D<uint2> filtered_texture,
-               RWTexture2D<uint1> thresholded_texture, uint min_white_black_diff)
+               Texture2D<uint8_t1> decimated_texture,
+               Texture2D<uint8_t2> filtered_texture,
+               RWTexture2D<uint8_t1> thresholded_texture, uint min_white_black_diff)
 {
     uint2 dim;
     decimated_texture.GetDimensions(dim.x, dim.y);
@@ -94,7 +94,7 @@ void threshold(uint2 tid,
 
     uint2 minmax = filtered_texture[pixel / 4];
 
-    uint result = 0;
+    uint8_t result = 0;
 
     if (minmax.y - minmax.x < min_white_black_diff)
     {
