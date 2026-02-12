@@ -16,6 +16,25 @@ def next_power_of_two(value: int) -> int:
     return 1 << (value - 1).bit_length()
 
 
+
+def crop_image_to_multiple(image: np.ndarray, multiple: int) -> np.ndarray:
+    height, width = image.shape[:2]
+    cropped_height = height - (height % multiple)
+    cropped_width = width - (width % multiple)
+    if cropped_height == 0 or cropped_width == 0:
+        raise ValueError(
+            f"input image {width}x{height} is too small for {multiple}x alignment"
+        )
+
+    if cropped_height != height or cropped_width != width:
+        print(
+            "cropping input image from "
+            f"{width}x{height} to {cropped_width}x{cropped_height} "
+            f"for {multiple}x alignment"
+        )
+
+    return image[:cropped_height, :cropped_width]
+
 def visualize_blob_extents(device, out_tex, blob_extents: np.ndarray, name_suffix: str = "") -> None:
     height = out_tex.height
     width = out_tex.width
@@ -185,6 +204,7 @@ module = spy.Module.load_from_file(device, "shaders/threshold.slang")
 
 img = cv2.imread(sys.argv[1])
 img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+img = crop_image_to_multiple(img, 8)
 
 tex = device.create_texture(
     width=img.shape[1],
@@ -245,8 +265,8 @@ spy.tev.show(decimated_tex, name="decimated")
 module.minmax(
     spy.grid(
         shape=(
-            decimated_tex.height,
-            decimated_tex.width,
+            unfiltered_minmax_tex.height,
+            unfiltered_minmax_tex.width,
         )
     ),
     decimated_tex,

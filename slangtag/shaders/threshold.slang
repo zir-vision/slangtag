@@ -33,7 +33,7 @@ void minmax(uint2 tid, Texture2D<uint8_t1> input_texture,
             RWTexture2D<uint8_t2> minmax_texture)
 {
     uint2 dim;
-    input_texture.GetDimensions(dim.x, dim.y);
+    minmax_texture.GetDimensions(dim.x, dim.y);
     uint2 pixel = tid.xy;
     if (any(pixel >= dim))
         return;
@@ -42,7 +42,12 @@ void minmax(uint2 tid, Texture2D<uint8_t1> input_texture,
 
     for (int i = 0; i < 4; ++i)
     {
-        uint8_t4 row = input_texture[(pixel * 4) + uint2(0, i)];
+        uint2 row_base = (pixel * 4) + uint2(0, i);
+        uint8_t4 row = uint8_t4(
+            input_texture[row_base + uint2(0, 0)].x,
+            input_texture[row_base + uint2(1, 0)].x,
+            input_texture[row_base + uint2(2, 0)].x,
+            input_texture[row_base + uint2(3, 0)].x);
         vals[i] = minmax_row(row);
     }
 
