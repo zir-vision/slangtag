@@ -3,6 +3,11 @@ import slangpy as spy
 import pathlib
 import numpy as np
 
+try:
+    from slangtag.decode_tags import decode_tags_from_fitted_quads
+except ImportError:
+    from decode_tags import decode_tags_from_fitted_quads
+
 
 def next_power_of_two(value: int) -> int:
     if value <= 1:
@@ -10,7 +15,7 @@ def next_power_of_two(value: int) -> int:
     return 1 << (value - 1).bit_length()
 
 
-def visualize_blob_extents(device, out_tex, blob_extents: np.ndarray) -> None:
+def visualize_blob_extents(device, out_tex, blob_extents: np.ndarray, name_suffix: str = "") -> None:
     height = out_tex.height
     width = out_tex.width
 
@@ -65,10 +70,10 @@ def visualize_blob_extents(device, out_tex, blob_extents: np.ndarray) -> None:
         usage=spy.TextureUsage.shader_resource,
         data=extent_coverage_u8,
     )
-    spy.tev.show(extent_coverage_tex, name="blob extent coverage")
+    spy.tev.show(extent_coverage_tex, name=f"blob extent coverage{name_suffix}")
     spy.tev.show(
         bitmap=spy.Bitmap(np.ascontiguousarray(overlay), spy.Bitmap.PixelFormat.rgb),
-        name="blob extents overlay",
+        name=f"blob extents overlay{name_suffix}",
     )
 
 
@@ -131,6 +136,40 @@ def visualize_quads(image_gray: np.ndarray, quads, name: str) -> None:
     )
 
 
+def visualize_decoded_tags(image_gray: np.ndarray, detections, name: str) -> None:
+    overlay = np.stack([image_gray, image_gray, image_gray], axis=-1).astype(np.uint8)
+    height, width = image_gray.shape
+    for i, detection in enumerate(detections):
+        corners = np.round(detection["corners"]).astype(np.int32)
+        corners[:, 0] = np.clip(corners[:, 0], 0, width - 1)
+        corners[:, 1] = np.clip(corners[:, 1], 0, height - 1)
+
+        color = (
+            int((29 * i) % 255 + 1),
+            int((89 * i) % 255 + 1),
+            int((149 * i) % 255 + 1),
+        )
+        cv2.polylines(overlay, [corners.reshape((-1, 1, 2))], True, color, 2, cv2.LINE_AA)
+
+        label = str(detection["id"])
+        anchor = tuple(corners[0].tolist())
+        cv2.putText(
+            overlay,
+            label,
+            anchor,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+    spy.tev.show(
+        bitmap=spy.Bitmap(np.ascontiguousarray(overlay), spy.Bitmap.PixelFormat.rgb),
+        name=name,
+    )
+
+
 device = spy.create_device(
     include_paths=[
         pathlib.Path(__file__).parent.absolute(),
@@ -143,7 +182,7 @@ device = spy.create_device(
 # Load the module
 module = spy.Module.load_from_file(device, "shaders/threshold.slang")
 
-img = cv2.imread("test2.webp")
+img = cv2.imread("test3.webp")
 img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
 tex = device.create_texture(
@@ -575,7 +614,7 @@ if blob_extent_count > 0:
         filtered_blob_extents[:, 7] > 0
     ]
     if passing_blob_extents.shape[0] > 0:
-        visualize_blob_extents(device, out_tex, passing_blob_extents)
+        visualize_blob_extents(device, out_tex, passing_blob_extents, " filtered")
 
 selected_blob_point_words_per_point = 4
 selected_blob_points_buf = device.create_buffer(
@@ -859,6 +898,20 @@ print(f"fitted quads (shader): {len(fitted_quads)}")
 if fitted_quads:
     print(f"first fitted quad: {fitted_quads[0]}")
     visualize_quads(img, fitted_quads, name="fitted quads")
+
+tag_dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+tag_params = cv2.aruco.DetectorParameters()
+tag_params.detectInvertedMarker = True
+decoded_tags = decode_tags_from_fitted_quads(
+    image_gray=img,
+    fitted_quads=fitted_quads,
+    dictionary=tag_dictionary,
+    detector_params=tag_params,
+)
+print(f"decoded tags: {len(decoded_tags)}")
+if decoded_tags:
+    print(f"first decoded tag: {decoded_tags[0]}")
+    visualize_decoded_tags(img, decoded_tags, name="decoded tags")
 
 blob_diff_density = np.count_nonzero(blob_diff[:, :, 1], axis=0).reshape((out_tex.height - 2, out_tex.width - 2))
 blob_diff_density_img = np.ascontiguousarray((blob_diff_density * 85).astype(np.uint8))
