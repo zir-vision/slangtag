@@ -1066,287 +1066,281 @@ void fit_quads(
     uint32_t min_tag_width,
     float quad_decimate)
 {
-    if (tid != 0u)
+    if (tid >= peak_extent_count)
         return;
 
-    uint32_t fitted_quad_count = 0u;
+    uint32_t peak_extent_index = tid;
+    uint32_t blob_index = peak_extents[peak_extent_index * kPeakExtentWordsPerExtent + kPeakExtentBlobIndexWord];
+    uint32_t peak_start = peak_extents[peak_extent_index * kPeakExtentWordsPerExtent + kPeakExtentStartingOffsetWord];
+    uint32_t peak_count = peak_extents[peak_extent_index * kPeakExtentWordsPerExtent + kPeakExtentCountWord];
 
-    for (uint32_t peak_extent_index = 0u; peak_extent_index < peak_extent_count; ++peak_extent_index)
+    if (blob_index >= filtered_blob_extent_count || peak_count < 4u)
+        return;
+
+    uint32_t blob_start = read_extent_word(filtered_blob_extents, blob_index, kExtentStartingOffsetWord);
+    uint32_t blob_count = read_extent_word(filtered_blob_extents, blob_index, kExtentCountWord);
+    if (blob_count < 8u)
+        return;
+
+    uint32_t local_peak_indices[kMaxQuadLocalPeakIndices];
+    uint32_t local_peak_count = 0u;
+    uint32_t maxima_to_use = min(max_nmaxima, peak_count);
+    maxima_to_use = min(maxima_to_use, kMaxQuadLocalPeakIndices);
+
+    for (uint32_t i = 0u; i < maxima_to_use; ++i)
     {
-        uint32_t blob_index = peak_extents[peak_extent_index * kPeakExtentWordsPerExtent + kPeakExtentBlobIndexWord];
-        uint32_t peak_start = peak_extents[peak_extent_index * kPeakExtentWordsPerExtent + kPeakExtentStartingOffsetWord];
-        uint32_t peak_count = peak_extents[peak_extent_index * kPeakExtentWordsPerExtent + kPeakExtentCountWord];
-
-        if (blob_index >= filtered_blob_extent_count || peak_count < 4u)
+        uint32_t point_index = read_peak_word(sorted_peaks, peak_start + i, kPeakPointIndexWord);
+        if (point_index < blob_start)
             continue;
 
-        uint32_t blob_start = read_extent_word(filtered_blob_extents, blob_index, kExtentStartingOffsetWord);
-        uint32_t blob_count = read_extent_word(filtered_blob_extents, blob_index, kExtentCountWord);
-        if (blob_count < 8u)
+        uint32_t local_index = point_index - blob_start;
+        if (local_index >= blob_count)
             continue;
 
-        uint32_t local_peak_indices[kMaxQuadLocalPeakIndices];
-        uint32_t local_peak_count = 0u;
-        uint32_t maxima_to_use = min(max_nmaxima, peak_count);
-        maxima_to_use = min(maxima_to_use, kMaxQuadLocalPeakIndices);
-
-        for (uint32_t i = 0u; i < maxima_to_use; ++i)
+        bool seen = false;
+        for (uint32_t j = 0u; j < local_peak_count; ++j)
         {
-            uint32_t point_index = read_peak_word(sorted_peaks, peak_start + i, kPeakPointIndexWord);
-            if (point_index < blob_start)
-                continue;
-
-            uint32_t local_index = point_index - blob_start;
-            if (local_index >= blob_count)
-                continue;
-
-            bool seen = false;
-            for (uint32_t j = 0u; j < local_peak_count; ++j)
+            if (local_peak_indices[j] == local_index)
             {
-                if (local_peak_indices[j] == local_index)
-                {
-                    seen = true;
-                    break;
-                }
+                seen = true;
+                break;
             }
-            if (seen)
-                continue;
-
-            local_peak_indices[local_peak_count] = local_index;
-            local_peak_count += 1u;
         }
-
-        for (uint32_t i = 1u; i < local_peak_count; ++i)
-        {
-            uint32_t key = local_peak_indices[i];
-            uint32_t j = i;
-            while (j > 0u && local_peak_indices[j - 1u] > key)
-            {
-                local_peak_indices[j] = local_peak_indices[j - 1u];
-                j -= 1u;
-            }
-            local_peak_indices[j] = key;
-        }
-
-        if (local_peak_count < 4u)
+        if (seen)
             continue;
 
-        bool has_best = false;
-        float best_score = 0.0f;
-        uint32_t best_corner_indices[4];
-        QuadLineFitMoments best_edge_moments[4];
+        local_peak_indices[local_peak_count] = local_index;
+        local_peak_count += 1u;
+    }
 
-        for (uint32_t i0 = 0u; i0 + 3u < local_peak_count; ++i0)
+    for (uint32_t i = 1u; i < local_peak_count; ++i)
+    {
+        uint32_t key = local_peak_indices[i];
+        uint32_t j = i;
+        while (j > 0u && local_peak_indices[j - 1u] > key)
         {
-            for (uint32_t i1 = i0 + 1u; i1 + 2u < local_peak_count; ++i1)
+            local_peak_indices[j] = local_peak_indices[j - 1u];
+            j -= 1u;
+        }
+        local_peak_indices[j] = key;
+    }
+
+    if (local_peak_count < 4u)
+        return;
+
+    bool has_best = false;
+    float best_score = 0.0f;
+    uint32_t best_corner_indices[4];
+    QuadLineFitMoments best_edge_moments[4];
+
+    for (uint32_t i0 = 0u; i0 + 3u < local_peak_count; ++i0)
+    {
+        for (uint32_t i1 = i0 + 1u; i1 + 2u < local_peak_count; ++i1)
+        {
+            for (uint32_t i2 = i1 + 1u; i2 + 1u < local_peak_count; ++i2)
             {
-                for (uint32_t i2 = i1 + 1u; i2 + 1u < local_peak_count; ++i2)
+                for (uint32_t i3 = i2 + 1u; i3 < local_peak_count; ++i3)
                 {
-                    for (uint32_t i3 = i2 + 1u; i3 < local_peak_count; ++i3)
+                    uint32_t corner_indices[4];
+                    corner_indices[0] = local_peak_indices[i0];
+                    corner_indices[1] = local_peak_indices[i1];
+                    corner_indices[2] = local_peak_indices[i2];
+                    corner_indices[3] = local_peak_indices[i3];
+
+                    uint32_t edge_start[4];
+                    uint32_t edge_end[4];
+                    edge_start[0] = corner_indices[0];
+                    edge_start[1] = corner_indices[1];
+                    edge_start[2] = corner_indices[2];
+                    edge_start[3] = corner_indices[3];
+                    edge_end[0] = corner_indices[1];
+                    edge_end[1] = corner_indices[2];
+                    edge_end[2] = corner_indices[3];
+                    edge_end[3] = corner_indices[0];
+
+                    bool valid = true;
+                    float total_mse = 0.0f;
+                    QuadLineFitMoments edge_moments[4];
+
+                    for (uint32_t edge_index = 0u; edge_index < 4u; ++edge_index)
                     {
-                        uint32_t corner_indices[4];
-                        corner_indices[0] = local_peak_indices[i0];
-                        corner_indices[1] = local_peak_indices[i1];
-                        corner_indices[2] = local_peak_indices[i2];
-                        corner_indices[3] = local_peak_indices[i3];
+                        QuadLineFitMoments moments;
+                        segment_moments(
+                            line_fit_points,
+                            blob_start,
+                            blob_count,
+                            edge_start[edge_index],
+                            edge_end[edge_index],
+                            moments);
 
-                        uint32_t edge_start[4];
-                        uint32_t edge_end[4];
-                        edge_start[0] = corner_indices[0];
-                        edge_start[1] = corner_indices[1];
-                        edge_start[2] = corner_indices[2];
-                        edge_start[3] = corner_indices[3];
-                        edge_end[0] = corner_indices[1];
-                        edge_end[1] = corner_indices[2];
-                        edge_end[2] = corner_indices[3];
-                        edge_end[3] = corner_indices[0];
-
-                        bool valid = true;
-                        float total_mse = 0.0f;
-                        QuadLineFitMoments edge_moments[4];
-
-                        for (uint32_t edge_index = 0u; edge_index < 4u; ++edge_index)
+                        if (moments.N < 2)
                         {
-                            QuadLineFitMoments moments;
-                            segment_moments(
-                                line_fit_points,
-                                blob_start,
-                                blob_count,
-                                edge_start[edge_index],
-                                edge_end[edge_index],
-                                moments);
-
-                            if (moments.N < 2)
-                            {
-                                valid = false;
-                                break;
-                            }
-
-                            float mse = line_fit_mse(moments);
-                            if (!(mse == mse) || mse > max_line_fit_mse)
-                            {
-                                valid = false;
-                                break;
-                            }
-
-                            edge_moments[edge_index] = moments;
-                            total_mse += mse;
+                            valid = false;
+                            break;
                         }
 
-                        if (!valid)
-                            continue;
-
-                        if (!has_best || total_mse < best_score)
+                        float mse = line_fit_mse(moments);
+                        if (!(mse == mse) || mse > max_line_fit_mse)
                         {
-                            has_best = true;
-                            best_score = total_mse;
-                            for (uint32_t c = 0u; c < 4u; ++c)
-                            {
-                                best_corner_indices[c] = corner_indices[c];
-                                best_edge_moments[c] = edge_moments[c];
-                            }
+                            valid = false;
+                            break;
+                        }
+
+                        edge_moments[edge_index] = moments;
+                        total_mse += mse;
+                    }
+
+                    if (!valid)
+                        continue;
+
+                    if (!has_best || total_mse < best_score)
+                    {
+                        has_best = true;
+                        best_score = total_mse;
+                        for (uint32_t c = 0u; c < 4u; ++c)
+                        {
+                            best_corner_indices[c] = corner_indices[c];
+                            best_edge_moments[c] = edge_moments[c];
                         }
                     }
                 }
             }
         }
-
-        if (!has_best)
-            continue;
-
-        float4 lines[4];
-        bool valid_lines = true;
-        for (uint32_t line_index = 0u; line_index < 4u; ++line_index)
-        {
-            if (!fit_line_from_moments(best_edge_moments[line_index], lines[line_index]))
-            {
-                valid_lines = false;
-                break;
-            }
-        }
-        if (!valid_lines)
-            continue;
-
-        bool bad_determinant = false;
-        float2 corners[4];
-        for (uint32_t i = 0u; i < 4u; ++i)
-        {
-            uint32_t i_next = (i + 1u) & 3u;
-            float A00 = lines[i].w;
-            float A01 = -lines[i_next].w;
-            float A10 = -lines[i].z;
-            float A11 = lines[i_next].z;
-            float B0 = -lines[i].x + lines[i_next].x;
-            float B1 = -lines[i].y + lines[i_next].y;
-
-            float det = A00 * A11 - A10 * A01;
-            if (abs(det) < 0.001f)
-            {
-                bad_determinant = true;
-                break;
-            }
-
-            float W00 = A11 / det;
-            float W01 = -A01 / det;
-            float L0 = W00 * B0 + W01 * B1;
-            corners[i].x = lines[i].x + L0 * A00;
-            corners[i].y = lines[i].y + L0 * A10;
-        }
-        if (bad_determinant)
-            continue;
-
-        float area = triangle_area(corners[0], corners[1], corners[2])
-            + triangle_area(corners[2], corners[3], corners[0]);
-        float min_area = 0.95f * float(min_tag_width * min_tag_width);
-        if (area < min_area)
-            continue;
-
-        bool reject_corner = false;
-        for (uint32_t i = 0u; i < 4u; ++i)
-        {
-            uint32_t i0 = i;
-            uint32_t i1 = (i + 1u) & 3u;
-            uint32_t i2 = (i + 2u) & 3u;
-
-            float dx1 = corners[i1].x - corners[i0].x;
-            float dy1 = corners[i1].y - corners[i0].y;
-            float dx2 = corners[i2].x - corners[i1].x;
-            float dy2 = corners[i2].y - corners[i1].y;
-            float denom = sqrt(dx1 * dx1 + dy1 * dy1) * sqrt(dx2 * dx2 + dy2 * dy2);
-            if (denom < 1.0e-9f)
-            {
-                reject_corner = true;
-                break;
-            }
-
-            float cos_dtheta = (dx1 * dx2 + dy1 * dy2) / denom;
-            if (abs(cos_dtheta) > cos_critical_rad || dx1 * dy2 < dy1 * dx2)
-            {
-                reject_corner = true;
-                break;
-            }
-        }
-        if (reject_corner)
-            continue;
-
-        if (quad_decimate > 1.0f)
-        {
-            if (abs(quad_decimate - 1.5f) < 1.0e-4f)
-            {
-                [ForceUnroll]
-                for (uint32_t c = 0u; c < 4u; ++c)
-                {
-                    corners[c] *= quad_decimate;
-                }
-            }
-            else
-            {
-                [ForceUnroll]
-                for (uint32_t c = 0u; c < 4u; ++c)
-                {
-                    corners[c] = (corners[c] - 0.5f) * quad_decimate + 0.5f;
-                }
-            }
-        }
-
-        write_fitted_quad_word(fitted_quads_out, fitted_quad_count, kFittedQuadBlobIndexWord, blob_index);
-        write_fitted_quad_word(
-            fitted_quads_out,
-            fitted_quad_count,
-            kFittedQuadReversedBorderWord,
-            blob_extent_dot(filtered_blob_extents, blob_index) < 0.0f ? 1u : 0u);
-        write_fitted_quad_word(fitted_quads_out, fitted_quad_count, kFittedQuadScoreWord, asuint(best_score));
-        write_fitted_quad_word(fitted_quads_out, fitted_quad_count, kFittedQuadCorner0XWord, asuint(corners[0].x));
-        write_fitted_quad_word(fitted_quads_out, fitted_quad_count, kFittedQuadCorner0YWord, asuint(corners[0].y));
-        write_fitted_quad_word(fitted_quads_out, fitted_quad_count, kFittedQuadCorner1XWord, asuint(corners[1].x));
-        write_fitted_quad_word(fitted_quads_out, fitted_quad_count, kFittedQuadCorner1YWord, asuint(corners[1].y));
-        write_fitted_quad_word(fitted_quads_out, fitted_quad_count, kFittedQuadCorner2XWord, asuint(corners[2].x));
-        write_fitted_quad_word(fitted_quads_out, fitted_quad_count, kFittedQuadCorner2YWord, asuint(corners[2].y));
-        write_fitted_quad_word(fitted_quads_out, fitted_quad_count, kFittedQuadCorner3XWord, asuint(corners[3].x));
-        write_fitted_quad_word(fitted_quads_out, fitted_quad_count, kFittedQuadCorner3YWord, asuint(corners[3].y));
-        write_fitted_quad_word(
-            fitted_quads_out,
-            fitted_quad_count,
-            kFittedQuadCornerIndex0Word,
-            blob_start + best_corner_indices[0]);
-        write_fitted_quad_word(
-            fitted_quads_out,
-            fitted_quad_count,
-            kFittedQuadCornerIndex1Word,
-            blob_start + best_corner_indices[1]);
-        write_fitted_quad_word(
-            fitted_quads_out,
-            fitted_quad_count,
-            kFittedQuadCornerIndex2Word,
-            blob_start + best_corner_indices[2]);
-        write_fitted_quad_word(
-            fitted_quads_out,
-            fitted_quad_count,
-            kFittedQuadCornerIndex3Word,
-            blob_start + best_corner_indices[3]);
-
-        fitted_quad_count += 1u;
     }
 
-    fitted_quad_count_out[0] = fitted_quad_count;
+    if (!has_best)
+        return;
+
+    float4 lines[4];
+    bool valid_lines = true;
+    for (uint32_t line_index = 0u; line_index < 4u; ++line_index)
+    {
+        if (!fit_line_from_moments(best_edge_moments[line_index], lines[line_index]))
+        {
+            valid_lines = false;
+            break;
+        }
+    }
+    if (!valid_lines)
+        return;
+
+    bool bad_determinant = false;
+    float2 corners[4];
+    for (uint32_t i = 0u; i < 4u; ++i)
+    {
+        uint32_t i_next = (i + 1u) & 3u;
+        float A00 = lines[i].w;
+        float A01 = -lines[i_next].w;
+        float A10 = -lines[i].z;
+        float A11 = lines[i_next].z;
+        float B0 = -lines[i].x + lines[i_next].x;
+        float B1 = -lines[i].y + lines[i_next].y;
+
+        float det = A00 * A11 - A10 * A01;
+        if (abs(det) < 0.001f)
+        {
+            bad_determinant = true;
+            break;
+        }
+
+        float W00 = A11 / det;
+        float W01 = -A01 / det;
+        float L0 = W00 * B0 + W01 * B1;
+        corners[i].x = lines[i].x + L0 * A00;
+        corners[i].y = lines[i].y + L0 * A10;
+    }
+    if (bad_determinant)
+        return;
+
+    float area = triangle_area(corners[0], corners[1], corners[2])
+        + triangle_area(corners[2], corners[3], corners[0]);
+    float min_area = 0.95f * float(min_tag_width * min_tag_width);
+    if (area < min_area)
+        return;
+
+    bool reject_corner = false;
+    for (uint32_t i = 0u; i < 4u; ++i)
+    {
+        uint32_t i0 = i;
+        uint32_t i1 = (i + 1u) & 3u;
+        uint32_t i2 = (i + 2u) & 3u;
+
+        float dx1 = corners[i1].x - corners[i0].x;
+        float dy1 = corners[i1].y - corners[i0].y;
+        float dx2 = corners[i2].x - corners[i1].x;
+        float dy2 = corners[i2].y - corners[i1].y;
+        float denom = sqrt(dx1 * dx1 + dy1 * dy1) * sqrt(dx2 * dx2 + dy2 * dy2);
+        if (denom < 1.0e-9f)
+        {
+            reject_corner = true;
+            break;
+        }
+
+        float cos_dtheta = (dx1 * dx2 + dy1 * dy2) / denom;
+        if (abs(cos_dtheta) > cos_critical_rad || dx1 * dy2 < dy1 * dx2)
+        {
+            reject_corner = true;
+            break;
+        }
+    }
+    if (reject_corner)
+        return;
+
+    if (quad_decimate > 1.0f)
+    {
+        if (abs(quad_decimate - 1.5f) < 1.0e-4f)
+        {
+            [ForceUnroll]
+            for (uint32_t c = 0u; c < 4u; ++c)
+            {
+                corners[c] *= quad_decimate;
+            }
+        }
+        else
+        {
+            [ForceUnroll]
+            for (uint32_t c = 0u; c < 4u; ++c)
+            {
+                corners[c] = (corners[c] - 0.5f) * quad_decimate + 0.5f;
+            }
+        }
+    }
+
+    uint32_t fitted_quad_index;
+    InterlockedAdd(fitted_quad_count_out[0], 1u, fitted_quad_index);
+    write_fitted_quad_word(fitted_quads_out, fitted_quad_index, kFittedQuadBlobIndexWord, blob_index);
+    write_fitted_quad_word(
+        fitted_quads_out,
+        fitted_quad_index,
+        kFittedQuadReversedBorderWord,
+        blob_extent_dot(filtered_blob_extents, blob_index) < 0.0f ? 1u : 0u);
+    write_fitted_quad_word(fitted_quads_out, fitted_quad_index, kFittedQuadScoreWord, asuint(best_score));
+    write_fitted_quad_word(fitted_quads_out, fitted_quad_index, kFittedQuadCorner0XWord, asuint(corners[0].x));
+    write_fitted_quad_word(fitted_quads_out, fitted_quad_index, kFittedQuadCorner0YWord, asuint(corners[0].y));
+    write_fitted_quad_word(fitted_quads_out, fitted_quad_index, kFittedQuadCorner1XWord, asuint(corners[1].x));
+    write_fitted_quad_word(fitted_quads_out, fitted_quad_index, kFittedQuadCorner1YWord, asuint(corners[1].y));
+    write_fitted_quad_word(fitted_quads_out, fitted_quad_index, kFittedQuadCorner2XWord, asuint(corners[2].x));
+    write_fitted_quad_word(fitted_quads_out, fitted_quad_index, kFittedQuadCorner2YWord, asuint(corners[2].y));
+    write_fitted_quad_word(fitted_quads_out, fitted_quad_index, kFittedQuadCorner3XWord, asuint(corners[3].x));
+    write_fitted_quad_word(fitted_quads_out, fitted_quad_index, kFittedQuadCorner3YWord, asuint(corners[3].y));
+    write_fitted_quad_word(
+        fitted_quads_out,
+        fitted_quad_index,
+        kFittedQuadCornerIndex0Word,
+        blob_start + best_corner_indices[0]);
+    write_fitted_quad_word(
+        fitted_quads_out,
+        fitted_quad_index,
+        kFittedQuadCornerIndex1Word,
+        blob_start + best_corner_indices[1]);
+    write_fitted_quad_word(
+        fitted_quads_out,
+        fitted_quad_index,
+        kFittedQuadCornerIndex2Word,
+        blob_start + best_corner_indices[2]);
+    write_fitted_quad_word(
+        fitted_quads_out,
+        fitted_quad_index,
+        kFittedQuadCornerIndex3Word,
+        blob_start + best_corner_indices[3]);
 }

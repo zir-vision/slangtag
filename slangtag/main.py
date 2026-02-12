@@ -2,6 +2,7 @@ import cv2
 import slangpy as spy
 import pathlib
 import numpy as np
+import sys
 
 try:
     from slangtag.decode_tags import decode_tags_from_fitted_quads
@@ -182,7 +183,7 @@ device = spy.create_device(
 # Load the module
 module = spy.Module.load_from_file(device, "shaders/threshold.slang")
 
-img = cv2.imread("test3.webp")
+img = cv2.imread(sys.argv[1])
 img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
 tex = device.create_texture(
@@ -876,7 +877,7 @@ fitted_quad_count_buf = device.create_buffer(
 )
 
 filter_module.fit_quads(
-    spy.grid(shape=(1,)),
+    spy.grid(shape=(max(1, peak_extent_count),)),
     sorted_peaks_buf,
     peak_extent_buf,
     line_fit_points_buf,
