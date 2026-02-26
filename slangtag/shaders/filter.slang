@@ -501,7 +501,7 @@ float fit_line_error(int N, int Mx, int My, int64_t Mxx, int64_t Myy, int64_t Mx
     float Cyy = float(Myy * int64_t(W) - int64_t(My) * int64_t(My));
 
     float eig_small = ((Cxx + Cyy) - sqrt((Cxx - Cyy) * (Cxx - Cyy) + 4.0f * Cxy * Cxy))
-        / float(W * W * 8.0f);
+        / float(int64_t(W) * int64_t(W) * int64_t(8));
     return float(N) * eig_small;
 }
 
@@ -999,7 +999,8 @@ float line_fit_mse(QuadLineFitMoments moments)
     float Cxy = float(moments.Mxy * int64_t(moments.W) - int64_t(moments.Mx) * int64_t(moments.My));
     float Cyy = float(moments.Myy * int64_t(moments.W) - int64_t(moments.My) * int64_t(moments.My));
     float hypot_cached = sqrt((Cxx - Cyy) * (Cxx - Cyy) + 4.0f * Cxy * Cxy);
-    return ((Cxx + Cyy) - hypot_cached) / float(moments.W * moments.W * 8.0f);
+    return ((Cxx + Cyy) - hypot_cached)
+        / float(int64_t(moments.W) * int64_t(moments.W) * int64_t(8));
 }
 
 bool fit_line_from_moments(QuadLineFitMoments moments, out float4 line_out)
