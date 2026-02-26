@@ -1,5 +1,6 @@
 import argparse
 import time
+from contextlib import contextmanager
 import cv2
 import slangpy as spy
 import pathlib
@@ -28,6 +29,36 @@ def next_power_of_two(value: int) -> int:
     if value <= 1:
         return 1
     return 1 << (value - 1).bit_length()
+
+
+class StageProfiler:
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.records: list[tuple[str, float]] = []
+
+    @contextmanager
+    def stage(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.records.append((name, time.perf_counter() - start))
+
+    def report(self) -> None:
+        if not self.enabled:
+            return
+        total = sum(duration for _, duration in self.records)
+        print("\npipeline timing profile")
+        if total <= 0:
+            print("  no timings recorded")
+            return
+        for name, duration in self.records:
+            pct = (duration / total) * 100.0
+            print(f"  {name:<36} {duration * 1000.0:9.3f} ms  {pct:6.2f}%")
+        print(f"  {'total':<36} {total * 1000.0:9.3f} ms  100.00%")
 
 
 
@@ -295,10 +326,16 @@ parser.add_argument(
     default="gpu",
     help="implementation backend for DetectGray2 fit-quad stages",
 )
+parser.add_argument(
+    "--profile",
+    action="store_true",
+    help="print wall-clock timing for each major pipeline stage",
+)
 args = parser.parse_args()
 
 fit_quads_impl = args.fit_quads_impl
 print(f"fit quads implementation: {fit_quads_impl}")
+profiler = StageProfiler(enabled=args.profile)
 
 device = spy.create_device(
     include_paths=[
@@ -357,31 +394,33 @@ out_tex = device.create_texture(
 spy.tev.show(tex, name="photo")
 
 
-module.decimate(
-    spy.grid(
-        shape=(
-            tex.height,
-            tex.width,
-        )
-    ),
-    tex,
-    decimated_tex,
-)
+with profiler.stage("decimate"):
+    module.decimate(
+        spy.grid(
+            shape=(
+                tex.height,
+                tex.width,
+            )
+        ),
+        tex,
+        decimated_tex,
+    )
 
 
 # Display the result
 spy.tev.show(decimated_tex, name="decimated")
 
-module.minmax(
-    spy.grid(
-        shape=(
-            unfiltered_minmax_tex.height,
-            unfiltered_minmax_tex.width,
-        )
-    ),
-    decimated_tex,
-    unfiltered_minmax_tex,
-)
+with profiler.stage("minmax"):
+    module.minmax(
+        spy.grid(
+            shape=(
+                unfiltered_minmax_tex.height,
+                unfiltered_minmax_tex.width,
+            )
+        ),
+        decimated_tex,
+        unfiltered_minmax_tex,
+    )
 
 # Show r and g channels of minmax texture separately
 unfiltered_minmax_tex_r = device.create_texture(
@@ -402,16 +441,17 @@ unfiltered_minmax_tex_g = device.create_texture(
 spy.tev.show(unfiltered_minmax_tex_r, name="unfiltered min")
 spy.tev.show(unfiltered_minmax_tex_g, name="unfiltered max")
 
-module.filter_minmax(
-    spy.grid(
-        shape=(
-            unfiltered_minmax_tex.height,
-            unfiltered_minmax_tex.width,
-        )
-    ),
-    unfiltered_minmax_tex,
-    minmax_tex,
-)
+with profiler.stage("filter minmax"):
+    module.filter_minmax(
+        spy.grid(
+            shape=(
+                unfiltered_minmax_tex.height,
+                unfiltered_minmax_tex.width,
+            )
+        ),
+        unfiltered_minmax_tex,
+        minmax_tex,
+    )
 
 # Show the filtered minmax texture
 minmax_tex_r = device.create_texture(
@@ -432,18 +472,19 @@ minmax_tex_g = device.create_texture(
 spy.tev.show(minmax_tex_r, name="min")
 spy.tev.show(minmax_tex_g, name="max")
 
-module.threshold(
-    spy.grid(
-        shape=(
-            decimated_tex.height,
-            decimated_tex.width,
-        )
-    ),
-    decimated_tex,
-    minmax_tex,
-    out_tex,
-    25
-)
+with profiler.stage("threshold"):
+    module.threshold(
+        spy.grid(
+            shape=(
+                decimated_tex.height,
+                decimated_tex.width,
+            )
+        ),
+        decimated_tex,
+        minmax_tex,
+        out_tex,
+        25
+    )
 
 # Show the output texture
 spy.tev.show(out_tex, name="thresholded")
@@ -456,54 +497,58 @@ ccl_out_buf = device.create_buffer(
     usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
 )
 
-ccl_module.init(
-    spy.grid(
-        shape=(
-            out_tex.height // 2,
-            out_tex.width // 2,
-        )
-    ),
-    out_tex,
-    ccl_out_buf,
-)
+with profiler.stage("ccl init"):
+    ccl_module.init(
+        spy.grid(
+            shape=(
+                out_tex.height // 2,
+                out_tex.width // 2,
+            )
+        ),
+        out_tex,
+        ccl_out_buf,
+    )
 
 spy.tev.show(bitmap=spy.Bitmap(ccl_out_buf.to_numpy().reshape((out_tex.height, out_tex.width)).astype(np.float32), spy.Bitmap.PixelFormat.r), name="ccl init")
 
-ccl_module.compression(
-    spy.grid(
-        shape=(
-            out_tex.height // 2,
-            out_tex.width // 2,
-        )
-    ),
-    ccl_out_buf,
-    spy.uint2(out_tex.width, out_tex.height),
-)
+with profiler.stage("ccl compression 1"):
+    ccl_module.compression(
+        spy.grid(
+            shape=(
+                out_tex.height // 2,
+                out_tex.width // 2,
+            )
+        ),
+        ccl_out_buf,
+        spy.uint2(out_tex.width, out_tex.height),
+    )
 spy.tev.show(bitmap=spy.Bitmap(ccl_out_buf.to_numpy().reshape((out_tex.height, out_tex.width)).astype(np.float32), spy.Bitmap.PixelFormat.r), name="ccl compress")
 
 
-ccl_module.merge(
-    spy.grid(
-        shape=(
-            out_tex.height // 2,
-            out_tex.width // 2,
-        )
-    ),
-    ccl_out_buf,
-    spy.uint2(out_tex.width, out_tex.height),
-)
+with profiler.stage("ccl merge"):
+    ccl_module.merge(
+        spy.grid(
+            shape=(
+                out_tex.height // 2,
+                out_tex.width // 2,
+            )
+        ),
+        ccl_out_buf,
+        spy.uint2(out_tex.width, out_tex.height),
+    )
 spy.tev.show(bitmap=spy.Bitmap(ccl_out_buf.to_numpy().reshape((out_tex.height, out_tex.width)).astype(np.float32), spy.Bitmap.PixelFormat.r), name="ccl merge")
 
-ccl_module.compression(
-    spy.grid(
-        shape=(
-            out_tex.height // 2,
-            out_tex.width // 2,
-        )
-    ),
-    ccl_out_buf,
-    spy.uint2(out_tex.width, out_tex.height),
-)
+with profiler.stage("ccl compression 2"):
+    ccl_module.compression(
+        spy.grid(
+            shape=(
+                out_tex.height // 2,
+                out_tex.width // 2,
+            )
+        ),
+        ccl_out_buf,
+        spy.uint2(out_tex.width, out_tex.height),
+    )
 spy.tev.show(bitmap=spy.Bitmap(ccl_out_buf.to_numpy().reshape((out_tex.height, out_tex.width)).astype(np.float32), spy.Bitmap.PixelFormat.r), name="ccl compress 2")
 
 
@@ -513,17 +558,18 @@ union_markers_size_buf = device.create_buffer(
     usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
 )
 
-ccl_module.final_labeling(
-    spy.grid(
-        shape=(
-            out_tex.height // 2,
-            out_tex.width // 2,
-        )
-    ),
-    ccl_out_buf,
-    union_markers_size_buf,
-    spy.uint2(out_tex.width, out_tex.height),
-)
+with profiler.stage("ccl final labeling"):
+    ccl_module.final_labeling(
+        spy.grid(
+            shape=(
+                out_tex.height // 2,
+                out_tex.width // 2,
+            )
+        ),
+        ccl_out_buf,
+        union_markers_size_buf,
+        spy.uint2(out_tex.width, out_tex.height),
+    )
 spy.tev.show(bitmap=spy.Bitmap(ccl_out_buf.to_numpy().reshape((out_tex.height, out_tex.width)).astype(np.float32), spy.Bitmap.PixelFormat.r), name="ccl final labeling")
 spy.tev.show(bitmap=spy.Bitmap(union_markers_size_buf.to_numpy().reshape((out_tex.height, out_tex.width)).astype(np.float32), spy.Bitmap.PixelFormat.r), name="union markers size")
 
@@ -541,20 +587,21 @@ select_module = spy.Module.load_from_file(device, "shaders/select.slang")
 sort_module = spy.Module.load_from_file(device, "shaders/sort.slang")
 filter_module = spy.Module.load_from_file(device, "shaders/filter.slang")
 
-blob_module.blob_diff(
-    spy.grid(
-        shape=(
-            out_tex.height,
-            out_tex.width,
-        )
-    ),
-    out_tex,
-    ccl_out_buf,
-    union_markers_size_buf,
-    blob_diff_out_buf,
-    spy.uint2(out_tex.width, out_tex.height),
-    25,
-)
+with profiler.stage("blob diff"):
+    blob_module.blob_diff(
+        spy.grid(
+            shape=(
+                out_tex.height,
+                out_tex.width,
+            )
+        ),
+        out_tex,
+        ccl_out_buf,
+        union_markers_size_buf,
+        blob_diff_out_buf,
+        spy.uint2(out_tex.width, out_tex.height),
+        25,
+    )
 
 blob_diff_count_buf = device.create_buffer(
     size=4,
@@ -563,16 +610,17 @@ blob_diff_count_buf = device.create_buffer(
     data=np.zeros(1, dtype=np.uint32),
 )
 
-select_module.count_nonzero_blob_diff_points(
-    spy.grid(
-        shape=(
-            blob_diff_total_points,
-        )
-    ),
-    blob_diff_out_buf,
-    blob_diff_count_buf,
-    blob_diff_total_points,
-)
+with profiler.stage("count nonzero blob diff"):
+    select_module.count_nonzero_blob_diff_points(
+        spy.grid(
+            shape=(
+                blob_diff_total_points,
+            )
+        ),
+        blob_diff_out_buf,
+        blob_diff_count_buf,
+        blob_diff_total_points,
+    )
 
 blob_diff_compacted_size = int(blob_diff_count_buf.to_numpy()[0])
 
@@ -589,17 +637,18 @@ blob_diff_filter_count_buf = device.create_buffer(
     data=np.zeros(1, dtype=np.uint32),
 )
 
-select_module.filter_nonzero_blob_diff_points(
-    spy.grid(
-        shape=(
-            blob_diff_total_points,
-        )
-    ),
-    blob_diff_out_buf,
-    blob_diff_compacted_buf,
-    blob_diff_filter_count_buf,
-    blob_diff_total_points,
-)
+with profiler.stage("compact blob diff points"):
+    select_module.filter_nonzero_blob_diff_points(
+        spy.grid(
+            shape=(
+                blob_diff_total_points,
+            )
+        ),
+        blob_diff_out_buf,
+        blob_diff_compacted_buf,
+        blob_diff_filter_count_buf,
+        blob_diff_total_points,
+    )
 
 blob_diff_filtered_size = int(blob_diff_filter_count_buf.to_numpy()[0])
 print(
@@ -623,35 +672,37 @@ blob_diff_sorted_buf = device.create_buffer(
     usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
 )
 
-sort_module.prepare_blob_diff_points(
-    spy.grid(
-        shape=(
-            blob_diff_sort_points,
-        )
-    ),
-    blob_diff_compacted_buf,
-    blob_diff_sorted_buf,
-    blob_diff_filtered_size,
-    blob_diff_sort_points,
-)
+with profiler.stage("prepare blob diff sort"):
+    sort_module.prepare_blob_diff_points(
+        spy.grid(
+            shape=(
+                blob_diff_sort_points,
+            )
+        ),
+        blob_diff_compacted_buf,
+        blob_diff_sorted_buf,
+        blob_diff_filtered_size,
+        blob_diff_sort_points,
+    )
 
-k = 2
-while k <= blob_diff_sort_points:
-    j = k // 2
-    while j > 0:
-        sort_module.bitonic_sort_blob_diff_points(
-            spy.grid(
-                shape=(
-                    blob_diff_sort_points,
-                )
-            ),
-            blob_diff_sorted_buf,
-            blob_diff_sort_points,
-            j,
-            k,
-        )
-        j //= 2
-    k *= 2
+with profiler.stage("bitonic sort blob diff"):
+    k = 2
+    while k <= blob_diff_sort_points:
+        j = k // 2
+        while j > 0:
+            sort_module.bitonic_sort_blob_diff_points(
+                spy.grid(
+                    shape=(
+                        blob_diff_sort_points,
+                    )
+                ),
+                blob_diff_sorted_buf,
+                blob_diff_sort_points,
+                j,
+                k,
+            )
+            j //= 2
+        k *= 2
 
 blob_diff_sorted = blob_diff_sorted_buf.to_numpy()[
     : blob_diff_filtered_size * blob_diff_words_per_point
@@ -676,13 +727,14 @@ blob_extent_count_buf = device.create_buffer(
     data=np.zeros(1, dtype=np.uint32),
 )
 
-filter_module.build_blob_pair_extents(
-    spy.grid(shape=(1,)),
-    blob_diff_sorted_buf,
-    blob_extent_buf,
-    blob_extent_count_buf,
-    blob_diff_filtered_size,
-)
+with profiler.stage("build blob pair extents"):
+    filter_module.build_blob_pair_extents(
+        spy.grid(shape=(1,)),
+        blob_diff_sorted_buf,
+        blob_extent_buf,
+        blob_extent_count_buf,
+        blob_diff_filtered_size,
+    )
 
 blob_extent_count = int(blob_extent_count_buf.to_numpy()[0])
 print(f"blob pair extents: {blob_extent_count}")
@@ -717,19 +769,20 @@ normal_border = 1
 min_cluster_pixels = 24
 max_cluster_pixels = 4 * (out_tex.width + out_tex.height)
 
-filter_module.filter_blob_pair_extents(
-    spy.grid(shape=(1,)),
-    blob_extent_buf,
-    filtered_blob_extent_buf,
-    selected_blob_extent_count_buf,
-    selected_blob_point_count_buf,
-    blob_extent_count,
-    min_tag_width,
-    reversed_border,
-    normal_border,
-    min_cluster_pixels,
-    max_cluster_pixels,
-)
+with profiler.stage("filter blob pair extents"):
+    filter_module.filter_blob_pair_extents(
+        spy.grid(shape=(1,)),
+        blob_extent_buf,
+        filtered_blob_extent_buf,
+        selected_blob_extent_count_buf,
+        selected_blob_point_count_buf,
+        blob_extent_count,
+        min_tag_width,
+        reversed_border,
+        normal_border,
+        min_cluster_pixels,
+        max_cluster_pixels,
+    )
 
 selected_blob_extent_count = int(selected_blob_extent_count_buf.to_numpy()[0])
 selected_blob_point_count = int(selected_blob_point_count_buf.to_numpy()[0])
@@ -754,19 +807,20 @@ selected_blob_points_buf = device.create_buffer(
     usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
 )
 
-filter_module.rewrite_selected_blob_points_with_theta(
-    spy.grid(
-        shape=(
-            blob_diff_filtered_size,
-        )
-    ),
-    blob_diff_sorted_buf,
-    blob_extent_buf,
-    filtered_blob_extent_buf,
-    selected_blob_points_buf,
-    blob_extent_count,
-    blob_diff_filtered_size,
-)
+with profiler.stage("rewrite selected blob points"):
+    filter_module.rewrite_selected_blob_points_with_theta(
+        spy.grid(
+            shape=(
+                blob_diff_filtered_size,
+            )
+        ),
+        blob_diff_sorted_buf,
+        blob_extent_buf,
+        filtered_blob_extent_buf,
+        selected_blob_points_buf,
+        blob_extent_count,
+        blob_diff_filtered_size,
+    )
 
 selected_blob_points = selected_blob_points_buf.to_numpy()[
     : selected_blob_point_count * selected_blob_point_words_per_point
@@ -781,35 +835,37 @@ selected_blob_sorted_points_buf = device.create_buffer(
     usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
 )
 
-sort_module.prepare_selected_blob_points(
-    spy.grid(
-        shape=(
-            selected_blob_sort_points,
-        )
-    ),
-    selected_blob_points_buf,
-    selected_blob_sorted_points_buf,
-    selected_blob_point_count,
-    selected_blob_sort_points,
-)
+with profiler.stage("prepare selected blob sort"):
+    sort_module.prepare_selected_blob_points(
+        spy.grid(
+            shape=(
+                selected_blob_sort_points,
+            )
+        ),
+        selected_blob_points_buf,
+        selected_blob_sorted_points_buf,
+        selected_blob_point_count,
+        selected_blob_sort_points,
+    )
 
-k = 2
-while k <= selected_blob_sort_points:
-    j = k // 2
-    while j > 0:
-        sort_module.bitonic_sort_selected_blob_points(
-            spy.grid(
-                shape=(
-                    selected_blob_sort_points,
-                )
-            ),
-            selected_blob_sorted_points_buf,
-            selected_blob_sort_points,
-            j,
-            k,
-        )
-        j //= 2
-    k *= 2
+with profiler.stage("bitonic sort selected blob"):
+    k = 2
+    while k <= selected_blob_sort_points:
+        j = k // 2
+        while j > 0:
+            sort_module.bitonic_sort_selected_blob_points(
+                spy.grid(
+                    shape=(
+                        selected_blob_sort_points,
+                    )
+                ),
+                selected_blob_sorted_points_buf,
+                selected_blob_sort_points,
+                j,
+                k,
+            )
+            j //= 2
+        k *= 2
 
 selected_blob_points_sorted = selected_blob_sorted_points_buf.to_numpy()[
     : selected_blob_point_count * selected_blob_point_words_per_point
@@ -831,16 +887,17 @@ line_fit_points_buf = device.create_buffer(
     usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
 )
 
-filter_module.build_line_fit_points(
-    spy.grid(shape=(1,)),
-    selected_blob_sorted_points_buf,
-    decimated_tex,
-    line_fit_points_buf,
-    selected_blob_point_count,
-    decimated_tex.width,
-    decimated_tex.height,
-    decimate,
-)
+with profiler.stage("build line fit points"):
+    filter_module.build_line_fit_points(
+        spy.grid(shape=(1,)),
+        selected_blob_sorted_points_buf,
+        decimated_tex,
+        line_fit_points_buf,
+        selected_blob_point_count,
+        decimated_tex.width,
+        decimated_tex.height,
+        decimate,
+    )
 
 line_fit_points = line_fit_points_buf.to_numpy()[
     : selected_blob_point_count * line_fit_point_words_per_point
@@ -865,16 +922,17 @@ peaks_buf = device.create_buffer(
     usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
 )
 
-filter_module.fit_line_errors_and_peaks(
-    spy.grid(shape=(1,)),
-    line_fit_points_buf,
-    filtered_blob_extent_buf,
-    errs_buf,
-    filtered_errs_buf,
-    peaks_buf,
-    blob_extent_count,
-    selected_blob_point_count,
-)
+with profiler.stage("fit line errors and peaks"):
+    filter_module.fit_line_errors_and_peaks(
+        spy.grid(shape=(1,)),
+        line_fit_points_buf,
+        filtered_blob_extent_buf,
+        errs_buf,
+        filtered_errs_buf,
+        peaks_buf,
+        blob_extent_count,
+        selected_blob_point_count,
+    )
 
 if selected_blob_point_count > 0:
     errs = errs_buf.to_numpy()[:selected_blob_point_count].view(np.float32)
@@ -892,12 +950,13 @@ peak_count_buf = device.create_buffer(
     data=np.zeros(1, dtype=np.uint32),
 )
 if selected_blob_point_count > 0:
-    select_module.count_valid_peaks(
-        spy.grid(shape=(selected_blob_point_count,)),
-        peaks_buf,
-        peak_count_buf,
-        selected_blob_point_count,
-    )
+    with profiler.stage("count valid peaks"):
+        select_module.count_valid_peaks(
+            spy.grid(shape=(selected_blob_point_count,)),
+            peaks_buf,
+            peak_count_buf,
+            selected_blob_point_count,
+        )
 
 peak_count = int(peak_count_buf.to_numpy()[0])
 print(f"valid peaks: {peak_count}/{selected_blob_point_count}")
@@ -914,13 +973,14 @@ compacted_peak_count_buf = device.create_buffer(
     data=np.zeros(1, dtype=np.uint32),
 )
 if selected_blob_point_count > 0:
-    select_module.filter_valid_peaks(
-        spy.grid(shape=(selected_blob_point_count,)),
-        peaks_buf,
-        compacted_peaks_buf,
-        compacted_peak_count_buf,
-        selected_blob_point_count,
-    )
+    with profiler.stage("compact valid peaks"):
+        select_module.filter_valid_peaks(
+            spy.grid(shape=(selected_blob_point_count,)),
+            peaks_buf,
+            compacted_peaks_buf,
+            compacted_peak_count_buf,
+            selected_blob_point_count,
+        )
 
 compacted_peak_count = int(compacted_peak_count_buf.to_numpy()[0])
 print(f"compacted peaks: {compacted_peak_count}")
@@ -932,27 +992,29 @@ sorted_peaks_buf = device.create_buffer(
     usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
 )
 
-sort_module.prepare_peaks(
-    spy.grid(shape=(peak_sort_points,)),
-    compacted_peaks_buf,
-    sorted_peaks_buf,
-    compacted_peak_count,
-    peak_sort_points,
-)
+with profiler.stage("prepare peak sort"):
+    sort_module.prepare_peaks(
+        spy.grid(shape=(peak_sort_points,)),
+        compacted_peaks_buf,
+        sorted_peaks_buf,
+        compacted_peak_count,
+        peak_sort_points,
+    )
 
-k = 2
-while k <= peak_sort_points:
-    j = k // 2
-    while j > 0:
-        sort_module.bitonic_sort_peaks(
-            spy.grid(shape=(peak_sort_points,)),
-            sorted_peaks_buf,
-            peak_sort_points,
-            j,
-            k,
-        )
-        j //= 2
-    k *= 2
+with profiler.stage("bitonic sort peaks"):
+    k = 2
+    while k <= peak_sort_points:
+        j = k // 2
+        while j > 0:
+            sort_module.bitonic_sort_peaks(
+                spy.grid(shape=(peak_sort_points,)),
+                sorted_peaks_buf,
+                peak_sort_points,
+                j,
+                k,
+            )
+            j //= 2
+        k *= 2
 
 sorted_peaks = np.zeros((0, peak_words_per_peak), dtype=np.uint32)
 if compacted_peak_count > 0:
@@ -979,13 +1041,14 @@ if fit_quads_impl == "gpu":
         data=np.zeros(1, dtype=np.uint32),
     )
 
-    filter_module.build_peak_extents(
-        spy.grid(shape=(1,)),
-        sorted_peaks_buf,
-        peak_extent_buf,
-        peak_extent_count_buf,
-        compacted_peak_count,
-    )
+    with profiler.stage("build peak extents (gpu)"):
+        filter_module.build_peak_extents(
+            spy.grid(shape=(1,)),
+            sorted_peaks_buf,
+            peak_extent_buf,
+            peak_extent_count_buf,
+            compacted_peak_count,
+        )
 
     peak_extent_count = int(peak_extent_count_buf.to_numpy()[0])
     if peak_extent_count > 0:
@@ -993,7 +1056,8 @@ if fit_quads_impl == "gpu":
             : peak_extent_count * peak_extent_words_per_extent
         ].reshape((peak_extent_count, peak_extent_words_per_extent))
 else:
-    peak_extents = build_peak_extents_cpu(sorted_peaks, compacted_peak_count)
+    with profiler.stage("build peak extents (cpu)"):
+        peak_extents = build_peak_extents_cpu(sorted_peaks, compacted_peak_count)
     peak_extent_count = int(peak_extents.shape[0])
 
 print(f"peak extents ({fit_quads_impl}): {peak_extent_count}")
@@ -1018,57 +1082,60 @@ fitted_quad_count = 0
 
 fit_quads_start_time = time.time()
 if fit_quads_impl == "gpu":
-    fitted_quads_buf = device.create_buffer(
-        size=max(1, peak_extent_count) * FITTED_QUAD_WORDS_PER_QUAD * 4,
-        format=spy.Format.r32_uint,
-        usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
-    )
-    fitted_quad_count_buf = device.create_buffer(
-        size=4,
-        format=spy.Format.r32_uint,
-        usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
-        data=np.zeros(1, dtype=np.uint32),
-    )
+    with profiler.stage("fit quads (gpu)"):
+        fitted_quads_buf = device.create_buffer(
+            size=max(1, peak_extent_count) * FITTED_QUAD_WORDS_PER_QUAD * 4,
+            format=spy.Format.r32_uint,
+            usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+        )
+        fitted_quad_count_buf = device.create_buffer(
+            size=4,
+            format=spy.Format.r32_uint,
+            usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+            data=np.zeros(1, dtype=np.uint32),
+        )
 
-    filter_module.fit_quads(
-        spy.grid(shape=(max(1, peak_extent_count),)),
-        sorted_peaks_buf,
-        peak_extent_buf,
-        line_fit_points_buf,
-        filtered_blob_extent_buf,
-        fitted_quads_buf,
-        fitted_quad_count_buf,
-        peak_extent_count,
-        blob_extent_count,
-        max_nmaxima,
-        max_line_fit_mse,
-        cos_critical_rad,
-        min_tag_width,
-        float(decimate),
-    )
-    fitted_quad_words = fitted_quads_buf.to_numpy()
-    fitted_quad_count = int(fitted_quad_count_buf.to_numpy()[0])
+        filter_module.fit_quads(
+            spy.grid(shape=(max(1, peak_extent_count),)),
+            sorted_peaks_buf,
+            peak_extent_buf,
+            line_fit_points_buf,
+            filtered_blob_extent_buf,
+            fitted_quads_buf,
+            fitted_quad_count_buf,
+            peak_extent_count,
+            blob_extent_count,
+            max_nmaxima,
+            max_line_fit_mse,
+            cos_critical_rad,
+            min_tag_width,
+            float(decimate),
+        )
+        fitted_quad_words = fitted_quads_buf.to_numpy()
+        fitted_quad_count = int(fitted_quad_count_buf.to_numpy()[0])
 else:
-    fitted_quad_candidates = fit_quad_candidates_cpu(
-        sorted_peaks=sorted_peaks,
-        peak_extents=peak_extents,
-        line_fit_points=line_fit_points,
-        filtered_blob_extents=filtered_blob_extents,
-        max_nmaxima=max_nmaxima,
-        max_line_fit_mse=max_line_fit_mse,
-        filtered_blob_extent_count=blob_extent_count,
-    )
-    fitted_quad_words, fitted_quad_count = update_fit_quads_cpu(
-        candidates=fitted_quad_candidates,
-        filtered_blob_extents=filtered_blob_extents,
-        cos_critical_rad=cos_critical_rad,
-        min_tag_width=min_tag_width,
-        quad_decimate=float(decimate),
-    )
+    with profiler.stage("fit quads (cpu)"):
+        fitted_quad_candidates = fit_quad_candidates_cpu(
+            sorted_peaks=sorted_peaks,
+            peak_extents=peak_extents,
+            line_fit_points=line_fit_points,
+            filtered_blob_extents=filtered_blob_extents,
+            max_nmaxima=max_nmaxima,
+            max_line_fit_mse=max_line_fit_mse,
+            filtered_blob_extent_count=blob_extent_count,
+        )
+        fitted_quad_words, fitted_quad_count = update_fit_quads_cpu(
+            candidates=fitted_quad_candidates,
+            filtered_blob_extents=filtered_blob_extents,
+            cos_critical_rad=cos_critical_rad,
+            min_tag_width=min_tag_width,
+            quad_decimate=float(decimate),
+        )
 
 print(f"fit quads time ({fit_quads_impl}): {time.time() - fit_quads_start_time:.3f} seconds")
 
-fitted_quads = decode_fitted_quads(fitted_quad_words, fitted_quad_count)
+with profiler.stage("decode fitted quads"):
+    fitted_quads = decode_fitted_quads(fitted_quad_words, fitted_quad_count)
 print(f"fitted quads ({fit_quads_impl}): {len(fitted_quads)}")
 if fitted_quads:
     print(f"first fitted quad: {fitted_quads[0]}")
@@ -1077,36 +1144,16 @@ if fitted_quads:
 tag_dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
 tag_params = cv2.aruco.DetectorParameters()
 tag_params.detectInvertedMarker = True
-decoded_tags = decode_tags_from_fitted_quads(
-    image_gray=img,
-    fitted_quads=fitted_quads,
-    dictionary=tag_dictionary,
-    detector_params=tag_params,
-)
+with profiler.stage("decode tags"):
+    decoded_tags = decode_tags_from_fitted_quads(
+        image_gray=img,
+        fitted_quads=fitted_quads,
+        dictionary=tag_dictionary,
+        detector_params=tag_params,
+    )
 print(f"decoded tags: {len(decoded_tags)}")
 if decoded_tags:
     print(f"first decoded tag: {decoded_tags[0]}")
     visualize_decoded_tags(img, decoded_tags, name="decoded tags")
 
-blob_diff_density = np.count_nonzero(blob_diff[:, :, 1], axis=0).reshape((out_tex.height - 2, out_tex.width - 2))
-blob_diff_density_img = np.ascontiguousarray((blob_diff_density * 85).astype(np.uint8))
-blob_diff_density_tex = device.create_texture(
-    width=out_tex.width - 2,
-    height=out_tex.height - 2,
-    format=spy.Format.r8_uint,
-    usage=spy.TextureUsage.shader_resource,
-    data=blob_diff_density_img,
-)
-spy.tev.show(blob_diff_density_tex, name="blob diff density")
-
-out_ccl = ccl_out_buf.to_numpy().reshape((out_tex.height, out_tex.width)).astype(np.uint32)
-num_unique_labels = len(np.unique(out_ccl))
-
-# Create a color for each label and display the result
-# Keep in mind that the labels are not necessarily contiguous, so we need to create a mapping from label to color
-unique_labels = np.unique(out_ccl)
-label_to_color = {label: np.random.randint(0, 255, size=3) for label in unique_labels}
-color_ccl = np.zeros((out_tex.height, out_tex.width, 3), dtype=np.uint8)
-for label, color in label_to_color.items():
-    color_ccl[out_ccl == label] = color
-spy.tev.show(bitmap=spy.Bitmap(color_ccl, spy.Bitmap.PixelFormat.rgb), name="ccl colored")
+profiler.report()
