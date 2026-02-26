@@ -1,13 +1,27 @@
+import argparse
+import time
 import cv2
 import slangpy as spy
 import pathlib
 import numpy as np
-import sys
 
 try:
     from slangtag.decode_tags import decode_tags_from_fitted_quads
 except ImportError:
     from decode_tags import decode_tags_from_fitted_quads
+
+try:
+    from slangtag.fit_quads_cpu import (
+        build_peak_extents_cpu,
+        fit_quad_candidates_cpu,
+        update_fit_quads_cpu,
+    )
+except ImportError:
+    from fit_quads_cpu import (
+        build_peak_extents_cpu,
+        fit_quad_candidates_cpu,
+        update_fit_quads_cpu,
+    )
 
 
 def next_power_of_two(value: int) -> int:
@@ -95,6 +109,89 @@ def visualize_blob_extents(device, out_tex, blob_extents: np.ndarray, name_suffi
         bitmap=spy.Bitmap(np.ascontiguousarray(overlay), spy.Bitmap.PixelFormat.rgb),
         name=f"blob extents overlay{name_suffix}",
     )
+
+def visualize_filtered_peak_extents(
+    out_tex,
+    filtered_blob_extents: np.ndarray,
+    sorted_peaks: np.ndarray,
+    peak_extents: np.ndarray,
+    selected_blob_points_sorted: np.ndarray,
+    min_peak_count: int = 4,
+    min_blob_point_count: int = 8,
+    name_suffix: str = "",
+) -> int:
+    if (
+        peak_extents.shape[0] == 0
+        or sorted_peaks.shape[0] == 0
+        or filtered_blob_extents.shape[0] == 0
+        or selected_blob_points_sorted.shape[0] == 0
+    ):
+        return 0
+
+    thresholded = out_tex.to_numpy()
+    if thresholded.ndim == 3:
+        thresholded = thresholded[:, :, 0]
+    overlay = np.stack([thresholded, thresholded, thresholded], axis=-1).astype(np.uint8)
+    height, width = thresholded.shape
+
+    passing_peak_extents = []
+    for extent in peak_extents:
+        blob_index = int(extent[0])
+        peak_start = int(extent[1])
+        peak_count = int(extent[2])
+        if blob_index >= filtered_blob_extents.shape[0]:
+            continue
+        if peak_count < min_peak_count:
+            continue
+        if int(filtered_blob_extents[blob_index, 7]) < min_blob_point_count:
+            continue
+        passing_peak_extents.append((blob_index, peak_start, peak_count))
+
+    if not passing_peak_extents:
+        return 0
+
+    for i, (blob_index, peak_start, peak_count) in enumerate(passing_peak_extents):
+        extent = filtered_blob_extents[blob_index]
+        min_x = int(np.clip(extent[2], 0, width - 1))
+        max_x = int(np.clip(extent[3], 0, width - 1))
+        min_y = int(np.clip(extent[4], 0, height - 1))
+        max_y = int(np.clip(extent[5], 0, height - 1))
+        if min_x > max_x or min_y > max_y:
+            continue
+
+        color = (
+            int((41 * i) % 255 + 1),
+            int((73 * i) % 255 + 1),
+            int((109 * i) % 255 + 1),
+        )
+
+        cv2.rectangle(
+            overlay,
+            (min_x, min_y),
+            (max_x, max_y),
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+        for peak_offset in range(peak_count):
+            peak_index = peak_start + peak_offset
+            if peak_index >= sorted_peaks.shape[0]:
+                continue
+            point_index = int(sorted_peaks[peak_index, 2])
+            if point_index >= selected_blob_points_sorted.shape[0]:
+                continue
+
+            px = int(np.clip(selected_blob_points_sorted[point_index, 2], 0, width - 1))
+            py = int(np.clip(selected_blob_points_sorted[point_index, 3], 0, height - 1))
+            cv2.circle(overlay, (px, py), 1, color, -1, cv2.LINE_AA)
+
+    spy.tev.show(
+        bitmap=spy.Bitmap(np.ascontiguousarray(overlay), spy.Bitmap.PixelFormat.rgb),
+        name=f"filtered peak extents overlay{name_suffix}",
+    )
+
+    return len(passing_peak_extents)
 
 
 FITTED_QUAD_WORDS_PER_QUAD = 15
@@ -190,6 +287,19 @@ def visualize_decoded_tags(image_gray: np.ndarray, detections, name: str) -> Non
     )
 
 
+parser = argparse.ArgumentParser(description="slangtag april tag detector")
+parser.add_argument("image", help="path to input image")
+parser.add_argument(
+    "--fit-quads-impl",
+    choices=("gpu", "cpu"),
+    default="gpu",
+    help="implementation backend for DetectGray2 fit-quad stages",
+)
+args = parser.parse_args()
+
+fit_quads_impl = args.fit_quads_impl
+print(f"fit quads implementation: {fit_quads_impl}")
+
 device = spy.create_device(
     include_paths=[
         pathlib.Path(__file__).parent.absolute(),
@@ -202,7 +312,7 @@ device = spy.create_device(
 # Load the module
 module = spy.Module.load_from_file(device, "shaders/threshold.slang")
 
-img = cv2.imread(sys.argv[1])
+img = cv2.imread(args.image)
 img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 img = crop_image_to_multiple(img, 8)
 
@@ -852,70 +962,114 @@ if compacted_peak_count > 0:
     print(f"first sorted peak: {sorted_peaks[0]}")
 
 peak_extent_words_per_extent = 3
-peak_extent_buf = device.create_buffer(
-    size=max(1, compacted_peak_count) * peak_extent_words_per_extent * 4,
-    format=spy.Format.r32_uint,
-    usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
-)
-peak_extent_count_buf = device.create_buffer(
-    size=4,
-    format=spy.Format.r32_uint,
-    usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
-    data=np.zeros(1, dtype=np.uint32),
-)
-
-filter_module.build_peak_extents(
-    spy.grid(shape=(1,)),
-    sorted_peaks_buf,
-    peak_extent_buf,
-    peak_extent_count_buf,
-    compacted_peak_count,
-)
-
-peak_extent_count = int(peak_extent_count_buf.to_numpy()[0])
-print(f"peak extents: {peak_extent_count}")
 peak_extents = np.zeros((0, peak_extent_words_per_extent), dtype=np.uint32)
+peak_extent_count = 0
+peak_extent_buf = None
+
+if fit_quads_impl == "gpu":
+    peak_extent_buf = device.create_buffer(
+        size=max(1, compacted_peak_count) * peak_extent_words_per_extent * 4,
+        format=spy.Format.r32_uint,
+        usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+    )
+    peak_extent_count_buf = device.create_buffer(
+        size=4,
+        format=spy.Format.r32_uint,
+        usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+        data=np.zeros(1, dtype=np.uint32),
+    )
+
+    filter_module.build_peak_extents(
+        spy.grid(shape=(1,)),
+        sorted_peaks_buf,
+        peak_extent_buf,
+        peak_extent_count_buf,
+        compacted_peak_count,
+    )
+
+    peak_extent_count = int(peak_extent_count_buf.to_numpy()[0])
+    if peak_extent_count > 0:
+        peak_extents = peak_extent_buf.to_numpy()[
+            : peak_extent_count * peak_extent_words_per_extent
+        ].reshape((peak_extent_count, peak_extent_words_per_extent))
+else:
+    peak_extents = build_peak_extents_cpu(sorted_peaks, compacted_peak_count)
+    peak_extent_count = int(peak_extents.shape[0])
+
+print(f"peak extents ({fit_quads_impl}): {peak_extent_count}")
 if peak_extent_count > 0:
-    peak_extents = peak_extent_buf.to_numpy()[
-        : peak_extent_count * peak_extent_words_per_extent
-    ].reshape((peak_extent_count, peak_extent_words_per_extent))
     print(f"first peak extent: {peak_extents[0]}")
+    filtered_peak_extent_count = visualize_filtered_peak_extents(
+        out_tex,
+        filtered_blob_extents,
+        sorted_peaks,
+        peak_extents,
+        selected_blob_points_sorted,
+        min_peak_count=4,
+        min_blob_point_count=8,
+    )
+    print(f"filtered peak extents: {filtered_peak_extent_count}/{peak_extent_count}")
 
 max_nmaxima = 10
 max_line_fit_mse = 10.0
 cos_critical_rad = 0.984807753012208
-fitted_quads_buf = device.create_buffer(
-    size=max(1, peak_extent_count) * FITTED_QUAD_WORDS_PER_QUAD * 4,
-    format=spy.Format.r32_uint,
-    usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
-)
-fitted_quad_count_buf = device.create_buffer(
-    size=4,
-    format=spy.Format.r32_uint,
-    usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
-    data=np.zeros(1, dtype=np.uint32),
-)
+fitted_quad_words = np.zeros((0,), dtype=np.uint32)
+fitted_quad_count = 0
 
-filter_module.fit_quads(
-    spy.grid(shape=(max(1, peak_extent_count),)),
-    sorted_peaks_buf,
-    peak_extent_buf,
-    line_fit_points_buf,
-    filtered_blob_extent_buf,
-    fitted_quads_buf,
-    fitted_quad_count_buf,
-    peak_extent_count,
-    blob_extent_count,
-    max_nmaxima,
-    max_line_fit_mse,
-    cos_critical_rad,
-    min_tag_width,
-    float(decimate),
-)
+fit_quads_start_time = time.time()
+if fit_quads_impl == "gpu":
+    fitted_quads_buf = device.create_buffer(
+        size=max(1, peak_extent_count) * FITTED_QUAD_WORDS_PER_QUAD * 4,
+        format=spy.Format.r32_uint,
+        usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+    )
+    fitted_quad_count_buf = device.create_buffer(
+        size=4,
+        format=spy.Format.r32_uint,
+        usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,
+        data=np.zeros(1, dtype=np.uint32),
+    )
 
-fitted_quad_count = int(fitted_quad_count_buf.to_numpy()[0])
-fitted_quads = decode_fitted_quads(fitted_quads_buf.to_numpy(), fitted_quad_count)
-print(f"fitted quads (shader): {len(fitted_quads)}")
+    filter_module.fit_quads(
+        spy.grid(shape=(max(1, peak_extent_count),)),
+        sorted_peaks_buf,
+        peak_extent_buf,
+        line_fit_points_buf,
+        filtered_blob_extent_buf,
+        fitted_quads_buf,
+        fitted_quad_count_buf,
+        peak_extent_count,
+        blob_extent_count,
+        max_nmaxima,
+        max_line_fit_mse,
+        cos_critical_rad,
+        min_tag_width,
+        float(decimate),
+    )
+    fitted_quad_words = fitted_quads_buf.to_numpy()
+    fitted_quad_count = int(fitted_quad_count_buf.to_numpy()[0])
+else:
+    fitted_quad_candidates = fit_quad_candidates_cpu(
+        sorted_peaks=sorted_peaks,
+        peak_extents=peak_extents,
+        line_fit_points=line_fit_points,
+        filtered_blob_extents=filtered_blob_extents,
+        max_nmaxima=max_nmaxima,
+        max_line_fit_mse=max_line_fit_mse,
+        filtered_blob_extent_count=blob_extent_count,
+    )
+    fitted_quad_words, fitted_quad_count = update_fit_quads_cpu(
+        candidates=fitted_quad_candidates,
+        filtered_blob_extents=filtered_blob_extents,
+        cos_critical_rad=cos_critical_rad,
+        min_tag_width=min_tag_width,
+        quad_decimate=float(decimate),
+    )
+
+print(f"fit quads time ({fit_quads_impl}): {time.time() - fit_quads_start_time:.3f} seconds")
+
+fitted_quads = decode_fitted_quads(fitted_quad_words, fitted_quad_count)
+print(f"fitted quads ({fit_quads_impl}): {len(fitted_quads)}")
 if fitted_quads:
     print(f"first fitted quad: {fitted_quads[0]}")
     visualize_quads(img, fitted_quads, name="fitted quads")
