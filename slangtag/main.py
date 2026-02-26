@@ -7,9 +7,12 @@ import pathlib
 import numpy as np
 
 try:
-    from slangtag.decode_tags import decode_tags_from_fitted_quads
+    from slangtag.decode_tags import (
+        decode_tags_from_fitted_quads,
+        decode_tags_from_fitted_quads_slang,
+    )
 except ImportError:
-    from decode_tags import decode_tags_from_fitted_quads
+    from decode_tags import decode_tags_from_fitted_quads, decode_tags_from_fitted_quads_slang
 
 try:
     from slangtag.fit_quads_cpu import (
@@ -327,6 +330,12 @@ parser.add_argument(
     help="implementation backend for DetectGray2 fit-quad stages",
 )
 parser.add_argument(
+    "--decode-tags-impl",
+    choices=("gpu", "cpu"),
+    default="cpu",
+    help="implementation backend for tag bit extraction",
+)
+parser.add_argument(
     "--profile",
     action="store_true",
     help="print wall-clock timing for each major pipeline stage",
@@ -334,7 +343,9 @@ parser.add_argument(
 args = parser.parse_args()
 
 fit_quads_impl = args.fit_quads_impl
+decode_tags_impl = args.decode_tags_impl
 print(f"fit quads implementation: {fit_quads_impl}")
+print(f"decode tags implementation: {decode_tags_impl}")
 profiler = StageProfiler(enabled=args.profile)
 
 device = spy.create_device(
@@ -1145,13 +1156,24 @@ tag_dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11
 tag_params = cv2.aruco.DetectorParameters()
 tag_params.detectInvertedMarker = True
 with profiler.stage("decode tags"):
-    decoded_tags = decode_tags_from_fitted_quads(
-        image_gray=img,
-        fitted_quads=fitted_quads,
-        dictionary=tag_dictionary,
-        detector_params=tag_params,
-    )
-print(f"decoded tags: {len(decoded_tags)}")
+    if decode_tags_impl == "gpu":
+        decode_module = spy.Module.load_from_file(device, "shaders/decode.slang")
+        decoded_tags = decode_tags_from_fitted_quads_slang(
+            image_gray=img,
+            fitted_quads=fitted_quads,
+            device=device,
+            module=decode_module,
+            dictionary=tag_dictionary,
+            detector_params=tag_params,
+        )
+    else:
+        decoded_tags = decode_tags_from_fitted_quads(
+            image_gray=img,
+            fitted_quads=fitted_quads,
+            dictionary=tag_dictionary,
+            detector_params=tag_params,
+        )
+print(f"decoded tags ({decode_tags_impl}): {len(decoded_tags)}")
 if decoded_tags:
     print(f"first decoded tag: {decoded_tags[0]}")
     visualize_decoded_tags(img, decoded_tags, name="decoded tags")
