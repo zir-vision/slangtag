@@ -122,18 +122,29 @@ void threshold(uint2 tid,
 }
 
 void decimate_buffer(uint2 tid,
-                     StructuredBuffer<uint32_t> input_image,
+                     StructuredBuffer<uint8_t> input_image,
                      ImageSize input_size,
-                     RWStructuredBuffer<uint32_t> decimated_image,
+                     RWStructuredBuffer<uint8_t> decimated_image,
                      ImageSize decimated_size)
 {
     uint2 pixel = tid.xy;
     if (!image_in_bounds(input_size, pixel))
         return;
 
-    if (pixel.x % 2 == 0u && pixel.y % 2 == 0u)
+    let x_decimate = input_size.width / decimated_size.width;
+    let y_decimate = input_size.height / decimated_size.height;
+    
+    if (x_decimate != y_decimate)
     {
-        uint2 out_pixel = pixel / 2u;
+        // For simplicity, we require the decimation factor to be the same in both dimensions.
+        return;
+    }
+
+    let decimate_factor = x_decimate;
+
+    if (pixel.x % decimate_factor == 0u && pixel.y % decimate_factor == 0u)
+    {
+        uint2 out_pixel = pixel / decimate_factor;
         if (image_in_bounds(decimated_size, out_pixel))
         {
             image_u8_write(
@@ -146,9 +157,9 @@ void decimate_buffer(uint2 tid,
 }
 
 void minmax_buffer(uint2 tid,
-                   StructuredBuffer<uint32_t> input_image,
+                   StructuredBuffer<uint8_t> input_image,
                    ImageSize input_size,
-                   RWStructuredBuffer<uint32_t> minmax_image,
+                   RWStructuredBuffer<uint8_t2> minmax_image,
                    ImageSize minmax_size)
 {
     uint2 pixel = tid.xy;
@@ -175,9 +186,9 @@ void minmax_buffer(uint2 tid,
 }
 
 void filter_minmax_buffer(uint2 tid,
-                          StructuredBuffer<uint32_t> minmax_image,
+                          StructuredBuffer<uint8_t2> minmax_image,
                           ImageSize minmax_size,
-                          RWStructuredBuffer<uint32_t> filtered_image,
+                          RWStructuredBuffer<uint8_t2> filtered_image,
                           ImageSize filtered_size)
 {
     uint2 pixel = tid.xy;
@@ -205,11 +216,11 @@ void filter_minmax_buffer(uint2 tid,
 }
 
 void threshold_buffer(uint2 tid,
-                      StructuredBuffer<uint32_t> decimated_image,
+                      StructuredBuffer<uint8_t> decimated_image,
                       ImageSize decimated_size,
-                      StructuredBuffer<uint32_t> filtered_image,
+                      StructuredBuffer<uint8_t2> filtered_image,
                       ImageSize filtered_size,
-                      RWStructuredBuffer<uint32_t> thresholded_image,
+                      RWStructuredBuffer<uint8_t> thresholded_image,
                       ImageSize thresholded_size,
                       uint min_white_black_diff)
 {

@@ -452,7 +452,7 @@ void final_labeling(uint2 tid, RWStructuredBuffer<uint32_t> labels,
 }
 
 
-void init_buffer(uint2 tid, StructuredBuffer<uint32_t> image, ImageSize image_size, RWStructuredBuffer<uint32_t> labels)
+void init_buffer(uint2 tid, StructuredBuffer<uint8_t> image, ImageSize image_size, RWStructuredBuffer<uint32_t> labels)
 {
     tid *= 2;
     uint2 dim = uint2(image_size.width, image_size.height);
@@ -657,4 +657,3 @@ void init_buffer(uint2 tid, StructuredBuffer<uint32_t> image, ImageSize image_si
     labels[background_labels_index + 1] =
         uint32_t(int(background_labels_index) + father_offset_right_background + 1);
 }
-

@@ -1,7 +1,7 @@
 import "./image_buffer.slang";
 import "../decode.slang";
 
-StructuredBuffer<uint32_t> image_gray;
+StructuredBuffer<uint8_t> image_gray;
 StructuredBuffer<uint32_t> corners;
 RWStructuredBuffer<uint32_t> quad_params_out;
 
@@ -19,7 +19,7 @@ ConstantBuffer<PushConstants> pc;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
-void prepare_decode_quads(uint3 dispatch_thread_id : SV_DispatchThreadID)
+void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     prepare_decode_quads_buffer(
         dispatch_thread_id.x,

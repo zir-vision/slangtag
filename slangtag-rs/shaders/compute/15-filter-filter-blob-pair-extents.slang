@@ -13,7 +13,7 @@ uint32_t max_cluster_pixels;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
-void filter_blob_pair_extents(uint3 dispatch_thread_id : SV_DispatchThreadID)
+void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     filter_blob_pair_extents(
         dispatch_thread_id.x,

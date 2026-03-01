@@ -611,7 +611,7 @@ void build_line_fit_points(
 void build_line_fit_points_buffer(
     uint tid,
     StructuredBuffer<uint32_t> sorted_selected_points,
-    StructuredBuffer<uint32_t> decimated_image,
+    StructuredBuffer<uint8_t> decimated_image,
     ImageSize decimated_size,
     RWStructuredBuffer<uint32_t> line_fit_points_out,
     uint32_t point_count,

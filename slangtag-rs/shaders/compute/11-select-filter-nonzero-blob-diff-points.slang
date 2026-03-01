@@ -7,7 +7,7 @@ uint32_t total_points;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
-void filter_nonzero_blob_diff_points(uint3 dispatch_thread_id : SV_DispatchThreadID)
+void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     filter_nonzero_blob_diff_points(
         dispatch_thread_id.x,

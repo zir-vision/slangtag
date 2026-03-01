@@ -1,88 +1,31 @@
 pub mod detect;
 
+#[macro_export]
+macro_rules! compute_shader_path {
+    ($shader_stem:literal) => {
+        concat!(env!("OUT_DIR"), "/shaders/compute/", $shader_stem, ".spv")
+    };
+}
+
+use bytemuck::{Pod, Zeroable};
 use image::{DynamicImage, ImageBuffer, Pixel, Primitive};
 use num_traits::real::Real;
+use std::fmt::Debug;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, io, process::Command};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo};
-use vulkano::device::QueueFlags;
+use vulkano::device::{DeviceFeatures, QueueFlags};
 use vulkano::device::{Device, DeviceCreateInfo, QueueCreateInfo};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 use vulkano::sync::GpuFuture;
 use vulkano::{VulkanLibrary, sync};
 
-/// Compiles a Slang compute shader to SPIR-V and returns the output path.
-///
-/// This uses `slangc` from `$SLANGC` if set, otherwise `slangc` from `PATH`.
-/// Relative `shader_path` values are resolved from `$CARGO_MANIFEST_DIR` when
-/// available.
-pub fn compile_slang_compute_shader_path<P: AsRef<Path>>(
-    shader_path: P,
-    entry_point: &str,
-) -> io::Result<PathBuf> {
-    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
-    let raw_shader_path = shader_path.as_ref();
-    let shader_path = if raw_shader_path.is_absolute() {
-        raw_shader_path.to_path_buf()
-    } else if let Some(manifest_dir) = manifest_dir {
-        manifest_dir.join(raw_shader_path)
-    } else {
-        raw_shader_path.to_path_buf()
-    };
-
-    let shader_stem = shader_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid shader filename"))?;
-
-    let out_root = std::env::var_os("OUT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("slangtag-spv");
-    fs::create_dir_all(&out_root)?;
-    let out_path = out_root.join(format!("{shader_stem}.{entry_point}.spv"));
-
-    let compiler = std::env::var("SLANGC").unwrap_or_else(|_| "slangc".to_string());
-    let output = Command::new(compiler)
-        .arg(&shader_path)
-        .arg("-target")
-        .arg("spirv")
-        .arg("-stage")
-        .arg("compute")
-        .arg("-entry")
-        .arg(entry_point)
-        .arg("-o")
-        .arg(&out_path)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::other(format!(
-            "slangc failed for {} (entry: {}): {}",
-            shader_path.display(),
-            entry_point,
-            stderr.trim()
-        )));
-    }
-
-    Ok(out_path)
-}
-
-#[macro_export]
-macro_rules! compile_slang_compute_shader {
-    ($shader_path:expr) => {
-        $crate::compile_slang_compute_shader_path($shader_path, "main")
-    };
-    ($shader_path:expr, $entry_point:expr) => {
-        $crate::compile_slang_compute_shader_path($shader_path, $entry_point)
-    };
-}
-
-#[derive(Clone, Copy)]
+#[repr(C)]
+#[derive(Pod, Zeroable, Clone, Copy)]
 pub struct Size {
     pub width: u32,
     pub height: u32,
@@ -109,7 +52,7 @@ pub struct GPUImage<T> {
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<T: BufferContents + Primitive> GPUImage<T> {
+impl<T: BufferContents + Primitive + Debug> GPUImage<T> {
     pub fn new(device: ComputeDevice, image: Subbuffer<[T]>, size: Size) -> Self {
         Self {
             image,
@@ -239,7 +182,16 @@ impl<T: BufferContents + Primitive> GPUImage<T> {
         data.to_vec()
     }
 
+    pub fn to_image_buffer(&self) -> ImageBuffer<image::Luma<T>, Vec<T>> {
+        let data = self.data();
+        println!("Read {} pixels from GPU image", data.len());
+        println!("Pixel data sample: {:?}", data.get(0..10));
+        ImageBuffer::from_raw(self.size.width, self.size.height, data)
+            .expect("failed to create image buffer from GPU image data")
+    }
 }
+
+
 
 
 #[derive(Clone)]
@@ -291,6 +243,10 @@ impl ComputeDevice {
                     queue_family_index,
                     ..Default::default()
                 }],
+                enabled_features: DeviceFeatures {
+                    shader_int8: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )

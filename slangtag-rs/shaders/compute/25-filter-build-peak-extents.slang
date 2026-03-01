@@ -7,7 +7,7 @@ uint32_t valid_peaks;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
-void build_peak_extents(uint3 dispatch_thread_id : SV_DispatchThreadID)
+void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     build_peak_extents(
         dispatch_thread_id.x,

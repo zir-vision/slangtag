@@ -194,12 +194,12 @@ uint8_t sample_warped(Texture2D<uint8_t1> image_gray,
     return sample_image(image_gray, src_x, src_y);
 }
 
-uint8_t sample_image_buffer(StructuredBuffer<uint32_t> image_gray, ImageSize image_size, int x, int y)
+uint8_t sample_image_buffer(StructuredBuffer<uint8_t> image_gray, ImageSize image_size, int x, int y)
 {
     return image_u8_read_i32(image_gray, image_size, x, y);
 }
 
-uint8_t sample_warped_buffer(StructuredBuffer<uint32_t> image_gray,
+uint8_t sample_warped_buffer(StructuredBuffer<uint8_t> image_gray,
                              ImageSize image_size,
                              float h00,
                              float h01,
@@ -450,7 +450,7 @@ void extract_candidate_bits(
 
 void prepare_decode_quads_buffer(
     uint tid,
-    StructuredBuffer<uint32_t> image_gray,
+    StructuredBuffer<uint8_t> image_gray,
     ImageSize image_size,
     StructuredBuffer<uint32_t> corners,
     RWStructuredBuffer<uint32_t> quad_params_out,
@@ -579,7 +579,7 @@ void prepare_decode_quads_buffer(
 
 void extract_candidate_bits_buffer(
     uint tid,
-    StructuredBuffer<uint32_t> image_gray,
+    StructuredBuffer<uint8_t> image_gray,
     ImageSize image_size,
     StructuredBuffer<uint32_t> quad_params,
     RWStructuredBuffer<uint32_t> bits_out,

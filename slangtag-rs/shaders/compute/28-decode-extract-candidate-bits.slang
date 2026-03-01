@@ -1,7 +1,7 @@
 import "./image_buffer.slang";
 import "../decode.slang";
 
-StructuredBuffer<uint32_t> image_gray;
+StructuredBuffer<uint8_t> image_gray;
 StructuredBuffer<uint32_t> quad_params;
 RWStructuredBuffer<uint32_t> bits_out;
 
@@ -20,7 +20,7 @@ ConstantBuffer<PushConstants> pc;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
-void extract_candidate_bits(uint3 dispatch_thread_id : SV_DispatchThreadID)
+void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     extract_candidate_bits_buffer(
         dispatch_thread_id.x,

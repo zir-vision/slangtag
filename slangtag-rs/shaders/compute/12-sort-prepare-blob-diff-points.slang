@@ -7,7 +7,7 @@ uint32_t total_points;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
-void prepare_blob_diff_points(uint3 dispatch_thread_id : SV_DispatchThreadID)
+void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     prepare_blob_diff_points(dispatch_thread_id.x, input, output, valid_points, total_points);
 }

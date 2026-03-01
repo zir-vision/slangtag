@@ -143,7 +143,7 @@ void blob_diff(uint2 tid,
 }
 
 void blob_diff_buffer(uint2 tid,
-                      StructuredBuffer<uint32_t> thresholded_image,
+                      StructuredBuffer<uint8_t> thresholded_image,
                       ImageSize thresholded_size,
                       RWStructuredBuffer<uint32_t> blobs,
                       RWStructuredBuffer<uint32_t> union_markers_size,

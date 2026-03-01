@@ -10,7 +10,7 @@ uint32_t point_count;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
-void fit_line_errors_and_peaks(uint3 dispatch_thread_id : SV_DispatchThreadID)
+void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     fit_line_errors_and_peaks(
         dispatch_thread_id.x,

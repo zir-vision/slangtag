@@ -2,7 +2,7 @@ import "./image_buffer.slang";
 import "../filter.slang";
 
 StructuredBuffer<uint32_t> sorted_selected_points;
-StructuredBuffer<uint32_t> decimated_image;
+StructuredBuffer<uint8_t> decimated_image;
 RWStructuredBuffer<uint32_t> line_fit_points_out;
 
 struct PushConstants
@@ -17,7 +17,7 @@ ConstantBuffer<PushConstants> pc;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
-void build_line_fit_points(uint3 dispatch_thread_id : SV_DispatchThreadID)
+void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     build_line_fit_points_buffer(
         dispatch_thread_id.x,

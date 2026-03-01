@@ -1,9 +1,9 @@
 import "./image_buffer.slang";
 import "../threshold.slang";
 
-StructuredBuffer<uint32_t> decimated_image;
-StructuredBuffer<uint32_t> filtered_image;
-RWStructuredBuffer<uint32_t> thresholded_image;
+StructuredBuffer<uint8_t> decimated_image;
+StructuredBuffer<uint8_t2> filtered_image;
+RWStructuredBuffer<uint8_t> thresholded_image;
 
 struct PushConstants
 {
@@ -18,7 +18,7 @@ ConstantBuffer<PushConstants> pc;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
-void threshold(uint3 dispatch_thread_id : SV_DispatchThreadID)
+void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     threshold_buffer(
         dispatch_thread_id.xy,

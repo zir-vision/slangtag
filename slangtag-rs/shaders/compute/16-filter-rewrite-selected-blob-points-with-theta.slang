@@ -9,7 +9,7 @@ uint32_t valid_points;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
-void rewrite_selected_blob_points_with_theta(uint3 dispatch_thread_id : SV_DispatchThreadID)
+void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     rewrite_selected_blob_points_with_theta(
         dispatch_thread_id.x,

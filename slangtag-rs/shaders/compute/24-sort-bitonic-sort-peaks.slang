@@ -7,7 +7,7 @@ uint32_t k;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
-void bitonic_sort_peaks(uint3 dispatch_thread_id : SV_DispatchThreadID)
+void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     bitonic_sort_peaks(dispatch_thread_id.x, peaks, total_peaks, j, k);
 }

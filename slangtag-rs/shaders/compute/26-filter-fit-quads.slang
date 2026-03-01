@@ -16,7 +16,7 @@ float quad_decimate;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
-void fit_quads(uint3 dispatch_thread_id : SV_DispatchThreadID)
+void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     fit_quads(
         dispatch_thread_id.x,
