@@ -1,6 +1,6 @@
 pub mod detect;
 
-use image::{DynamicImage, ImageBuffer};
+use image::{DynamicImage, ImageBuffer, Pixel, Primitive};
 use num_traits::real::Real;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -109,10 +109,82 @@ pub struct GPUImage<T> {
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<T: Real + BufferContents> GPUImage<T> {
+impl<T: BufferContents + Primitive> GPUImage<T> {
     pub fn new(device: ComputeDevice, image: Subbuffer<[T]>, size: Size) -> Self {
         Self {
             image,
+            size,
+            device,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn from_image_buffer(
+        device: ComputeDevice,
+        image: ImageBuffer<image::Luma<T>, Vec<T>>,
+    ) -> Self {
+        let size = Size::new(image.width(), image.height());
+        let flat_data: Vec<T> = image.into_raw();
+
+        // Create a staging buffer for the image data
+        let transfer_buffer: Subbuffer<[T]> = Buffer::from_iter(
+            device.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            flat_data.into_iter(),
+        )
+        .expect("failed to create transfer buffer");
+
+        // Create the GPU image buffer that will hold the data on the GPU
+        // This buffer should be device-local for optimal performance, and we'll copy the data from the staging buffer
+        let gpu_image: Subbuffer<[T]> = Buffer::new_unsized(
+            device.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_DST | BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+            size.total_pixels().try_into().expect("image size exceeds buffer limits"),
+        )
+        .expect("failed to create GPU image buffer");
+
+        // Copy data from the staging buffer to the GPU image buffer
+        let mut builder = AutoCommandBufferBuilder::primary(
+            device.command_buffer_allocator.clone(),
+            device.queue_family_index,
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+
+        builder
+            .copy_buffer(CopyBufferInfo::buffers(
+                transfer_buffer.clone(),
+                gpu_image.clone(),
+            ))
+            .unwrap();
+
+        let command_buffer = builder.build().unwrap();
+
+        let future = sync::now(device.device.clone())
+            .then_execute(device.queue.clone(), command_buffer)
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap();
+
+        future.wait(None).unwrap();
+
+        Self {
+            image: gpu_image,
             size,
             device,
             _marker: std::marker::PhantomData,
@@ -131,7 +203,10 @@ impl<T: Real + BufferContents> GPUImage<T> {
                     | MemoryTypeFilter::HOST_RANDOM_ACCESS,
                 ..Default::default()
             },
-            self.size.total_pixels().try_into().expect("image size exceeds buffer limits"),
+            self.size
+                .total_pixels()
+                .try_into()
+                .expect("image size exceeds buffer limits"),
         )
         .expect("failed to create destination buffer");
 
@@ -163,7 +238,9 @@ impl<T: Real + BufferContents> GPUImage<T> {
 
         data.to_vec()
     }
+
 }
+
 
 #[derive(Clone)]
 pub struct ComputeDevice {
