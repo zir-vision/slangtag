@@ -1,3 +1,5 @@
+import "compute/image_buffer.slang";
+
 static const uint32_t kBlobDiffWordsPerPoint = 6u;
 static const uint32_t kBlobExtentWordsPerExtent = 11u;
 static const uint32_t kSelectedBlobPointWordsPerPoint = 4u;
@@ -565,6 +567,86 @@ void build_line_fit_points(
                 - int(decimated_image[uint2(uint32_t(ix - 1), uint32_t(iy))].x);
             int grad_y = int(decimated_image[uint2(uint32_t(ix), uint32_t(iy + 1))].x)
                 - int(decimated_image[uint2(uint32_t(ix), uint32_t(iy - 1))].x);
+
+            W = int(sqrt(float(grad_x * grad_x + grad_y * grad_y))) + 1;
+        }
+
+        int point_Mx = W * ix2;
+        int point_My = W * iy2;
+        int64_t point_Mxx = int64_t(W) * int64_t(ix2) * int64_t(ix2);
+        int64_t point_Mxy = int64_t(W) * int64_t(ix2) * int64_t(iy2);
+        int64_t point_Myy = int64_t(W) * int64_t(iy2) * int64_t(iy2);
+
+        if (blob_index != previous_blob_index)
+        {
+            running_Mx = 0;
+            running_My = 0;
+            running_W = 0;
+            running_Mxx = 0;
+            running_Myy = 0;
+            running_Mxy = 0;
+            previous_blob_index = blob_index;
+        }
+
+        running_Mx += point_Mx;
+        running_My += point_My;
+        running_W += W;
+        running_Mxx += point_Mxx;
+        running_Myy += point_Myy;
+        running_Mxy += point_Mxy;
+
+        write_line_fit_point(
+            line_fit_points_out,
+            i,
+            running_Mx,
+            running_My,
+            running_W,
+            blob_index,
+            running_Mxx,
+            running_Myy,
+            running_Mxy);
+    }
+}
+
+void build_line_fit_points_buffer(
+    uint tid,
+    StructuredBuffer<uint32_t> sorted_selected_points,
+    StructuredBuffer<uint32_t> decimated_image,
+    ImageSize decimated_size,
+    RWStructuredBuffer<uint32_t> line_fit_points_out,
+    uint32_t point_count,
+    uint32_t decimate)
+{
+    if (tid != 0u)
+        return;
+
+    uint32_t previous_blob_index = 0xFFFFFFFFu;
+    int running_Mx = 0;
+    int running_My = 0;
+    int running_W = 0;
+    int64_t running_Mxx = 0;
+    int64_t running_Myy = 0;
+    int64_t running_Mxy = 0;
+
+    for (uint32_t i = 0u; i < point_count; ++i)
+    {
+        uint32_t blob_index = read_selected_blob_point_word(sorted_selected_points, i, kSelectedPointBlobIndexWord);
+        uint32_t x = read_selected_blob_point_word(sorted_selected_points, i, kSelectedPointXWord);
+        uint32_t y = read_selected_blob_point_word(sorted_selected_points, i, kSelectedPointYWord);
+
+        int delta = int(decimate) - 1;
+        int ix2 = int(x) * int(decimate) + delta;
+        int iy2 = int(y) * int(decimate) + delta;
+        int ix = ix2 / int(decimate);
+        int iy = iy2 / int(decimate);
+
+        int W = 1;
+        if (ix > 0 && uint32_t(ix + 1) < decimated_size.width && iy > 0 && uint32_t(iy + 1) < decimated_size.height)
+        {
+            int grad_x = int(image_u8_read(decimated_image, decimated_size, uint2(uint32_t(ix + 1), uint32_t(iy))))
+                - int(image_u8_read(decimated_image, decimated_size, uint2(uint32_t(ix - 1), uint32_t(iy))));
+            int grad_y = int(image_u8_read(decimated_image, decimated_size, uint2(uint32_t(ix), uint32_t(iy + 1))))
+                - int(image_u8_read(decimated_image, decimated_size, uint2(uint32_t(ix), uint32_t(iy - 1))));
 
             W = int(sqrt(float(grad_x * grad_x + grad_y * grad_y))) + 1;
         }

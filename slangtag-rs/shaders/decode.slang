@@ -1,3 +1,5 @@
+import "compute/image_buffer.slang";
+
 static const uint32_t kCornersWordsPerQuad = 8u;
 static const uint32_t kQuadParamWordsPerQuad = 12u;
 static const uint32_t kQuadParamH00Word = 0u;
@@ -190,6 +192,38 @@ uint8_t sample_warped(Texture2D<uint8_t1> image_gray,
     int src_x = int(floor(sx + 0.5f));
     int src_y = int(floor(sy + 0.5f));
     return sample_image(image_gray, src_x, src_y);
+}
+
+uint8_t sample_image_buffer(StructuredBuffer<uint32_t> image_gray, ImageSize image_size, int x, int y)
+{
+    return image_u8_read_i32(image_gray, image_size, x, y);
+}
+
+uint8_t sample_warped_buffer(StructuredBuffer<uint32_t> image_gray,
+                             ImageSize image_size,
+                             float h00,
+                             float h01,
+                             float h02,
+                             float h10,
+                             float h11,
+                             float h12,
+                             float h20,
+                             float h21,
+                             float h22,
+                             uint32_t dx,
+                             uint32_t dy)
+{
+    float fx = float(dx);
+    float fy = float(dy);
+    float denom = h20 * fx + h21 * fy + h22;
+    if (abs(denom) <= 1e-8f)
+        return 0u;
+
+    float sx = (h00 * fx + h01 * fy + h02) / denom;
+    float sy = (h10 * fx + h11 * fy + h12) / denom;
+    int src_x = int(floor(sx + 0.5f));
+    int src_y = int(floor(sy + 0.5f));
+    return sample_image_buffer(image_gray, image_size, src_x, src_y);
 }
 
 void write_quad_param_float(RWStructuredBuffer<uint32_t> quad_params, uint32_t quad_index, uint32_t word_index, float value)
@@ -396,6 +430,211 @@ void extract_candidate_bits(
         {
             uint32_t v = uint32_t(sample_warped(
                 image_gray,
+                h00,
+                h01,
+                h02,
+                h10,
+                h11,
+                h12,
+                h20,
+                h21,
+                h22,
+                start_x + xx,
+                start_y + yy));
+            if (v > otsu_threshold)
+                white_pixels += 1u;
+        }
+    }
+    bits_out[tid] = (white_pixels > (area >> 1u)) ? 1u : 0u;
+}
+
+void prepare_decode_quads_buffer(
+    uint tid,
+    StructuredBuffer<uint32_t> image_gray,
+    ImageSize image_size,
+    StructuredBuffer<uint32_t> corners,
+    RWStructuredBuffer<uint32_t> quad_params_out,
+    uint32_t quad_count,
+    uint32_t marker_size_with_borders,
+    uint32_t cell_size,
+    float min_stddev_otsu)
+{
+    if (tid >= quad_count)
+        return;
+
+    uint32_t quad_index = tid;
+    uint32_t result_size = marker_size_with_borders * cell_size;
+
+    float h00;
+    float h01;
+    float h02;
+    float h10;
+    float h11;
+    float h12;
+    float h20;
+    float h21;
+    float h22;
+    bool valid_h = build_dst_to_src_homography(
+        corners, quad_index, result_size, h00, h01, h02, h10, h11, h12, h20, h21, h22);
+    write_quad_param_float(quad_params_out, quad_index, kQuadParamH00Word, h00);
+    write_quad_param_float(quad_params_out, quad_index, kQuadParamH01Word, h01);
+    write_quad_param_float(quad_params_out, quad_index, kQuadParamH02Word, h02);
+    write_quad_param_float(quad_params_out, quad_index, kQuadParamH10Word, h10);
+    write_quad_param_float(quad_params_out, quad_index, kQuadParamH11Word, h11);
+    write_quad_param_float(quad_params_out, quad_index, kQuadParamH12Word, h12);
+    write_quad_param_float(quad_params_out, quad_index, kQuadParamH20Word, h20);
+    write_quad_param_float(quad_params_out, quad_index, kQuadParamH21Word, h21);
+    write_quad_param_float(quad_params_out, quad_index, kQuadParamH22Word, h22);
+    if (!valid_h)
+    {
+        write_quad_param_uint(quad_params_out, quad_index, kQuadParamModeWord, 2u);
+        write_quad_param_uint(quad_params_out, quad_index, kQuadParamFillBitWord, 0u);
+        write_quad_param_uint(quad_params_out, quad_index, kQuadParamOtsuThresholdWord, 0u);
+        return;
+    }
+
+    uint32_t inner_margin = cell_size / 2u;
+    uint32_t inner_start = inner_margin;
+    uint32_t inner_end = result_size - inner_margin;
+    uint32_t inner_count = 0u;
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+
+    [loop]
+    for (uint32_t y = inner_start; y < inner_end; ++y)
+    {
+        [loop]
+        for (uint32_t x = inner_start; x < inner_end; ++x)
+        {
+            float v = float(sample_warped_buffer(image_gray, image_size, h00, h01, h02, h10, h11, h12, h20, h21, h22, x, y));
+            sum += v;
+            sum_sq += v * v;
+            inner_count += 1u;
+        }
+    }
+
+    float mean = inner_count > 0u ? sum / float(inner_count) : 0.0f;
+    float variance = inner_count > 0u ? max(0.0f, sum_sq / float(inner_count) - mean * mean) : 0.0f;
+    float stddev = sqrt(variance);
+
+    if (stddev < min_stddev_otsu)
+    {
+        uint32_t fill = mean > 127.0f ? 1u : 0u;
+        write_quad_param_uint(quad_params_out, quad_index, kQuadParamModeWord, 1u);
+        write_quad_param_uint(quad_params_out, quad_index, kQuadParamFillBitWord, fill);
+        write_quad_param_uint(quad_params_out, quad_index, kQuadParamOtsuThresholdWord, 0u);
+        return;
+    }
+
+    uint32_t hist[256];
+    [unroll]
+    for (uint32_t i = 0u; i < 256u; ++i)
+    {
+        hist[i] = 0u;
+    }
+
+    uint32_t total = result_size * result_size;
+    float total_sum = 0.0f;
+    [loop]
+    for (uint32_t y = 0u; y < result_size; ++y)
+    {
+        [loop]
+        for (uint32_t x = 0u; x < result_size; ++x)
+        {
+            uint32_t v = uint32_t(sample_warped_buffer(image_gray, image_size, h00, h01, h02, h10, h11, h12, h20, h21, h22, x, y));
+            hist[v] += 1u;
+            total_sum += float(v);
+        }
+    }
+
+    uint32_t otsu_threshold = 0u;
+    float sum_b = 0.0f;
+    uint32_t w_b = 0u;
+    float max_between = -1.0f;
+    [loop]
+    for (uint32_t t = 0u; t < 256u; ++t)
+    {
+        w_b += hist[t];
+        if (w_b == 0u)
+            continue;
+
+        uint32_t w_f = total - w_b;
+        if (w_f == 0u)
+            break;
+
+        sum_b += float(t) * float(hist[t]);
+        float m_b = sum_b / float(w_b);
+        float m_f = (total_sum - sum_b) / float(w_f);
+        float between = float(w_b) * float(w_f) * (m_b - m_f) * (m_b - m_f);
+        if (between > max_between)
+        {
+            max_between = between;
+            otsu_threshold = t;
+        }
+    }
+    write_quad_param_uint(quad_params_out, quad_index, kQuadParamModeWord, 0u);
+    write_quad_param_uint(quad_params_out, quad_index, kQuadParamFillBitWord, 0u);
+    write_quad_param_uint(quad_params_out, quad_index, kQuadParamOtsuThresholdWord, otsu_threshold);
+}
+
+void extract_candidate_bits_buffer(
+    uint tid,
+    StructuredBuffer<uint32_t> image_gray,
+    ImageSize image_size,
+    StructuredBuffer<uint32_t> quad_params,
+    RWStructuredBuffer<uint32_t> bits_out,
+    uint32_t quad_count,
+    uint32_t marker_size_with_borders,
+    uint32_t cell_size,
+    uint32_t cell_margin_pixels,
+    uint32_t cell_span)
+{
+    uint32_t cells_per_quad = marker_size_with_borders * marker_size_with_borders;
+    uint32_t total_cells = quad_count * cells_per_quad;
+    if (tid >= total_cells || cell_span == 0u)
+        return;
+
+    uint32_t quad_index = tid / cells_per_quad;
+    uint32_t cell_index = tid - quad_index * cells_per_quad;
+    uint32_t cell_y = cell_index / marker_size_with_borders;
+    uint32_t cell_x = cell_index - cell_y * marker_size_with_borders;
+
+    uint32_t mode = read_quad_param_uint(quad_params, quad_index, kQuadParamModeWord);
+    if (mode == 2u)
+    {
+        bits_out[tid] = 0u;
+        return;
+    }
+    if (mode == 1u)
+    {
+        bits_out[tid] = read_quad_param_uint(quad_params, quad_index, kQuadParamFillBitWord);
+        return;
+    }
+
+    float h00 = read_quad_param_float(quad_params, quad_index, kQuadParamH00Word);
+    float h01 = read_quad_param_float(quad_params, quad_index, kQuadParamH01Word);
+    float h02 = read_quad_param_float(quad_params, quad_index, kQuadParamH02Word);
+    float h10 = read_quad_param_float(quad_params, quad_index, kQuadParamH10Word);
+    float h11 = read_quad_param_float(quad_params, quad_index, kQuadParamH11Word);
+    float h12 = read_quad_param_float(quad_params, quad_index, kQuadParamH12Word);
+    float h20 = read_quad_param_float(quad_params, quad_index, kQuadParamH20Word);
+    float h21 = read_quad_param_float(quad_params, quad_index, kQuadParamH21Word);
+    float h22 = read_quad_param_float(quad_params, quad_index, kQuadParamH22Word);
+    uint32_t otsu_threshold = read_quad_param_uint(quad_params, quad_index, kQuadParamOtsuThresholdWord);
+
+    uint32_t area = cell_span * cell_span;
+    uint32_t start_x = cell_x * cell_size + cell_margin_pixels;
+    uint32_t start_y = cell_y * cell_size + cell_margin_pixels;
+    uint32_t white_pixels = 0u;
+    [loop]
+    for (uint32_t yy = 0u; yy < cell_span; ++yy)
+    {
+        [loop]
+        for (uint32_t xx = 0u; xx < cell_span; ++xx)
+        {
+            uint32_t v = uint32_t(sample_warped_buffer(
+                image_gray,
+                image_size,
                 h00,
                 h01,
                 h02,
