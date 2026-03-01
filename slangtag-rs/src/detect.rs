@@ -1,4 +1,4 @@
-use image::{DynamicImage, GenericImageView};
+use image::{DynamicImage, GrayImage, ImageBuffer};
 
 use crate::ComputeDevice;
 
@@ -13,7 +13,7 @@ impl Detector {
     }
 
     pub fn detect(&self, image: DynamicImage) -> Result<(), ()> {
-        
+        let gray = image.into_luma8();
         Ok(())
     }
 }

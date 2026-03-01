@@ -1,12 +1,19 @@
 pub mod detect;
 
+use image::{DynamicImage, ImageBuffer};
+use num_traits::real::Real;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, io, process::Command};
-use vulkano::VulkanLibrary;
+use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
+use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo};
 use vulkano::device::QueueFlags;
 use vulkano::device::{Device, DeviceCreateInfo, QueueCreateInfo};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
+use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
+use vulkano::sync::GpuFuture;
+use vulkano::{VulkanLibrary, sync};
 
 /// Compiles a Slang compute shader to SPIR-V and returns the output path.
 ///
@@ -75,6 +82,90 @@ macro_rules! compile_slang_compute_shader {
     };
 }
 
+#[derive(Clone, Copy)]
+pub struct Size {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Size {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+
+    pub fn total_pixels(&self) -> usize {
+        (self.width as usize) * (self.height as usize)
+    }
+}
+
+/// GPUImage is a grayscale image in GPU memory.
+/// T is a marker type for the image format, e.g. u8 for 8-bit grayscale, f32 for 32-bit float grayscale, etc.
+#[derive(Clone)]
+pub struct GPUImage<T> {
+    pub(crate) image: Subbuffer<[T]>,
+    pub(crate) size: Size,
+    device: ComputeDevice,
+
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T: Real + BufferContents> GPUImage<T> {
+    pub fn new(device: ComputeDevice, image: Subbuffer<[T]>, size: Size) -> Self {
+        Self {
+            image,
+            size,
+            device,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn data(&self) -> Vec<T> {
+        let destination: Subbuffer<[T]> = Buffer::new_unsized(
+            self.device.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_DST,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                ..Default::default()
+            },
+            self.size.total_pixels().try_into().expect("image size exceeds buffer limits"),
+        )
+        .expect("failed to create destination buffer");
+
+        let mut builder = AutoCommandBufferBuilder::primary(
+            self.device.command_buffer_allocator.clone(),
+            self.device.queue_family_index,
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+
+        builder
+            .copy_buffer(CopyBufferInfo::buffers(
+                self.image.clone(),
+                destination.clone(),
+            ))
+            .unwrap();
+
+        let command_buffer = builder.build().unwrap();
+
+        let future = sync::now(self.device.device.clone())
+            .then_execute(self.device.queue.clone(), command_buffer)
+            .unwrap()
+            .then_signal_fence_and_flush() // same as signal fence, and then flush
+            .unwrap();
+
+        future.wait(None).unwrap();
+
+        let data = destination.read().unwrap();
+
+        data.to_vec()
+    }
+}
+
+#[derive(Clone)]
 pub struct ComputeDevice {
     pub(crate) device: Arc<vulkano::device::Device>,
     pub(crate) queue: Arc<vulkano::device::Queue>,
@@ -83,6 +174,7 @@ pub struct ComputeDevice {
         Arc<vulkano::command_buffer::allocator::StandardCommandBufferAllocator>,
     pub(crate) descriptor_set_allocator:
         Arc<vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator>,
+    pub(crate) queue_family_index: u32,
 }
 
 impl ComputeDevice {
@@ -128,9 +220,9 @@ impl ComputeDevice {
         .expect("failed to create device");
         let queue = queues.next().unwrap();
 
-        let memory_allocator = Arc::new(vulkano::memory::allocator::StandardMemoryAllocator::new_default(
-            device.clone(),
-        ));
+        let memory_allocator = Arc::new(
+            vulkano::memory::allocator::StandardMemoryAllocator::new_default(device.clone()),
+        );
         let command_buffer_allocator = Arc::new(
             vulkano::command_buffer::allocator::StandardCommandBufferAllocator::new(
                 device.clone(),
@@ -138,7 +230,10 @@ impl ComputeDevice {
             ),
         );
         let descriptor_set_allocator = Arc::new(
-            vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator::new(device.clone(), Default::default()),
+            vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator::new(
+                device.clone(),
+                Default::default(),
+            ),
         );
 
         ComputeDevice {
@@ -147,6 +242,7 @@ impl ComputeDevice {
             memory_allocator,
             command_buffer_allocator,
             descriptor_set_allocator,
+            queue_family_index,
         }
     }
 }

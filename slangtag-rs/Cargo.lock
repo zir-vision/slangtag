@@ -1152,6 +1152,7 @@ name = "slangtag"
 version = "0.1.0"
 dependencies = [
  "image",
+ "num-traits",
  "vulkano",
 ]
 
