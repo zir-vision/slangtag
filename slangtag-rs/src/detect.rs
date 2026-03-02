@@ -1,7 +1,8 @@
 use crate::{ComputeDevice, GPUImage, Size, compute_shader_path};
 use bytemuck::{Pod, Zeroable};
 use image::{DynamicImage, GrayImage};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 use vulkano::buffer::BufferContents;
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
@@ -17,6 +18,37 @@ use vulkano::{
 };
 
 include!("apriltag36h11_codes.rs");
+
+#[derive(Copy, Clone)]
+struct RotatedTagCode {
+    code: u64,
+    id: u32,
+    rotation: u8,
+}
+
+static APRILTAG_36H11_ROTATED_CODES: LazyLock<Vec<RotatedTagCode>> = LazyLock::new(|| {
+    let mut rotated_codes = Vec::with_capacity(APRILTAG_36H11_CODES.len() * 4);
+    for (id, code) in APRILTAG_36H11_CODES.iter().copied().enumerate() {
+        let mut rotated_code = code;
+        for rotation in 0..4u8 {
+            rotated_codes.push(RotatedTagCode {
+                code: rotated_code,
+                id: id as u32,
+                rotation,
+            });
+            rotated_code = Detector::rotate_code_ccw(rotated_code, Detector::APRILTAG_MARKER_SIZE);
+        }
+    }
+    rotated_codes
+});
+
+static APRILTAG_36H11_EXACT_LOOKUP: LazyLock<HashMap<u64, (u32, u8)>> = LazyLock::new(|| {
+    let mut by_code = HashMap::with_capacity(APRILTAG_36H11_ROTATED_CODES.len());
+    for entry in APRILTAG_36H11_ROTATED_CODES.iter().copied() {
+        by_code.entry(entry.code).or_insert((entry.id, entry.rotation));
+    }
+    by_code
+});
 
 pub struct DetectionSettings {
     pub decimate: Option<u8>,
@@ -78,125 +110,125 @@ impl DetectionPipelines {
         Self {
             decimate: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("01-threshold-decimate")),
+                include_bytes!(compute_shader_path!("threshold-decimate")),
             ),
             minmax: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("02-threshold-minmax")),
+                include_bytes!(compute_shader_path!("threshold-minmax")),
             ),
             filter_minmax: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("03-threshold-filter-minmax")),
+                include_bytes!(compute_shader_path!("threshold-filter-minmax")),
             ),
             threshold: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("04-threshold-threshold")),
+                include_bytes!(compute_shader_path!("threshold-threshold")),
             ),
             ccl_init: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("05-ccl-init")),
+                include_bytes!(compute_shader_path!("ccl-init")),
             ),
             ccl_compression: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("06-ccl-compression")),
+                include_bytes!(compute_shader_path!("ccl-compression")),
             ),
             ccl_merge: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("07-ccl-merge")),
+                include_bytes!(compute_shader_path!("ccl-merge")),
             ),
             ccl_final_labeling: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("08-ccl-final-labeling")),
+                include_bytes!(compute_shader_path!("ccl-final-labeling")),
             ),
             blob_diff: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("09-blob-blob-diff")),
+                include_bytes!(compute_shader_path!("blob-blob-diff")),
             ),
             count_nonzero_blob_diff_points: Detector::create_compute_pipeline(
                 device,
                 include_bytes!(compute_shader_path!(
-                    "10-select-count-nonzero-blob-diff-points"
+                    "select-count-nonzero-blob-diff-points"
                 )),
             ),
             filter_nonzero_blob_diff_points: Detector::create_compute_pipeline(
                 device,
                 include_bytes!(compute_shader_path!(
-                    "11-select-filter-nonzero-blob-diff-points"
+                    "select-filter-nonzero-blob-diff-points"
                 )),
             ),
             prepare_blob_diff_points: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("12-sort-prepare-blob-diff-points")),
+                include_bytes!(compute_shader_path!("sort-prepare-blob-diff-points")),
             ),
             bitonic_sort_blob_diff_points: Detector::create_compute_pipeline(
                 device,
                 include_bytes!(compute_shader_path!(
-                    "13-sort-bitonic-sort-blob-diff-points"
+                    "sort-bitonic-sort-blob-diff-points"
                 )),
             ),
             build_blob_pair_extents: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("14-filter-build-blob-pair-extents")),
+                include_bytes!(compute_shader_path!("filter-build-blob-pair-extents")),
             ),
             filter_blob_pair_extents: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("15-filter-filter-blob-pair-extents")),
+                include_bytes!(compute_shader_path!("filter-filter-blob-pair-extents")),
             ),
             rewrite_selected_blob_points_with_theta: Detector::create_compute_pipeline(
                 device,
                 include_bytes!(compute_shader_path!(
-                    "16-filter-rewrite-selected-blob-points-with-theta"
+                    "filter-rewrite-selected-blob-points-with-theta"
                 )),
             ),
             prepare_selected_blob_points: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("17-sort-prepare-selected-blob-points")),
+                include_bytes!(compute_shader_path!("sort-prepare-selected-blob-points")),
             ),
             bitonic_sort_selected_blob_points: Detector::create_compute_pipeline(
                 device,
                 include_bytes!(compute_shader_path!(
-                    "18-sort-bitonic-sort-selected-blob-points"
+                    "sort-bitonic-sort-selected-blob-points"
                 )),
             ),
             build_line_fit_points: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("19-filter-build-line-fit-points")),
+                include_bytes!(compute_shader_path!("filter-build-line-fit-points")),
             ),
             fit_line_errors_and_peaks: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("20-filter-fit-line-errors-and-peaks")),
+                include_bytes!(compute_shader_path!("filter-fit-line-errors-and-peaks")),
             ),
             count_valid_peaks: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("21-select-count-valid-peaks")),
+                include_bytes!(compute_shader_path!("select-count-valid-peaks")),
             ),
             filter_valid_peaks: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("22-select-filter-valid-peaks")),
+                include_bytes!(compute_shader_path!("select-filter-valid-peaks")),
             ),
             prepare_peaks: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("23-sort-prepare-peaks")),
+                include_bytes!(compute_shader_path!("sort-prepare-peaks")),
             ),
             bitonic_sort_peaks: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("24-sort-bitonic-sort-peaks")),
+                include_bytes!(compute_shader_path!("sort-bitonic-sort-peaks")),
             ),
             build_peak_extents: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("25-filter-build-peak-extents")),
+                include_bytes!(compute_shader_path!("filter-build-peak-extents")),
             ),
             fit_quads: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("26-filter-fit-quads")),
+                include_bytes!(compute_shader_path!("filter-fit-quads")),
             ),
             prepare_decode_quads: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("27-decode-prepare-decode-quads")),
+                include_bytes!(compute_shader_path!("decode-prepare-decode-quads")),
             ),
             extract_candidate_bits: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("28-decode-extract-candidate-bits")),
+                include_bytes!(compute_shader_path!("decode-extract-candidate-bits")),
             ),
         }
     }
@@ -834,20 +866,21 @@ impl Detector {
         let max_corrected_bits = (Self::APRILTAG_MAX_CORRECTION_BITS as f32
             * Self::APRILTAG_ERROR_CORRECTION_RATE)
             .floor() as u32;
+
+        if max_corrected_bits == 0 {
+            return APRILTAG_36H11_EXACT_LOOKUP.get(&payload_code).copied();
+        }
+
         let mut best_distance = u32::MAX;
         let mut best_id = 0u32;
         let mut best_rotation = 0u8;
 
-        for (id, code) in APRILTAG_36H11_CODES.iter().copied().enumerate() {
-            let mut rotated_code = code;
-            for rotation in 0..4u8 {
-                let distance = (payload_code ^ rotated_code).count_ones();
-                if distance < best_distance {
-                    best_distance = distance;
-                    best_id = id as u32;
-                    best_rotation = rotation;
-                }
-                rotated_code = Self::rotate_code_ccw(rotated_code, Self::APRILTAG_MARKER_SIZE);
+        for entry in APRILTAG_36H11_ROTATED_CODES.iter().copied() {
+            let distance = (payload_code ^ entry.code).count_ones();
+            if distance < best_distance {
+                best_distance = distance;
+                best_id = entry.id;
+                best_rotation = entry.rotation;
             }
         }
 
