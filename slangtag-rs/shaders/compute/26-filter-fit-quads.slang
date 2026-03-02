@@ -6,13 +6,20 @@ StructuredBuffer<uint32_t> line_fit_points;
 StructuredBuffer<uint32_t> filtered_blob_extents;
 RWStructuredBuffer<uint32_t> fitted_quads_out;
 RWStructuredBuffer<uint32_t> fitted_quad_count_out;
-uint32_t peak_extent_count;
-uint32_t filtered_blob_extent_count;
-uint32_t max_nmaxima;
-float max_line_fit_mse;
-float cos_critical_rad;
-uint32_t min_tag_width;
-float quad_decimate;
+
+struct PushConstants
+{
+    uint32_t peak_extent_count;
+    uint32_t filtered_blob_extent_count;
+    uint32_t max_nmaxima;
+    float max_line_fit_mse;
+    float cos_critical_rad;
+    uint32_t min_tag_width;
+    float quad_decimate;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<PushConstants> pc;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
@@ -26,11 +33,11 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
         filtered_blob_extents,
         fitted_quads_out,
         fitted_quad_count_out,
-        peak_extent_count,
-        filtered_blob_extent_count,
-        max_nmaxima,
-        max_line_fit_mse,
-        cos_critical_rad,
-        min_tag_width,
-        quad_decimate);
+        pc.peak_extent_count,
+        pc.filtered_blob_extent_count,
+        pc.max_nmaxima,
+        pc.max_line_fit_mse,
+        pc.cos_critical_rad,
+        pc.min_tag_width,
+        pc.quad_decimate);
 }

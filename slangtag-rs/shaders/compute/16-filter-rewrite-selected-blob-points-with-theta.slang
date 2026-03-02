@@ -4,11 +4,17 @@ StructuredBuffer<uint32_t> sorted_points;
 StructuredBuffer<uint32_t> extents_in;
 StructuredBuffer<uint32_t> filtered_extents;
 RWStructuredBuffer<uint32_t> selected_points_out;
-uint32_t extent_count;
-uint32_t valid_points;
+struct PushConstants
+{
+    uint32_t extent_count;
+    uint32_t valid_points;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<PushConstants> pc;
 
 [shader("compute")]
-[numthreads(1, 1, 1)]
+[numthreads(256, 1, 1)]
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     rewrite_selected_blob_points_with_theta(
@@ -17,6 +23,6 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
         extents_in,
         filtered_extents,
         selected_points_out,
-        extent_count,
-        valid_points);
+        pc.extent_count,
+        pc.valid_points);
 }

@@ -5,8 +5,14 @@ StructuredBuffer<uint32_t> filtered_extents;
 RWStructuredBuffer<uint32_t> errs_out;
 RWStructuredBuffer<uint32_t> filtered_errs_out;
 RWStructuredBuffer<uint32_t> peaks_out;
-uint32_t extent_count;
-uint32_t point_count;
+struct PushConstants
+{
+    uint32_t extent_count;
+    uint32_t point_count;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<PushConstants> pc;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
@@ -19,6 +25,6 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
         errs_out,
         filtered_errs_out,
         peaks_out,
-        extent_count,
-        point_count);
+        pc.extent_count,
+        pc.point_count);
 }

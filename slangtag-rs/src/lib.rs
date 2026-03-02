@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::{fs, io, process::Command};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo};
-use vulkano::device::{DeviceFeatures, QueueFlags};
 use vulkano::device::{Device, DeviceCreateInfo, QueueCreateInfo};
+use vulkano::device::{DeviceFeatures, QueueFlags};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 use vulkano::sync::GpuFuture;
@@ -97,7 +97,9 @@ impl<T: BufferContents + Primitive + Debug> GPUImage<T> {
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
             },
-            size.total_pixels().try_into().expect("image size exceeds buffer limits"),
+            size.total_pixels()
+                .try_into()
+                .expect("image size exceeds buffer limits"),
         )
         .expect("failed to create GPU image buffer");
 
@@ -191,9 +193,6 @@ impl<T: BufferContents + Primitive + Debug> GPUImage<T> {
     }
 }
 
-
-
-
 #[derive(Clone)]
 pub struct ComputeDevice {
     pub(crate) device: Arc<vulkano::device::Device>,
@@ -244,7 +243,8 @@ impl ComputeDevice {
                     ..Default::default()
                 }],
                 enabled_features: DeviceFeatures {
-                    shader_int8: true,
+                    shader_int8: true,  // >90% support.
+                    shader_int64: true, // 56% support. mostly android
                     ..Default::default()
                 },
                 ..Default::default()

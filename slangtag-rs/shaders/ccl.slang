@@ -27,6 +27,11 @@ void set_bit(inout uint8_t bitmap, Info position)
     bitmap |= (uint8_t(1) << uint8_t(position));
 }
 
+bool is_white_sample_u32(uint32_t v)
+{
+    return v != 0u && v != 127u;
+}
+
 // FIX: Use RWStructuredBuffer for linear addressing support
 uint32_t find(RWStructuredBuffer<uint32_t> s_buf, uint32_t n)
 {
@@ -99,15 +104,15 @@ void init(uint2 tid, RWTexture2D<uint8_t1> image, RWStructuredBuffer<uint32_t> l
     uint8_t info_left_background = 0;
     uint8_t info_right_background = 0;
     
-    // Using int array to match logic, though uint is safer for image data
-    int buffer[4] = { 0, 0, 0, 0 };
+    // Keep values unsigned to avoid any backend-dependent sign extension.
+    uint32_t buffer[4] = { 0u, 0u, 0u, 0u };
 
     buffer[0] = image[tid].x;
     buffer[1] = image[tid + uint2(1, 0)].x;
     buffer[2] = image[tid + uint2(0, 1)].x;
     buffer[3] = image[tid + uint2(1, 1)].x;
 
-    if (buffer[0] == 255)
+    if (is_white_sample_u32(buffer[0]))
     {
         p_foreground |= 0x777;
         set_bit(info_foreground, Info::a);
@@ -118,7 +123,7 @@ void init(uint2 tid, RWTexture2D<uint8_t1> image, RWStructuredBuffer<uint32_t> l
         set_bit(info_left_background, Info::a);
     }
 
-    if (buffer[1] == 255)
+    if (is_white_sample_u32(buffer[1]))
     {
         p_foreground |= (0x777 << 1);
         set_bit(info_foreground, Info::b);
@@ -129,7 +134,7 @@ void init(uint2 tid, RWTexture2D<uint8_t1> image, RWStructuredBuffer<uint32_t> l
         set_bit(info_right_background, Info::b);
     }
 
-    if (buffer[2] == 255)
+    if (is_white_sample_u32(buffer[2]))
     {
         p_foreground |= (0x777 << 4);
         set_bit(info_foreground, Info::c);
@@ -140,7 +145,7 @@ void init(uint2 tid, RWTexture2D<uint8_t1> image, RWStructuredBuffer<uint32_t> l
         set_bit(info_left_background, Info::c);
     }
 
-    if (buffer[3] == 255)
+    if (is_white_sample_u32(buffer[3]))
     {
         set_bit(info_foreground, Info::d);
     }
@@ -387,14 +392,14 @@ void final_labeling(uint2 tid, RWStructuredBuffer<uint32_t> labels,
     }
     else
     {
-        a_label = (has_bit(foreground_info, Info::a) * foreground_label +
-                   has_bit(background_left_info, Info::a) * background_left_label);
-        b_label = has_bit(foreground_info, Info::b) * foreground_label +
-                  has_bit(background_right_info, Info::b) * background_right_label;
-        c_label = has_bit(foreground_info, Info::c) * foreground_label +
-                  has_bit(background_left_info, Info::c) * background_left_label;
-        d_label = has_bit(foreground_info, Info::d) * foreground_label +
-                  has_bit(background_right_info, Info::d) * background_right_label;
+        a_label = (has_bit(foreground_info, Info::a) ? foreground_label : 0u) +
+                  (has_bit(background_left_info, Info::a) ? background_left_label : 0u);
+        b_label = (has_bit(foreground_info, Info::b) ? foreground_label : 0u) +
+                  (has_bit(background_right_info, Info::b) ? background_right_label : 0u);
+        c_label = (has_bit(foreground_info, Info::c) ? foreground_label : 0u) +
+                  (has_bit(background_left_info, Info::c) ? background_left_label : 0u);
+        d_label = (has_bit(foreground_info, Info::d) ? foreground_label : 0u) +
+                  (has_bit(background_right_info, Info::d) ? background_right_label : 0u);
 
         // FIX: Explicit separate writes
         labels[foreground_labels_index] = a_label;
@@ -470,15 +475,15 @@ void init_buffer(uint2 tid, StructuredBuffer<uint8_t> image, ImageSize image_siz
     uint8_t info_left_background = 0;
     uint8_t info_right_background = 0;
     
-    // Using int array to match logic, though uint is safer for image data
-    int buffer[4] = { 0, 0, 0, 0 };
+    // Keep values unsigned to avoid backend-dependent sign behavior.
+    uint32_t buffer[4] = { 0u, 0u, 0u, 0u };
 
     buffer[0] = image_u8_read(image, image_size, tid);
     buffer[1] = image_u8_read(image, image_size, tid + uint2(1, 0));
     buffer[2] = image_u8_read(image, image_size, tid + uint2(0, 1));
     buffer[3] = image_u8_read(image, image_size, tid + uint2(1, 1));
 
-    if (buffer[0] == 255)
+    if (is_white_sample_u32(buffer[0]))
     {
         p_foreground |= 0x777;
         set_bit(info_foreground, Info::a);
@@ -489,7 +494,7 @@ void init_buffer(uint2 tid, StructuredBuffer<uint8_t> image, ImageSize image_siz
         set_bit(info_left_background, Info::a);
     }
 
-    if (buffer[1] == 255)
+    if (is_white_sample_u32(buffer[1]))
     {
         p_foreground |= (0x777 << 1);
         set_bit(info_foreground, Info::b);
@@ -500,7 +505,7 @@ void init_buffer(uint2 tid, StructuredBuffer<uint8_t> image, ImageSize image_siz
         set_bit(info_right_background, Info::b);
     }
 
-    if (buffer[2] == 255)
+    if (is_white_sample_u32(buffer[2]))
     {
         p_foreground |= (0x777 << 4);
         set_bit(info_foreground, Info::c);
@@ -511,7 +516,7 @@ void init_buffer(uint2 tid, StructuredBuffer<uint8_t> image, ImageSize image_siz
         set_bit(info_left_background, Info::c);
     }
 
-    if (buffer[3] == 255)
+    if (is_white_sample_u32(buffer[3]))
     {
         set_bit(info_foreground, Info::d);
     }
@@ -554,14 +559,24 @@ void init_buffer(uint2 tid, StructuredBuffer<uint8_t> image, ImageSize image_siz
     // Assuming 'image' handles OOB clamps or logic is sufficient here.
 
     // P Square
-    if (has_bit(p_foreground, 0) && (image_u8_read(image, image_size, tid - uint2(1, 1)) == 255u))
+    if (tid.x > 0u &&
+        tid.y > 0u &&
+        has_bit(p_foreground, 0) &&
+        is_white_sample_u32(image_u8_read(image, image_size, tid - uint2(1, 1))))
     {
         father_offset_foreground = -(2 * int(dim.x) + 2);
     }
 
     // Q Square
-    if ((has_bit(p_foreground, 1) && image_u8_read(image, image_size, tid - uint2(0, 1)) == 255u) ||
-        (has_bit(p_foreground, 2) && image_u8_read(image, image_size, tid + uint2(1, 0) - uint2(0, 1)) == 255u))
+    bool q_foreground =
+        (tid.y > 0u &&
+         has_bit(p_foreground, 1) &&
+         is_white_sample_u32(image_u8_read(image, image_size, tid - uint2(0, 1)))) ||
+        (tid.y > 0u &&
+         tid.x + 1u < dim.x &&
+         has_bit(p_foreground, 2) &&
+         is_white_sample_u32(image_u8_read(image, image_size, tid + uint2(1, 0) - uint2(0, 1))));
+    if (q_foreground)
     {
         if (father_offset_foreground == 0)
         {
@@ -573,17 +588,25 @@ void init_buffer(uint2 tid, StructuredBuffer<uint8_t> image, ImageSize image_siz
         }
     }
 
-    if ((has_bit(p_background, 1) && image_u8_read(image, image_size, tid - uint2(0, 1)) == 0u))
+    if (tid.y > 0u &&
+        has_bit(p_background, 1) &&
+        image_u8_read(image, image_size, tid - uint2(0, 1)) == 0u)
     {
         father_offset_left_background = -2 * int(dim.x);
     }
-    if ((has_bit(p_background, 2) && image_u8_read(image, image_size, tid + uint2(1, 0) - uint2(0, 1)) == 0u))
+    if (tid.y > 0u &&
+        tid.x + 1u < dim.x &&
+        has_bit(p_background, 2) &&
+        image_u8_read(image, image_size, tid + uint2(1, 0) - uint2(0, 1)) == 0u)
     {
         father_offset_right_background = -2 * int(dim.x);
     }
 
     // R Square
-    if (has_bit(p_foreground, 3) && image_u8_read(image, image_size, tid + uint2(2, 0) - uint2(0, 1)) == 255u)
+    if (tid.y > 0u &&
+        tid.x + 2u < dim.x &&
+        has_bit(p_foreground, 3) &&
+        is_white_sample_u32(image_u8_read(image, image_size, tid + uint2(2, 0) - uint2(0, 1))))
     {
         if (father_offset_foreground == 0)
         {
@@ -596,8 +619,15 @@ void init_buffer(uint2 tid, StructuredBuffer<uint8_t> image, ImageSize image_siz
     }
 
     // S Square
-    if ((has_bit(p_foreground, 4) && image_u8_read(image, image_size, tid - uint2(1, 0)) == 255u) ||
-        (has_bit(p_foreground, 8) && image_u8_read(image, image_size, tid + uint2(0, 1) - uint2(1, 0)) == 255u))
+    bool s_foreground =
+        (tid.x > 0u &&
+         has_bit(p_foreground, 4) &&
+         is_white_sample_u32(image_u8_read(image, image_size, tid - uint2(1, 0)))) ||
+        (tid.x > 0u &&
+         tid.y + 1u < dim.y &&
+         has_bit(p_foreground, 8) &&
+         is_white_sample_u32(image_u8_read(image, image_size, tid + uint2(0, 1) - uint2(1, 0))));
+    if (s_foreground)
     {
         if (father_offset_foreground == 0)
         {
@@ -608,8 +638,15 @@ void init_buffer(uint2 tid, StructuredBuffer<uint8_t> image, ImageSize image_siz
             set_bit(info_foreground, Info::S);
         }
     }
-    if ((has_bit(p_background, 4) && image_u8_read(image, image_size, tid - uint2(1, 0)) == 0u) ||
-        (has_bit(p_background, 8) && image_u8_read(image, image_size, tid + uint2(0, 1) - uint2(1, 0)) == 0u))
+    bool s_background =
+        (tid.x > 0u &&
+         has_bit(p_background, 4) &&
+         image_u8_read(image, image_size, tid - uint2(1, 0)) == 0u) ||
+        (tid.x > 0u &&
+         tid.y + 1u < dim.y &&
+         has_bit(p_background, 8) &&
+         image_u8_read(image, image_size, tid + uint2(0, 1) - uint2(1, 0)) == 0u);
+    if (s_background)
     {
         if (father_offset_left_background == 0)
         {

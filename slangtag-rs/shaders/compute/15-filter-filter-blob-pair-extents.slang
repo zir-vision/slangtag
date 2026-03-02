@@ -4,12 +4,18 @@ StructuredBuffer<uint32_t> extents_in;
 RWStructuredBuffer<uint32_t> extents_out;
 RWStructuredBuffer<uint32_t> selected_extent_count_out;
 RWStructuredBuffer<uint32_t> selected_point_count_out;
-uint32_t extent_count;
-uint32_t tag_width;
-uint32_t reversed_border;
-uint32_t normal_border;
-uint32_t min_cluster_pixels;
-uint32_t max_cluster_pixels;
+struct PushConstants
+{
+    uint32_t extent_count;
+    uint32_t tag_width;
+    uint32_t reversed_border;
+    uint32_t normal_border;
+    uint32_t min_cluster_pixels;
+    uint32_t max_cluster_pixels;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<PushConstants> pc;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
@@ -21,10 +27,10 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
         extents_out,
         selected_extent_count_out,
         selected_point_count_out,
-        extent_count,
-        tag_width,
-        reversed_border,
-        normal_border,
-        min_cluster_pixels,
-        max_cluster_pixels);
+        pc.extent_count,
+        pc.tag_width,
+        pc.reversed_border,
+        pc.normal_border,
+        pc.min_cluster_pixels,
+        pc.max_cluster_pixels);
 }

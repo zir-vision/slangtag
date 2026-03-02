@@ -3,7 +3,13 @@ import "../filter.slang";
 StructuredBuffer<uint32_t> sorted_points;
 RWStructuredBuffer<uint32_t> extents_out;
 RWStructuredBuffer<uint32_t> extent_count_out;
-uint32_t valid_points;
+struct PushConstants
+{
+    uint32_t valid_points;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<PushConstants> pc;
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
@@ -14,5 +20,5 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
         sorted_points,
         extents_out,
         extent_count_out,
-        valid_points);
+        pc.valid_points);
 }
