@@ -8,23 +8,22 @@ fn main() {
     let image_path = args
         .get(1)
         .expect("Please provide an image path as the first argument");
-    let min_blob_size = args
-        .get(2)
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(25);
+    
     let image = image::open(image_path).expect("Failed to open image");
 
     let dev = ComputeDevice::new_default();
     let det = Detector::new(
         dev,
         DetectionSettings {
-            decimate: Some(2),
-            min_blob_size,
+            decimate: None,
             ..Default::default()
         },
     );
-    for _ in 0..20 {
-        let tags = det.detect(image.clone()).expect("Detection failed");
-        println!("Detected {} tag candidates", tags.len());
-    }
+
+    let gray_image = image.to_luma8();
+    let start = std::time::Instant::now();
+    let tags = det.detect_gray(gray_image).expect("Detection failed");
+    let duration = start.elapsed();
+    println!("Detection took {:.2?}", duration);
+    println!("Detected {} tags", tags.len());
 }

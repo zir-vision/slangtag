@@ -13,3 +13,6 @@ vulkano = "0.35.2"
 [[bin]]
 name = "slangtag"
 path = "src/bin.rs"
+
+[profile.release]
+debug = true

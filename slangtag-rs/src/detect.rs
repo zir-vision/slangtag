@@ -1,6 +1,6 @@
 use crate::{ComputeDevice, GPUImage, Size, compute_shader_path};
 use bytemuck::{Pod, Zeroable};
-use image::{DynamicImage, GrayImage};
+use image::{DynamicImage, GrayImage, ImageBuffer};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use vulkano::buffer::BufferContents;
@@ -437,6 +437,12 @@ impl Detector {
     }
 
     pub fn detect(&self, image: DynamicImage) -> Result<Vec<DetectedTag>, ()> {
+        let gray_image = image.to_luma8();
+        self.detect_gray(gray_image)
+    }
+
+
+    pub fn detect_gray(&self, image: ImageBuffer<image::Luma<u8>, Vec<u8>>) -> Result<Vec<DetectedTag>, ()> {
         if let Some(factor) = self.settings.decimate
             && !is_power_of_two(factor)
         {
@@ -444,7 +450,7 @@ impl Detector {
         }
 
         let decimate_factor = self.settings.decimate.unwrap_or(1) as u32;
-        let aligned_input = crop_image_to_multiple(image.into_luma8(), 4 * decimate_factor)?;
+        let aligned_input = crop_image_to_multiple(image, 4 * decimate_factor)?;
         let input_gpu_image =
             crate::GPUImage::from_image_buffer(self.device.clone(), aligned_input);
 
@@ -1039,10 +1045,10 @@ impl Detector {
     }
 
     fn new_zeroed_u32_storage_buffer(&self, len: usize) -> Subbuffer<[u32]> {
-        Buffer::from_iter(
+        let buf = Buffer::new_unsized(
             self.device.memory_allocator.clone(),
             BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC,
+                usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST,
                 ..Default::default()
             },
             AllocationCreateInfo {
@@ -1050,9 +1056,28 @@ impl Detector {
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
             },
-            std::iter::repeat(0u32).take(len),
+            len as u64,
         )
-        .expect("failed to create zeroed u32 storage buffer")
+        .expect("failed to create zeroed u32 storage buffer");
+
+        // Fill buffer using vkCmdFillBuffer
+        let mut builder = AutoCommandBufferBuilder::primary(
+            self.device.command_buffer_allocator.clone(),
+            self.device.queue_family_index,
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .expect("failed to create command buffer builder");
+        builder
+            .fill_buffer(buf.clone(), 0)
+            .expect("failed to record fill buffer command");
+        let command_buffer = builder.build().expect("failed to build command buffer");
+        let future = sync::now(self.device.device.clone())
+            .then_execute(self.device.queue.clone(), command_buffer)
+            .expect("failed to execute command buffer")
+            .then_signal_fence_and_flush()
+            .expect("failed to flush command buffer");
+        future.wait(None).expect("failed to wait for buffer fill");
+        buf
     }
 
     fn new_zeroed_u32_counter_buffer(&self) -> Subbuffer<[u32]> {
