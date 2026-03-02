@@ -71,207 +71,6 @@ fn dispatch_groups_1d(total_invocations: u32, local_size_x: u32) -> u32 {
     }
 }
 
-fn canonicalize_labels_cpu(labels: &[u32]) -> Vec<u32> {
-    let mut parents = labels.to_vec();
-    let n = parents.len();
-    for i in 0..n {
-        let mut x = parents[i] as usize;
-        let mut guard = 0usize;
-        while x < n && parents[x] as usize != x && guard < n {
-            x = parents[x] as usize;
-            guard += 1;
-        }
-        let root = if x < n { x as u32 } else { parents[i] };
-        let mut y = i;
-        guard = 0;
-        while (parents[y] as usize) < n && parents[y] != root && guard < n {
-            let next = parents[y] as usize;
-            parents[y] = root;
-            y = next;
-            guard += 1;
-        }
-        parents[i] = root;
-    }
-    parents
-}
-
-fn ccl_from_thresholded_cpu(thresholded: &[u8], size: Size) -> (Vec<u32>, Vec<u32>) {
-    let width = size.width as usize;
-    let height = size.height as usize;
-    let n = width * height;
-    let mut parents: Vec<usize> = (0..n).collect();
-
-    fn find(parents: &mut [usize], mut x: usize) -> usize {
-        while parents[x] != x {
-            let p = parents[x];
-            parents[x] = parents[p];
-            x = parents[x];
-        }
-        x
-    }
-
-    fn unite(parents: &mut [usize], a: usize, b: usize) {
-        let ra = find(parents, a);
-        let rb = find(parents, b);
-        if ra == rb {
-            return;
-        }
-        if ra < rb {
-            parents[rb] = ra;
-        } else {
-            parents[ra] = rb;
-        }
-    }
-
-    for y in 0..height {
-        for x in 0..width {
-            let idx = y * width + x;
-            let v = thresholded[idx];
-            if v == 127 {
-                continue;
-            }
-            if x > 0 {
-                let nidx = idx - 1;
-                if thresholded[nidx] == v {
-                    unite(&mut parents, idx, nidx);
-                }
-            }
-            if y > 0 {
-                let nidx = idx - width;
-                if thresholded[nidx] == v {
-                    unite(&mut parents, idx, nidx);
-                }
-                if x > 0 {
-                    let nidx = idx - width - 1;
-                    if thresholded[nidx] == v {
-                        unite(&mut parents, idx, nidx);
-                    }
-                }
-                if x + 1 < width {
-                    let nidx = idx - width + 1;
-                    if thresholded[nidx] == v {
-                        unite(&mut parents, idx, nidx);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut labels = vec![0u32; n];
-    for i in 0..n {
-        if thresholded[i] == 127 {
-            labels[i] = i as u32;
-        } else {
-            labels[i] = find(&mut parents, i) as u32;
-        }
-    }
-
-    let mut union_sizes = vec![0u32; n];
-    for i in 0..n {
-        if thresholded[i] == 0 || thresholded[i] == 255 {
-            let root = labels[i] as usize;
-            if root < n {
-                union_sizes[root] = union_sizes[root].saturating_add(1);
-            }
-        }
-    }
-
-    (labels, union_sizes)
-}
-
-fn ccl_from_thresholded_cpu_dual_connectivity(
-    thresholded: &[u8],
-    size: Size,
-) -> (Vec<u32>, Vec<u32>) {
-    let width = size.width as usize;
-    let height = size.height as usize;
-    let n = width * height;
-    let mut parents: Vec<usize> = (0..n).collect();
-
-    fn find(parents: &mut [usize], mut x: usize) -> usize {
-        while parents[x] != x {
-            let p = parents[x];
-            parents[x] = parents[p];
-            x = parents[x];
-        }
-        x
-    }
-
-    fn unite(parents: &mut [usize], a: usize, b: usize) {
-        let ra = find(parents, a);
-        let rb = find(parents, b);
-        if ra == rb {
-            return;
-        }
-        if ra < rb {
-            parents[rb] = ra;
-        } else {
-            parents[ra] = rb;
-        }
-    }
-
-    for y in 0..height {
-        for x in 0..width {
-            let idx = y * width + x;
-            let v = thresholded[idx];
-            if v == 127 {
-                continue;
-            }
-
-            if x > 0 {
-                let nidx = idx - 1;
-                if thresholded[nidx] == v {
-                    unite(&mut parents, idx, nidx);
-                }
-            }
-            if y > 0 {
-                let nidx = idx - width;
-                if thresholded[nidx] == v {
-                    unite(&mut parents, idx, nidx);
-                }
-            }
-
-            // Match the CCL shader's effective topology:
-            // white is 8-connected, background is 4-connected.
-            if v == 255 && y > 0 {
-                if x > 0 {
-                    let nidx = idx - width - 1;
-                    if thresholded[nidx] == v {
-                        unite(&mut parents, idx, nidx);
-                    }
-                }
-                if x + 1 < width {
-                    let nidx = idx - width + 1;
-                    if thresholded[nidx] == v {
-                        unite(&mut parents, idx, nidx);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut labels = vec![0u32; n];
-    for i in 0..n {
-        if thresholded[i] == 127 {
-            labels[i] = i as u32;
-        } else {
-            labels[i] = find(&mut parents, i) as u32;
-        }
-    }
-
-    let mut union_sizes = vec![0u32; n];
-    for i in 0..n {
-        if thresholded[i] == 0 || thresholded[i] == 255 {
-            let root = labels[i] as usize;
-            if root < n {
-                union_sizes[root] = union_sizes[root].saturating_add(1);
-            }
-        }
-    }
-
-    (labels, union_sizes)
-}
-
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone)]
 struct DecimatePushConstants {
@@ -448,14 +247,6 @@ impl Detector {
 
         let decimate_factor = self.settings.decimate.unwrap_or(1) as u32;
         let aligned_input = crop_image_to_multiple(image.into_luma8(), 4 * decimate_factor)?;
-        println!(
-            "[detect] input={}x{} decimate_factor={} min_white_black_diff={} min_blob_size={}",
-            aligned_input.width(),
-            aligned_input.height(),
-            decimate_factor,
-            self.settings.min_white_black_diff,
-            self.settings.min_blob_size
-        );
         let input_gpu_image =
             crate::GPUImage::from_image_buffer(self.device.clone(), aligned_input);
 
@@ -466,10 +257,6 @@ impl Detector {
             }
             None => input_gpu_image.clone(),
         };
-        println!(
-            "[detect] decimated={}x{}",
-            decimated_image.size.width, decimated_image.size.height
-        );
 
         let (minmax_image, minmax_size) = self.minmax(&decimated_image);
         let filtered_minmax_image = self.filter_minmax(&minmax_image, minmax_size);
@@ -479,131 +266,7 @@ impl Detector {
             minmax_size,
             self.settings.min_white_black_diff,
         );
-        let thresholded = thresholded_image.data();
-        let mut black = 0usize;
-        let mut mid = 0usize;
-        let mut white = 0usize;
-        let mut black_large = 0usize;
-        let mut white_large = 0usize;
-        let mut max_black_union = 0u32;
-        let mut max_white_union = 0u32;
-        for &v in &thresholded {
-            match v {
-                0 => black += 1,
-                127 => mid += 1,
-                255 => white += 1,
-                _ => {}
-            }
-        }
-        println!(
-            "[detect] thresholded pixels: black={} mid(127)={} white={} total={}",
-            black,
-            mid,
-            white,
-            thresholded.len()
-        );
-        let (cpu_ccl_labels, cpu_ccl_union_sizes) =
-            ccl_from_thresholded_cpu(&thresholded, thresholded_image.size);
-        let cpu_ccl_nonzero = cpu_ccl_union_sizes.iter().filter(|&&x| x > 0).count();
-        let cpu_ccl_max = cpu_ccl_union_sizes.iter().copied().max().unwrap_or(0);
-        println!(
-            "[detect] ccl independent cpu: nonzero={} max={}",
-            cpu_ccl_nonzero, cpu_ccl_max
-        );
-        let (cpu_ccl_labels_dual, cpu_ccl_union_sizes_dual) =
-            ccl_from_thresholded_cpu_dual_connectivity(&thresholded, thresholded_image.size);
-        let cpu_ccl_dual_nonzero = cpu_ccl_union_sizes_dual.iter().filter(|&&x| x > 0).count();
-        let cpu_ccl_dual_max = cpu_ccl_union_sizes_dual.iter().copied().max().unwrap_or(0);
-        println!(
-            "[detect] ccl cpu dual-connectivity: nonzero={} max={}",
-            cpu_ccl_dual_nonzero, cpu_ccl_dual_max
-        );
-
         let labels = self.ccl_init(&thresholded_image);
-        let labels_after_init =
-            self.download_u32_buffer(&labels, thresholded_image.size.total_pixels());
-        let width = thresholded_image.size.width as usize;
-        let height = thresholded_image.size.height as usize;
-        let mut fg_info_low_mismatch = 0usize;
-        let mut left_bg_info_low_mismatch = 0usize;
-        let mut right_bg_info_low_mismatch = 0usize;
-        let mut fg_info_sample = Vec::new();
-        for y in (0..height).step_by(2) {
-            for x in (0..width).step_by(2) {
-                if x + 1 >= width || y + 1 >= height {
-                    continue;
-                }
-                let idx = y * width + x;
-                let info = labels_after_init[idx + 1];
-                let fg_low = (info & 0xFu32) as u8;
-                let left_low = ((info >> 8) & 0xFu32) as u8;
-                let right_low = ((info >> 16) & 0xFu32) as u8;
-
-                let v0 = thresholded[idx];
-                let v1 = thresholded[idx + 1];
-                let v2 = thresholded[idx + width];
-                let v3 = thresholded[idx + width + 1];
-
-                let mut fg_expected = 0u8;
-                if v0 == 255 {
-                    fg_expected |= 1 << 0;
-                }
-                if v1 == 255 {
-                    fg_expected |= 1 << 1;
-                }
-                if v2 == 255 {
-                    fg_expected |= 1 << 2;
-                }
-                if v3 == 255 {
-                    fg_expected |= 1 << 3;
-                }
-
-                let mut left_expected = 0u8;
-                if v0 == 0 {
-                    left_expected |= 1 << 0;
-                }
-                if v2 == 0 {
-                    left_expected |= 1 << 2;
-                }
-
-                let mut right_expected = 0u8;
-                if v1 == 0 {
-                    right_expected |= 1 << 1;
-                }
-                if v3 == 0 {
-                    right_expected |= 1 << 3;
-                }
-
-                if fg_low != fg_expected {
-                    fg_info_low_mismatch += 1;
-                    if fg_info_sample.len() < 8 {
-                        fg_info_sample.push((idx as u32, fg_low, fg_expected, v0, v1, v2, v3));
-                    }
-                }
-                if left_low != left_expected {
-                    left_bg_info_low_mismatch += 1;
-                }
-                if right_low != right_expected {
-                    right_bg_info_low_mismatch += 1;
-                }
-            }
-        }
-        let tile_count = (width / 2) * (height / 2);
-        println!(
-            "[detect] ccl init info-low compare: fg_mismatch={}/{} left_bg_mismatch={}/{} right_bg_mismatch={}/{}",
-            fg_info_low_mismatch,
-            tile_count,
-            left_bg_info_low_mismatch,
-            tile_count,
-            right_bg_info_low_mismatch,
-            tile_count
-        );
-        if !fg_info_sample.is_empty() {
-            println!(
-                "[detect] ccl init fg mismatch sample (idx,fg_low,fg_expected,v00,v10,v01,v11): {:?}",
-                fg_info_sample
-            );
-        }
         self.ccl_compression(&labels, thresholded_image.size);
         self.ccl_merge(&labels, thresholded_image.size);
         self.ccl_compression(&labels, thresholded_image.size);
@@ -611,264 +274,6 @@ impl Detector {
         let union_markers_size =
             self.new_zeroed_u32_storage_buffer(thresholded_image.size.total_pixels());
         self.ccl_final_labeling(&labels, &union_markers_size, thresholded_image.size);
-        let union_sizes_gpu =
-            self.download_u32_buffer(&union_markers_size, thresholded_image.size.total_pixels());
-        let label_words = self.download_u32_buffer(&labels, thresholded_image.size.total_pixels());
-        let label_words_canonical = canonicalize_labels_cpu(&label_words);
-        let relabeled = label_words_canonical
-            .iter()
-            .zip(label_words.iter())
-            .filter(|(a, b)| a != b)
-            .count();
-        println!(
-            "[detect] ccl canonicalized labels on CPU: changed={}/{}",
-            relabeled,
-            label_words_canonical.len()
-        );
-        let nonzero_unions = union_sizes_gpu.iter().filter(|&&x| x > 0).count();
-        let max_union = union_sizes_gpu.iter().copied().max().unwrap_or(0);
-        println!(
-            "[detect] ccl union sizes: nonzero={} max={}",
-            nonzero_unions, max_union
-        );
-
-        let mut union_sizes_cpu = vec![0u32; thresholded_image.size.total_pixels()];
-        for (i, &label) in label_words.iter().enumerate() {
-            let label = label as usize;
-            if label >= union_sizes_cpu.len() {
-                continue;
-            }
-            if thresholded[i] == 0 || thresholded[i] == 255 {
-                union_sizes_cpu[label] = union_sizes_cpu[label].saturating_add(1);
-            }
-        }
-        let max_union_cpu = union_sizes_cpu.iter().copied().max().unwrap_or(0);
-        let nonzero_unions_cpu = union_sizes_cpu.iter().filter(|&&x| x > 0).count();
-        println!(
-            "[detect] ccl cpu union sizes from labels: nonzero={} max={}",
-            nonzero_unions_cpu, max_union_cpu
-        );
-
-        let max_white_union_gpu = label_words
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &l)| {
-                if thresholded[i] != 255 {
-                    return None;
-                }
-                let li = l as usize;
-                (li < union_sizes_gpu.len()).then_some(union_sizes_gpu[li])
-            })
-            .max()
-            .unwrap_or(0);
-        let max_white_union_cpu = label_words
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &l)| {
-                if thresholded[i] != 255 {
-                    return None;
-                }
-                let li = l as usize;
-                (li < union_sizes_cpu.len()).then_some(union_sizes_cpu[li])
-            })
-            .max()
-            .unwrap_or(0);
-
-        let cpu_white_max_independent = label_words
-            .iter()
-            .enumerate()
-            .filter_map(|(i, _)| {
-                if thresholded[i] != 255 {
-                    return None;
-                }
-                let li = cpu_ccl_labels[i] as usize;
-                (li < cpu_ccl_union_sizes.len()).then_some(cpu_ccl_union_sizes[li])
-            })
-            .max()
-            .unwrap_or(0);
-        let cpu_white_max_dual = label_words
-            .iter()
-            .enumerate()
-            .filter_map(|(i, _)| {
-                if thresholded[i] != 255 {
-                    return None;
-                }
-                let li = cpu_ccl_labels_dual[i] as usize;
-                (li < cpu_ccl_union_sizes_dual.len()).then_some(cpu_ccl_union_sizes_dual[li])
-            })
-            .max()
-            .unwrap_or(0);
-        println!(
-            "[detect] ccl white-max compare: gpu_union[label]={} gpu_recount[label]={} cpu_independent={} cpu_dual={}",
-            max_white_union_gpu, max_white_union_cpu, cpu_white_max_independent, cpu_white_max_dual
-        );
-        let mut label_word_mismatch = 0usize;
-        let mut label_bit_mismatch = 0u64;
-        for i in 0..label_words.len() {
-            let gpu = label_words[i];
-            let cpu = cpu_ccl_labels_dual[i];
-            if gpu != cpu {
-                label_word_mismatch += 1;
-                label_bit_mismatch += (gpu ^ cpu).count_ones() as u64;
-            }
-        }
-        let mut union_word_mismatch = 0usize;
-        let mut union_bit_mismatch = 0u64;
-        for i in 0..union_sizes_gpu.len() {
-            let gpu = union_sizes_gpu[i];
-            let cpu = cpu_ccl_union_sizes_dual[i];
-            if gpu != cpu {
-                union_word_mismatch += 1;
-                union_bit_mismatch += (gpu ^ cpu).count_ones() as u64;
-            }
-        }
-        let mut pixel_size_mismatch = 0usize;
-        let mut pixel_size_mismatch_black = 0usize;
-        let mut pixel_size_mismatch_white = 0usize;
-        let mut pixel_mismatch_sample = Vec::new();
-        for i in 0..thresholded.len() {
-            if thresholded[i] == 127 {
-                continue;
-            }
-            let gl = label_words[i] as usize;
-            let cl = cpu_ccl_labels_dual[i] as usize;
-            let gpu_size = if gl < union_sizes_gpu.len() {
-                union_sizes_gpu[gl]
-            } else {
-                0
-            };
-            let cpu_size = if cl < cpu_ccl_union_sizes_dual.len() {
-                cpu_ccl_union_sizes_dual[cl]
-            } else {
-                0
-            };
-            if gpu_size != cpu_size {
-                pixel_size_mismatch += 1;
-                if thresholded[i] == 0 {
-                    pixel_size_mismatch_black += 1;
-                } else if thresholded[i] == 255 {
-                    pixel_size_mismatch_white += 1;
-                }
-                if pixel_mismatch_sample.len() < 8 {
-                    pixel_mismatch_sample.push((
-                        i,
-                        thresholded[i],
-                        gl as u32,
-                        gpu_size,
-                        cl as u32,
-                        cpu_size,
-                    ));
-                }
-            }
-        }
-        println!(
-            "[detect] ccl compare labels(bitwise): word_mismatch={}/{} bit_mismatch={}",
-            label_word_mismatch,
-            label_words.len(),
-            label_bit_mismatch
-        );
-        println!(
-            "[detect] ccl compare union_sizes(bitwise): word_mismatch={}/{} bit_mismatch={}",
-            union_word_mismatch,
-            union_sizes_gpu.len(),
-            union_bit_mismatch
-        );
-        println!(
-            "[detect] ccl compare per-pixel component-size: mismatch={} black={} white={}",
-            pixel_size_mismatch, pixel_size_mismatch_black, pixel_size_mismatch_white
-        );
-        if !pixel_mismatch_sample.is_empty() {
-            println!(
-                "[detect] ccl per-pixel mismatch sample (idx,v,gpu_label,gpu_size,cpu_label,cpu_size): {:?}",
-                pixel_mismatch_sample
-            );
-        }
-
-        let gpu_ccl_failed = fg_info_low_mismatch > 0
-            || (max_white_union_gpu == 0 && cpu_white_max_dual > 0)
-            || (white > 0 && pixel_size_mismatch_white * 100 > white * 5);
-        if gpu_ccl_failed {
-            eprintln!(
-                "[detect] ERROR: GPU CCL validation failed (fg_mismatch={} gpu_white_max={} cpu_white_max={} white_pixel_size_mismatch={}/{})",
-                fg_info_low_mismatch,
-                max_white_union_gpu,
-                cpu_white_max_dual,
-                pixel_size_mismatch_white,
-                white
-            );
-            return Err(());
-        }
-
-        let labels_for_blob_diff = labels.clone();
-        let union_sizes = union_sizes_gpu;
-
-        let labels_out_of_range = label_words
-            .iter()
-            .filter(|&&l| l as usize >= union_sizes.len())
-            .count();
-        let large_label_pixels = label_words
-            .iter()
-            .filter(|&&l| {
-                (l as usize) < union_sizes.len()
-                    && union_sizes[l as usize] >= self.settings.min_blob_size
-            })
-            .count();
-        println!(
-            "[detect] labels: out_of_range={} pixels_with_union(label)>={} => {}",
-            labels_out_of_range, self.settings.min_blob_size, large_label_pixels
-        );
-        if !label_words.is_empty() {
-            let mut sample = Vec::new();
-            for i in 0..usize::min(8, label_words.len()) {
-                let l = label_words[i] as usize;
-                let us = if l < union_sizes.len() {
-                    union_sizes[l]
-                } else {
-                    u32::MAX
-                };
-                sample.push((i, label_words[i], us));
-            }
-            println!(
-                "[detect] label/union sample (idx,label,union[label]): {:?}",
-                sample
-            );
-        }
-        for i in 0..thresholded.len() {
-            let l = label_words[i] as usize;
-            let union = if l < union_sizes.len() {
-                union_sizes[l]
-            } else {
-                0
-            };
-            let large = union >= self.settings.min_blob_size;
-            if !large {
-                match thresholded[i] {
-                    0 => max_black_union = max_black_union.max(union),
-                    255 => max_white_union = max_white_union.max(union),
-                    _ => {}
-                }
-                continue;
-            }
-            match thresholded[i] {
-                0 => {
-                    black_large += 1;
-                    max_black_union = max_black_union.max(union);
-                }
-                255 => {
-                    white_large += 1;
-                    max_white_union = max_white_union.max(union);
-                }
-                _ => {}
-            }
-        }
-        println!(
-            "[detect] large-component polarity pixels: black={} white={}",
-            black_large, white_large
-        );
-        println!(
-            "[detect] max union by polarity: black={} white={}",
-            max_black_union, max_white_union
-        );
 
         let blob_diff_words_per_point = 6usize;
         let blob_diff_points_per_offset = (thresholded_image.size.width as usize - 2)
@@ -878,59 +283,10 @@ impl Detector {
             .new_u32_storage_buffer(blob_diff_total_points as usize * blob_diff_words_per_point);
         self.blob_diff(
             &thresholded_image,
-            &labels_for_blob_diff,
+            &labels,
             &union_markers_size,
             &blob_diff_out,
             self.settings.min_blob_size,
-        );
-
-        let mut eligible_centers = 0usize;
-        let mut raw_bw_adjacencies = 0usize;
-        let mut bw_with_large_rep0 = 0usize;
-        let mut bw_with_large_rep1 = 0usize;
-        let mut potential_connections = 0usize;
-        for y in 1..(height.saturating_sub(1)) {
-            for x in 1..(width.saturating_sub(1)) {
-                let idx = y * width + x;
-                let v0 = thresholded[idx];
-                let rep0 = label_words[idx] as usize;
-                let rep0_large =
-                    rep0 < union_sizes.len() && union_sizes[rep0] >= self.settings.min_blob_size;
-                if v0 == 127 || rep0 >= union_sizes.len() || !rep0_large {
-                    continue;
-                }
-                eligible_centers += 1;
-                let neighbors = [(1isize, 0isize), (1, 1), (0, 1), (-1, 1)];
-                for (dx, dy) in neighbors {
-                    let nx = (x as isize + dx) as usize;
-                    let ny = (y as isize + dy) as usize;
-                    let nidx = ny * width + nx;
-                    let v1 = thresholded[nidx];
-                    let rep1 = label_words[nidx] as usize;
-                    if v0 as u16 + v1 as u16 == 255 {
-                        raw_bw_adjacencies += 1;
-                        if rep0_large {
-                            bw_with_large_rep0 += 1;
-                        }
-                        if rep1 < union_sizes.len()
-                            && union_sizes[rep1] >= self.settings.min_blob_size
-                        {
-                            bw_with_large_rep1 += 1;
-                            if rep0_large {
-                                potential_connections += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        println!(
-            "[detect] blob_diff CPU precheck: eligible_centers={} raw_bw_adjacencies={} bw_with_large_rep0={} bw_with_large_rep1={} potential_connections={}",
-            eligible_centers,
-            raw_bw_adjacencies,
-            bw_with_large_rep0,
-            bw_with_large_rep1,
-            potential_connections
         );
 
         let blob_diff_count = self.new_zeroed_u32_counter_buffer();
@@ -940,10 +296,6 @@ impl Detector {
             blob_diff_total_points,
         );
         let blob_diff_compacted_size = self.read_counter(&blob_diff_count);
-        println!(
-            "[detect] blob_diff nonzero points: {}/{}",
-            blob_diff_compacted_size, blob_diff_total_points
-        );
 
         let blob_diff_compacted = self.new_u32_storage_buffer(
             usize::max(1, blob_diff_compacted_size as usize) * blob_diff_words_per_point,
@@ -956,23 +308,8 @@ impl Detector {
             blob_diff_total_points,
         );
         let blob_diff_filtered_size = self.read_counter(&blob_diff_filter_count);
-        println!(
-            "[detect] blob_diff compacted points: {}",
-            blob_diff_filtered_size
-        );
-        if blob_diff_filtered_size > 0 {
-            let sample = self.download_u32_buffer(
-                &blob_diff_compacted,
-                usize::min(3, blob_diff_filtered_size as usize) * blob_diff_words_per_point,
-            );
-            println!("[detect] blob_diff first points (u32 words): {:?}", sample);
-        }
 
         let blob_diff_sort_points = next_power_of_two(blob_diff_filtered_size);
-        println!(
-            "[detect] blob_diff sort points (pow2): {}",
-            blob_diff_sort_points
-        );
         let blob_diff_sorted = self.new_u32_storage_buffer(
             usize::max(1, blob_diff_sort_points as usize) * blob_diff_words_per_point,
         );
@@ -996,14 +333,6 @@ impl Detector {
             blob_diff_filtered_size,
         );
         let blob_extent_count_value = self.read_counter(&blob_extent_count);
-        println!("[detect] blob extents: {}", blob_extent_count_value);
-        if blob_extent_count_value > 0 {
-            let sample = self.download_u32_buffer(
-                &blob_extent,
-                usize::min(2, blob_extent_count_value as usize) * blob_extent_words_per_extent,
-            );
-            println!("[detect] first blob extent words: {:?}", sample);
-        }
 
         let filtered_blob_extent = self.new_u32_storage_buffer(
             usize::max(1, blob_extent_count_value as usize) * blob_extent_words_per_extent,
@@ -1025,12 +354,6 @@ impl Detector {
         );
         let selected_blob_extent_count_value = self.read_counter(&selected_blob_extent_count);
         let selected_blob_point_count_value = self.read_counter(&selected_blob_point_count);
-        println!(
-            "[detect] selected extents: {}/{} selected points: {}",
-            selected_blob_extent_count_value,
-            blob_extent_count_value,
-            selected_blob_point_count_value
-        );
 
         let selected_blob_point_words_per_point = 4usize;
         let selected_blob_points = self.new_u32_storage_buffer(
@@ -1045,17 +368,6 @@ impl Detector {
             blob_extent_count_value,
             blob_diff_filtered_size,
         );
-        if selected_blob_point_count_value > 0 {
-            let sample = self.download_u32_buffer(
-                &selected_blob_points,
-                usize::min(3, selected_blob_point_count_value as usize)
-                    * selected_blob_point_words_per_point,
-            );
-            println!(
-                "[detect] selected blob points (unsorted) sample: {:?}",
-                sample
-            );
-        }
 
         let selected_blob_sort_points = next_power_of_two(selected_blob_point_count_value);
         let selected_blob_sorted_points = self.new_u32_storage_buffer(
@@ -1071,17 +383,6 @@ impl Detector {
             &selected_blob_sorted_points,
             selected_blob_sort_points,
         );
-        if selected_blob_point_count_value > 0 {
-            let sample = self.download_u32_buffer(
-                &selected_blob_sorted_points,
-                usize::min(3, selected_blob_point_count_value as usize)
-                    * selected_blob_point_words_per_point,
-            );
-            println!(
-                "[detect] selected blob points (sorted) sample: {:?}",
-                sample
-            );
-        }
 
         let line_fit_point_words_per_point = 10usize;
         let line_fit_points = self.new_u32_storage_buffer(
@@ -1119,10 +420,6 @@ impl Detector {
             self.count_valid_peaks(&peaks, &peak_count, selected_blob_point_count_value);
         }
         let peak_count_value = self.read_counter(&peak_count);
-        println!(
-            "[detect] valid peaks: {}/{}",
-            peak_count_value, selected_blob_point_count_value
-        );
 
         let compacted_peaks = self
             .new_u32_storage_buffer(usize::max(1, peak_count_value as usize) * peak_words_per_peak);
@@ -1136,17 +433,8 @@ impl Detector {
             );
         }
         let compacted_peak_count_value = self.read_counter(&compacted_peak_count);
-        println!("[detect] compacted peaks: {}", compacted_peak_count_value);
-        if compacted_peak_count_value > 0 {
-            let sample = self.download_u32_buffer(
-                &compacted_peaks,
-                usize::min(3, compacted_peak_count_value as usize) * peak_words_per_peak,
-            );
-            println!("[detect] compacted peak sample: {:?}", sample);
-        }
 
         let peak_sort_points = next_power_of_two(compacted_peak_count_value);
-        println!("[detect] peak sort points (pow2): {}", peak_sort_points);
         let sorted_peaks = self
             .new_u32_storage_buffer(usize::max(1, peak_sort_points as usize) * peak_words_per_peak);
         self.prepare_peaks(
@@ -1169,45 +457,6 @@ impl Detector {
             compacted_peak_count_value,
         );
         let peak_extent_count_value = self.read_counter(&peak_extent_count);
-        println!("[detect] peak extents: {}", peak_extent_count_value);
-        if peak_extent_count_value > 0 {
-            let peak_extent_words = self.download_u32_buffer(
-                &peak_extents,
-                peak_extent_count_value as usize * peak_extent_words_per_extent,
-            );
-            let filtered_extent_words = self.download_u32_buffer(
-                &filtered_blob_extent,
-                usize::max(1, blob_extent_count_value as usize) * blob_extent_words_per_extent,
-            );
-            let mut gate_peak_count = 0u32;
-            let mut gate_blob_count = 0u32;
-            let mut gate_blob_index = 0u32;
-            let mut gate_total = 0u32;
-            for i in 0..(peak_extent_count_value as usize) {
-                gate_total += 1;
-                let base = i * peak_extent_words_per_extent;
-                let blob_index = peak_extent_words[base] as usize;
-                let peak_count = peak_extent_words[base + 2];
-                if blob_index >= blob_extent_count_value as usize {
-                    gate_blob_index += 1;
-                    continue;
-                }
-                if peak_count < 4 {
-                    gate_peak_count += 1;
-                    continue;
-                }
-                let blob_base = blob_index * blob_extent_words_per_extent;
-                let blob_count = filtered_extent_words[blob_base + 7];
-                if blob_count < 8 {
-                    gate_blob_count += 1;
-                    continue;
-                }
-            }
-            println!(
-                "[detect] fit_quads pre-gates: total={} fail_blob_index={} fail_peak_count={} fail_blob_count<8={}",
-                gate_total, gate_blob_index, gate_peak_count, gate_blob_count
-            );
-        }
 
         let fitted_quad_words_per_quad = 15usize;
         let fitted_quads = self.new_u32_storage_buffer(
@@ -1227,7 +476,6 @@ impl Detector {
             decimate_factor as f32,
         );
         let fitted_quad_count_value = self.read_counter(&fitted_quad_count);
-        println!("[detect] fitted quads: {}", fitted_quad_count_value);
         let mut detected_tags = Vec::new();
 
         if fitted_quad_count_value > 0 {
@@ -1270,27 +518,8 @@ impl Detector {
             );
 
             let bits_words = self.download_u32_buffer(&bits, bits_count);
-            let first_bits = &bits_words[0..usize::min(bits_words.len(), 64)];
-            let ones = first_bits.iter().filter(|&&b| b != 0).count();
-            println!(
-                "[detect] decode bits sample: {} words, ones_in_first_tag={}",
-                bits_words.len(),
-                ones
-            );
             detected_tags =
                 self.build_detected_tags(&fitted_quad_words, fitted_quad_count_value, &bits_words);
-        }
-        println!("[detect] detected tags: {}", detected_tags.len());
-        if let Some(first) = detected_tags.first() {
-            let ones = first.bits_with_border.iter().filter(|&&b| b != 0).count();
-            println!(
-                "[detect] first tag: quad={} blob={} score={:.4} ones={}/{}",
-                first.quad_index,
-                first.blob_index,
-                first.score,
-                ones,
-                first.bits_with_border.len()
-            );
         }
 
         Ok(detected_tags)
