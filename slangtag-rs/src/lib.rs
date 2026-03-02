@@ -1,4 +1,5 @@
 pub mod detect;
+pub mod sort;
 
 #[macro_export]
 macro_rules! compute_shader_path {
@@ -127,6 +128,37 @@ impl<T: BufferContents + Primitive + Debug> GPUImage<T> {
             .unwrap();
 
         future.wait(None).unwrap();
+
+        Self {
+            image: gpu_image,
+            size,
+            device,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn from_image_buffer_fast(
+        device: ComputeDevice,
+        image: ImageBuffer<image::Luma<T>, Vec<T>>,
+    ) -> Self {
+        let size = Size::new(image.width(), image.height());
+        let flat_data: Vec<T> = image.into_raw();
+
+        // Create the GPU image buffer that will hold the data on the GPU
+        let gpu_image: Subbuffer<[T]> = Buffer::from_iter(
+            device.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            flat_data.into_iter(),
+        )
+        .expect("failed to create GPU image buffer");
 
         Self {
             image: gpu_image,

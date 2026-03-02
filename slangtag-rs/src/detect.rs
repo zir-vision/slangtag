@@ -452,7 +452,7 @@ impl Detector {
         let decimate_factor = self.settings.decimate.unwrap_or(1) as u32;
         let aligned_input = crop_image_to_multiple(image, 4 * decimate_factor)?;
         let input_gpu_image =
-            crate::GPUImage::from_image_buffer(self.device.clone(), aligned_input);
+            crate::GPUImage::from_image_buffer_fast(self.device.clone(), aligned_input);
 
         let decimated_image = match self.settings.decimate {
             Some(factor) => {

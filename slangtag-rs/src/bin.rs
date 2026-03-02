@@ -15,7 +15,7 @@ fn main() {
     let det = Detector::new(
         dev,
         DetectionSettings {
-            decimate: None,
+            decimate: Some(2),
             ..Default::default()
         },
     );
