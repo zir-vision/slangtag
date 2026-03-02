@@ -23,13 +23,8 @@ fn main() {
             ..Default::default()
         },
     );
-
-    let tags = det.detect(image).expect("Detection failed");
-    println!("Detected {} tag candidates", tags.len());
-    for tag in &tags {
-        println!(
-            "quad={} blob={} score={:.4} reversed={} id={:?}",
-            tag.quad_index, tag.blob_index, tag.score, tag.reversed_border, tag.id
-        );
+    for _ in 0..20 {
+        let tags = det.detect(image.clone()).expect("Detection failed");
+        println!("Detected {} tag candidates", tags.len());
     }
 }

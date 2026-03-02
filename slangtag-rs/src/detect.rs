@@ -39,6 +39,167 @@ pub struct DetectedTag {
 pub struct Detector {
     device: ComputeDevice,
     settings: DetectionSettings,
+    pipelines: DetectionPipelines,
+}
+
+struct DetectionPipelines {
+    decimate: Arc<ComputePipeline>,
+    minmax: Arc<ComputePipeline>,
+    filter_minmax: Arc<ComputePipeline>,
+    threshold: Arc<ComputePipeline>,
+    ccl_init: Arc<ComputePipeline>,
+    ccl_compression: Arc<ComputePipeline>,
+    ccl_merge: Arc<ComputePipeline>,
+    ccl_final_labeling: Arc<ComputePipeline>,
+    blob_diff: Arc<ComputePipeline>,
+    count_nonzero_blob_diff_points: Arc<ComputePipeline>,
+    filter_nonzero_blob_diff_points: Arc<ComputePipeline>,
+    prepare_blob_diff_points: Arc<ComputePipeline>,
+    bitonic_sort_blob_diff_points: Arc<ComputePipeline>,
+    build_blob_pair_extents: Arc<ComputePipeline>,
+    filter_blob_pair_extents: Arc<ComputePipeline>,
+    rewrite_selected_blob_points_with_theta: Arc<ComputePipeline>,
+    prepare_selected_blob_points: Arc<ComputePipeline>,
+    bitonic_sort_selected_blob_points: Arc<ComputePipeline>,
+    build_line_fit_points: Arc<ComputePipeline>,
+    fit_line_errors_and_peaks: Arc<ComputePipeline>,
+    count_valid_peaks: Arc<ComputePipeline>,
+    filter_valid_peaks: Arc<ComputePipeline>,
+    prepare_peaks: Arc<ComputePipeline>,
+    bitonic_sort_peaks: Arc<ComputePipeline>,
+    build_peak_extents: Arc<ComputePipeline>,
+    fit_quads: Arc<ComputePipeline>,
+    prepare_decode_quads: Arc<ComputePipeline>,
+    extract_candidate_bits: Arc<ComputePipeline>,
+}
+
+impl DetectionPipelines {
+    fn new(device: &ComputeDevice) -> Self {
+        Self {
+            decimate: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("01-threshold-decimate")),
+            ),
+            minmax: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("02-threshold-minmax")),
+            ),
+            filter_minmax: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("03-threshold-filter-minmax")),
+            ),
+            threshold: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("04-threshold-threshold")),
+            ),
+            ccl_init: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("05-ccl-init")),
+            ),
+            ccl_compression: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("06-ccl-compression")),
+            ),
+            ccl_merge: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("07-ccl-merge")),
+            ),
+            ccl_final_labeling: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("08-ccl-final-labeling")),
+            ),
+            blob_diff: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("09-blob-blob-diff")),
+            ),
+            count_nonzero_blob_diff_points: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!(
+                    "10-select-count-nonzero-blob-diff-points"
+                )),
+            ),
+            filter_nonzero_blob_diff_points: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!(
+                    "11-select-filter-nonzero-blob-diff-points"
+                )),
+            ),
+            prepare_blob_diff_points: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("12-sort-prepare-blob-diff-points")),
+            ),
+            bitonic_sort_blob_diff_points: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!(
+                    "13-sort-bitonic-sort-blob-diff-points"
+                )),
+            ),
+            build_blob_pair_extents: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("14-filter-build-blob-pair-extents")),
+            ),
+            filter_blob_pair_extents: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("15-filter-filter-blob-pair-extents")),
+            ),
+            rewrite_selected_blob_points_with_theta: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!(
+                    "16-filter-rewrite-selected-blob-points-with-theta"
+                )),
+            ),
+            prepare_selected_blob_points: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("17-sort-prepare-selected-blob-points")),
+            ),
+            bitonic_sort_selected_blob_points: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!(
+                    "18-sort-bitonic-sort-selected-blob-points"
+                )),
+            ),
+            build_line_fit_points: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("19-filter-build-line-fit-points")),
+            ),
+            fit_line_errors_and_peaks: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("20-filter-fit-line-errors-and-peaks")),
+            ),
+            count_valid_peaks: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("21-select-count-valid-peaks")),
+            ),
+            filter_valid_peaks: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("22-select-filter-valid-peaks")),
+            ),
+            prepare_peaks: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("23-sort-prepare-peaks")),
+            ),
+            bitonic_sort_peaks: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("24-sort-bitonic-sort-peaks")),
+            ),
+            build_peak_extents: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("25-filter-build-peak-extents")),
+            ),
+            fit_quads: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("26-filter-fit-quads")),
+            ),
+            prepare_decode_quads: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("27-decode-prepare-decode-quads")),
+            ),
+            extract_candidate_bits: Detector::create_compute_pipeline(
+                device,
+                include_bytes!(compute_shader_path!("28-decode-extract-candidate-bits")),
+            ),
+        }
+    }
 }
 
 impl Default for DetectionSettings {
@@ -235,7 +396,12 @@ impl Detector {
     const DETECT_INVERTED_MARKER: bool = true;
 
     pub fn new(device: ComputeDevice, settings: DetectionSettings) -> Self {
-        Self { device, settings }
+        let pipelines = DetectionPipelines::new(&device);
+        Self {
+            device,
+            settings,
+            pipelines,
+        }
     }
 
     pub fn detect(&self, image: DynamicImage) -> Result<Vec<DetectedTag>, ()> {
@@ -714,10 +880,13 @@ impl Detector {
         corrected
     }
 
-    fn create_compute_pipeline(&self, module_bytes: &[u8]) -> Arc<ComputePipeline> {
+    fn create_compute_pipeline(
+        device: &ComputeDevice,
+        module_bytes: &[u8],
+    ) -> Arc<ComputePipeline> {
         let shader = unsafe {
             vulkano::shader::ShaderModule::new(
-                self.device.device.clone(),
+                device.device.clone(),
                 ShaderModuleCreateInfo::new(&bytes_to_words(module_bytes).unwrap()),
             )
             .expect("failed to create shader module")
@@ -729,15 +898,15 @@ impl Detector {
 
         let stage = PipelineShaderStageCreateInfo::new(entry_point);
         let layout = PipelineLayout::new(
-            self.device.device.clone(),
+            device.device.clone(),
             PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-                .into_pipeline_layout_create_info(self.device.device.clone())
+                .into_pipeline_layout_create_info(device.device.clone())
                 .unwrap(),
         )
         .expect("failed to create pipeline layout");
 
         ComputePipeline::new(
-            self.device.device.clone(),
+            device.device.clone(),
             None,
             ComputePipelineCreateInfo::stage_layout(stage, layout),
         )
@@ -935,8 +1104,7 @@ impl Detector {
     }
 
     fn decimate(&self, image: &GPUImage<u8>, factor: u8) -> GPUImage<u8> {
-        let module_bytes = include_bytes!(compute_shader_path!("01-threshold-decimate"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.decimate.clone();
 
         let decimated_size = crate::Size::new(
             image.size.width / factor as u32,
@@ -967,8 +1135,7 @@ impl Detector {
     }
 
     fn minmax(&self, decimated_image: &GPUImage<u8>) -> (Subbuffer<[u8]>, Size) {
-        let module_bytes = include_bytes!(compute_shader_path!("02-threshold-minmax"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.minmax.clone();
 
         let minmax_size = Size::new(
             decimated_image.size.width / 4,
@@ -998,8 +1165,7 @@ impl Detector {
     }
 
     fn filter_minmax(&self, minmax_image: &Subbuffer<[u8]>, minmax_size: Size) -> Subbuffer<[u8]> {
-        let module_bytes = include_bytes!(compute_shader_path!("03-threshold-filter-minmax"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.filter_minmax.clone();
 
         let filtered_image = self.new_u8_storage_buffer(minmax_size.total_pixels() * 2);
         let descriptor_set = self.create_descriptor_set(
@@ -1031,8 +1197,7 @@ impl Detector {
         filtered_size: Size,
         min_white_black_diff: u8,
     ) -> GPUImage<u8> {
-        let module_bytes = include_bytes!(compute_shader_path!("04-threshold-threshold"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.threshold.clone();
 
         let thresholded_size = decimated_image.size;
         let thresholded_image = self.new_u8_storage_buffer(thresholded_size.total_pixels());
@@ -1062,8 +1227,7 @@ impl Detector {
     }
 
     fn ccl_init(&self, thresholded_image: &GPUImage<u8>) -> Subbuffer<[u32]> {
-        let module_bytes = include_bytes!(compute_shader_path!("05-ccl-init"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.ccl_init.clone();
 
         let labels = self.new_u32_storage_buffer(thresholded_image.size.total_pixels());
         let descriptor_set = self.create_descriptor_set(
@@ -1092,8 +1256,7 @@ impl Detector {
     }
 
     fn ccl_compression(&self, labels: &Subbuffer<[u32]>, image_size: Size) {
-        let module_bytes = include_bytes!(compute_shader_path!("06-ccl-compression"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.ccl_compression.clone();
 
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
@@ -1110,8 +1273,7 @@ impl Detector {
     }
 
     fn ccl_merge(&self, labels: &Subbuffer<[u32]>, image_size: Size) {
-        let module_bytes = include_bytes!(compute_shader_path!("07-ccl-merge"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.ccl_merge.clone();
 
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
@@ -1133,8 +1295,7 @@ impl Detector {
         union_markers_size: &Subbuffer<[u32]>,
         image_size: Size,
     ) {
-        let module_bytes = include_bytes!(compute_shader_path!("08-ccl-final-labeling"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.ccl_final_labeling.clone();
 
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
@@ -1161,8 +1322,7 @@ impl Detector {
         result: &Subbuffer<[u32]>,
         min_blob_size: u32,
     ) {
-        let module_bytes = include_bytes!(compute_shader_path!("09-blob-blob-diff"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.blob_diff.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
@@ -1194,10 +1354,7 @@ impl Detector {
         count_out: &Subbuffer<[u32]>,
         total_points: u32,
     ) {
-        let module_bytes = include_bytes!(compute_shader_path!(
-            "10-select-count-nonzero-blob-diff-points"
-        ));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.count_nonzero_blob_diff_points.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
@@ -1224,10 +1381,7 @@ impl Detector {
         output_count: &Subbuffer<[u32]>,
         total_points: u32,
     ) {
-        let module_bytes = include_bytes!(compute_shader_path!(
-            "11-select-filter-nonzero-blob-diff-points"
-        ));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.filter_nonzero_blob_diff_points.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
@@ -1255,8 +1409,7 @@ impl Detector {
         valid_points: u32,
         total_points: u32,
     ) {
-        let module_bytes = include_bytes!(compute_shader_path!("12-sort-prepare-blob-diff-points"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.prepare_blob_diff_points.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
@@ -1284,10 +1437,7 @@ impl Detector {
             return;
         }
 
-        let module_bytes = include_bytes!(compute_shader_path!(
-            "13-sort-bitonic-sort-blob-diff-points"
-        ));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.bitonic_sort_blob_diff_points.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![WriteDescriptorSet::buffer(0, points.clone())],
@@ -1320,9 +1470,7 @@ impl Detector {
         extent_count_out: &Subbuffer<[u32]>,
         valid_points: u32,
     ) {
-        let module_bytes =
-            include_bytes!(compute_shader_path!("14-filter-build-blob-pair-extents"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.build_blob_pair_extents.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
@@ -1354,9 +1502,7 @@ impl Detector {
         min_cluster_pixels: u32,
         max_cluster_pixels: u32,
     ) {
-        let module_bytes =
-            include_bytes!(compute_shader_path!("15-filter-filter-blob-pair-extents"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.filter_blob_pair_extents.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
@@ -1390,10 +1536,10 @@ impl Detector {
         extent_count: u32,
         valid_points: u32,
     ) {
-        let module_bytes = include_bytes!(compute_shader_path!(
-            "16-filter-rewrite-selected-blob-points-with-theta"
-        ));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self
+            .pipelines
+            .rewrite_selected_blob_points_with_theta
+            .clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
@@ -1425,9 +1571,7 @@ impl Detector {
         valid_points: u32,
         total_points: u32,
     ) {
-        let module_bytes =
-            include_bytes!(compute_shader_path!("17-sort-prepare-selected-blob-points"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.prepare_selected_blob_points.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
@@ -1455,10 +1599,7 @@ impl Detector {
             return;
         }
 
-        let module_bytes = include_bytes!(compute_shader_path!(
-            "18-sort-bitonic-sort-selected-blob-points"
-        ));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.bitonic_sort_selected_blob_points.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![WriteDescriptorSet::buffer(0, points.clone())],
@@ -1492,8 +1633,7 @@ impl Detector {
         point_count: u32,
         decimate: u32,
     ) {
-        let module_bytes = include_bytes!(compute_shader_path!("19-filter-build-line-fit-points"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.build_line_fit_points.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
@@ -1524,9 +1664,7 @@ impl Detector {
         extent_count: u32,
         point_count: u32,
     ) {
-        let module_bytes =
-            include_bytes!(compute_shader_path!("20-filter-fit-line-errors-and-peaks"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.fit_line_errors_and_peaks.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
@@ -1554,8 +1692,7 @@ impl Detector {
         count_out: &Subbuffer<[u32]>,
         total_peaks: u32,
     ) {
-        let module_bytes = include_bytes!(compute_shader_path!("21-select-count-valid-peaks"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.count_valid_peaks.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
@@ -1584,8 +1721,7 @@ impl Detector {
         output_count: &Subbuffer<[u32]>,
         total_peaks: u32,
     ) {
-        let module_bytes = include_bytes!(compute_shader_path!("22-select-filter-valid-peaks"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.filter_valid_peaks.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
@@ -1615,8 +1751,7 @@ impl Detector {
         valid_peaks: u32,
         total_peaks: u32,
     ) {
-        let module_bytes = include_bytes!(compute_shader_path!("23-sort-prepare-peaks"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.prepare_peaks.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
@@ -1644,8 +1779,7 @@ impl Detector {
             return;
         }
 
-        let module_bytes = include_bytes!(compute_shader_path!("24-sort-bitonic-sort-peaks"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.bitonic_sort_peaks.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![WriteDescriptorSet::buffer(0, peaks.clone())],
@@ -1682,8 +1816,7 @@ impl Detector {
         peak_extent_count_out: &Subbuffer<[u32]>,
         valid_peaks: u32,
     ) {
-        let module_bytes = include_bytes!(compute_shader_path!("25-filter-build-peak-extents"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.build_peak_extents.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
@@ -1715,8 +1848,7 @@ impl Detector {
         min_tag_width: u32,
         quad_decimate: f32,
     ) {
-        let module_bytes = include_bytes!(compute_shader_path!("26-filter-fit-quads"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.fit_quads.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
@@ -1754,8 +1886,7 @@ impl Detector {
         cell_size: u32,
         min_stddev_otsu: f32,
     ) {
-        let module_bytes = include_bytes!(compute_shader_path!("27-decode-prepare-decode-quads"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.prepare_decode_quads.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
@@ -1793,8 +1924,7 @@ impl Detector {
         cell_margin_pixels: u32,
         cell_span: u32,
     ) {
-        let module_bytes = include_bytes!(compute_shader_path!("28-decode-extract-candidate-bits"));
-        let compute_pipeline = self.create_compute_pipeline(module_bytes);
+        let compute_pipeline = self.pipelines.extract_candidate_bits.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
