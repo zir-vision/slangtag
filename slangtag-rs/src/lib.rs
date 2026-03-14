@@ -50,7 +50,7 @@ pub struct GPUImage<T> {
     pub(crate) size: Size,
     device: ComputeDevice,
 
-    _marker: std::marker::PhantomData<T>,
+    // _marker: std::marker::PhantomData<T>,
 }
 
 impl<T: BufferContents + Primitive + Debug> GPUImage<T> {
@@ -59,7 +59,7 @@ impl<T: BufferContents + Primitive + Debug> GPUImage<T> {
             image,
             size,
             device,
-            _marker: std::marker::PhantomData,
+            // _marker: std::marker::PhantomData,
         }
     }
 
@@ -133,7 +133,7 @@ impl<T: BufferContents + Primitive + Debug> GPUImage<T> {
             image: gpu_image,
             size,
             device,
-            _marker: std::marker::PhantomData,
+            // _marker: std::marker::PhantomData,
         }
     }
 
@@ -164,7 +164,7 @@ impl<T: BufferContents + Primitive + Debug> GPUImage<T> {
             image: gpu_image,
             size,
             device,
-            _marker: std::marker::PhantomData,
+            // _marker: std::marker::PhantomData,
         }
     }
 
@@ -240,10 +240,36 @@ pub struct ComputeDevice {
 impl ComputeDevice {
     pub fn new_default() -> ComputeDevice {
         let library = VulkanLibrary::new().expect("no local Vulkan library/DLL");
+        // Print available layers for debugging purposes
+        // println!("Available Vulkan layers:");
+        // for layer in library
+        //     .layer_properties()
+        //     .expect("could not get layer properties")
+        // {
+        //     println!("  - {}: {}", layer.name(), layer.implementation_version());
+        //     println!("Supported layer extensions:");
+        //     for layer in library
+        //         .supported_layer_extensions(layer.name())
+        //         .expect("could not get supported layer extensions")
+        //     {
+        //         println!("    - {}: {}", layer.0, layer.1);
+        //     }
+        // }
         let instance = Instance::new(
             library,
             InstanceCreateInfo {
-                flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+                enabled_layers: vec![
+                    "VK_LAYER_KHRONOS_validation".to_string(),
+
+                    "VK_LAYER_LUNARG_crash_diagnostic".to_string(),
+                ],
+                enabled_validation_features: vec![
+                    vulkano::instance::debug::ValidationFeatureEnable::DebugPrintf
+                ],
+                enabled_extensions: vulkano::instance::InstanceExtensions {
+                    ext_validation_features: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -266,6 +292,16 @@ impl ComputeDevice {
             .expect("couldn't find a graphical queue family")
             as u32;
 
+        let supported_features = physical_device.supported_features();
+        let enabled_features = DeviceFeatures {
+            shader_int8: supported_features.shader_int8,
+            shader_int64: supported_features.shader_int64,
+            subgroup_size_control: supported_features.subgroup_size_control,
+            robust_buffer_access: true,
+            robust_buffer_access2: true,
+            ..Default::default()
+        };
+
         let (device, mut queues) = Device::new(
             physical_device,
             DeviceCreateInfo {
@@ -274,9 +310,9 @@ impl ComputeDevice {
                     queue_family_index,
                     ..Default::default()
                 }],
-                enabled_features: DeviceFeatures {
-                    shader_int8: true,  // >90% support.
-                    shader_int64: true, // 56% support. mostly android
+                enabled_features,
+                enabled_extensions: vulkano::device::DeviceExtensions {
+                    khr_push_descriptor: true,
                     ..Default::default()
                 },
                 ..Default::default()

@@ -45,7 +45,9 @@ static APRILTAG_36H11_ROTATED_CODES: LazyLock<Vec<RotatedTagCode>> = LazyLock::n
 static APRILTAG_36H11_EXACT_LOOKUP: LazyLock<HashMap<u64, (u32, u8)>> = LazyLock::new(|| {
     let mut by_code = HashMap::with_capacity(APRILTAG_36H11_ROTATED_CODES.len());
     for entry in APRILTAG_36H11_ROTATED_CODES.iter().copied() {
-        by_code.entry(entry.code).or_insert((entry.id, entry.rotation));
+        by_code
+            .entry(entry.code)
+            .or_insert((entry.id, entry.rotation));
     }
     by_code
 });
@@ -162,9 +164,7 @@ impl DetectionPipelines {
             ),
             bitonic_sort_blob_diff_points: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!(
-                    "sort-bitonic-sort-blob-diff-points"
-                )),
+                include_bytes!(compute_shader_path!("sort-bitonic-sort-blob-diff-points")),
             ),
             build_blob_pair_extents: Detector::create_compute_pipeline(
                 device,
@@ -441,8 +441,10 @@ impl Detector {
         self.detect_gray(gray_image)
     }
 
-
-    pub fn detect_gray(&self, image: ImageBuffer<image::Luma<u8>, Vec<u8>>) -> Result<Vec<DetectedTag>, ()> {
+    pub fn detect_gray(
+        &self,
+        image: ImageBuffer<image::Luma<u8>, Vec<u8>>,
+    ) -> Result<Vec<DetectedTag>, ()> {
         if let Some(factor) = self.settings.decimate
             && !is_power_of_two(factor)
         {
@@ -1048,7 +1050,9 @@ impl Detector {
         let buf = Buffer::new_unsized(
             self.device.memory_allocator.clone(),
             BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST,
+                usage: BufferUsage::STORAGE_BUFFER
+                    | BufferUsage::TRANSFER_SRC
+                    | BufferUsage::TRANSFER_DST,
                 ..Default::default()
             },
             AllocationCreateInfo {

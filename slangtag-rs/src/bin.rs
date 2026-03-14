@@ -8,7 +8,7 @@ fn main() {
     let image_path = args
         .get(1)
         .expect("Please provide an image path as the first argument");
-    
+
     let image = image::open(image_path).expect("Failed to open image");
 
     let dev = ComputeDevice::new_default();
