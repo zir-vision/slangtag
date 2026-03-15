@@ -1,6 +1,7 @@
 use crate::gpu::{BufferMemory, CommandRecorder, ComputePipeline, DescriptorBuffer, GpuBuffer};
 use crate::sort::RadixSorter;
 use crate::{ComputeDevice, GPUImage, Size, compute_shader_path, include_u32};
+use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use image::{DynamicImage, GrayImage, ImageBuffer};
 use std::collections::HashMap;
@@ -320,6 +321,129 @@ fn dispatch_groups_1d(total_invocations: u32, local_size_x: u32) -> u32 {
     }
 }
 
+struct TimedPass {
+    name: String,
+    start_query: u32,
+    end_query: u32,
+}
+
+struct PipelineTimings {
+    query_pool: crate::GpuQueryPool,
+    next_query: u32,
+    spans: Vec<TimedPass>,
+}
+
+impl PipelineTimings {
+    fn new(device: &ComputeDevice, query_capacity: u32) -> Self {
+        Self {
+            query_pool: device.create_timestamp_query_pool(query_capacity),
+            next_query: 0,
+            spans: Vec::new(),
+        }
+    }
+
+    fn reset(&mut self, commands: &mut CommandRecorder<'_>) {
+        commands.reset_query_pool(&self.query_pool, 0, self.query_pool.query_count());
+        self.next_query = 0;
+        self.spans.clear();
+    }
+
+    fn allocate_queries(&mut self, count: u32) -> u32 {
+        let base = self.next_query;
+        let end = base
+            .checked_add(count)
+            .expect("timing query index overflow in detect pipeline");
+        assert!(
+            end <= self.query_pool.query_count(),
+            "detect timing query pool exhausted: required={} capacity={}",
+            end,
+            self.query_pool.query_count()
+        );
+        self.next_query = end;
+        base
+    }
+
+    fn dispatch_with_push_constants<T: Pod + Copy>(
+        &mut self,
+        commands: &mut CommandRecorder<'_>,
+        name: &str,
+        compute_pipeline: &ComputePipeline,
+        bindings: &[(u32, DescriptorBuffer)],
+        push_constants: &T,
+        dispatch: [u32; 3],
+    ) {
+        let start_query = self.allocate_queries(1);
+        let end_query = self.allocate_queries(1);
+        commands.write_timestamp(
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            &self.query_pool,
+            start_query,
+        );
+        commands.dispatch_with_push_constants(
+            compute_pipeline,
+            bindings,
+            push_constants,
+            dispatch,
+        );
+        commands.write_timestamp(
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            &self.query_pool,
+            end_query,
+        );
+        self.spans.push(TimedPass {
+            name: name.to_owned(),
+            start_query,
+            end_query,
+        });
+    }
+
+    fn reserve_radix_sort_queries(&mut self, name_prefix: &str) -> u32 {
+        let base_query = self.allocate_queries(RadixSorter::TIMESTAMP_QUERY_COUNT);
+        for pass in 0..4 {
+            let start = base_query + 1 + 3 * pass;
+            self.spans.push(TimedPass {
+                name: format!("{name_prefix}::upsweep[p{pass}]"),
+                start_query: start,
+                end_query: start + 1,
+            });
+            self.spans.push(TimedPass {
+                name: format!("{name_prefix}::spine[p{pass}]"),
+                start_query: start + 1,
+                end_query: start + 2,
+            });
+            self.spans.push(TimedPass {
+                name: format!("{name_prefix}::downsweep[p{pass}]"),
+                start_query: start + 2,
+                end_query: start + 3,
+            });
+        }
+        base_query
+    }
+
+    fn print_summary(&self, device: &ComputeDevice) {
+        if self.next_query == 0 {
+            return;
+        }
+
+        let timestamps = device.get_query_pool_results_u64(&self.query_pool, 0, self.next_query);
+        let timestamp_period_ns = f64::from(device.timestamp_period_ns());
+
+        println!("GPU shader timings (detect pipeline):");
+        let mut total_ms = 0.0f64;
+        for span in &self.spans {
+            let start = timestamps[span.start_query as usize];
+            let end = timestamps[span.end_query as usize];
+            if end < start {
+                continue;
+            }
+            let elapsed_ms = ((end - start) as f64) * timestamp_period_ns / 1_000_000.0;
+            total_ms += elapsed_ms;
+            println!("  {:<52} {:>9.3} ms", span.name, elapsed_ms);
+        }
+        println!("  {:<52} {:>9.3} ms", "total timed shader execution", total_ms);
+    }
+}
+
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone)]
 struct DecimatePushConstants {
@@ -559,12 +683,17 @@ impl Detector {
         let blob_diff_compacted = self
             .new_u32_storage_buffer(blob_diff_total_points as usize * blob_diff_words_per_point);
         let blob_diff_filter_count = self.new_zeroed_u32_counter_buffer();
+        let mut pipeline_timings = PipelineTimings::new(&self.device, 512);
 
         // Phase 1: threshold/CCL/blob-diff and direct compaction into oversized output.
         self.device.run_commands(|commands| {
+            pipeline_timings.reset(commands);
+
             if self.settings.decimate.is_some() {
                 let decimate_pipeline = &self.pipelines.decimate;
-                self.dispatch_with_push_constants_recorded(
+                self.dispatch_with_push_constants_recorded_timed(
+                    &mut pipeline_timings,
+                    "threshold-decimate",
                     commands,
                     decimate_pipeline,
                     &[
@@ -580,7 +709,9 @@ impl Detector {
                 commands.barrier_shader_write_to_shader_read();
             }
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "threshold-minmax",
                 commands,
                 &self.pipelines.minmax,
                 &[
@@ -595,7 +726,9 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "threshold-filter-minmax",
                 commands,
                 &self.pipelines.filter_minmax,
                 &[(0, minmax_image.descriptor()), (1, filtered_minmax_image.descriptor())],
@@ -607,7 +740,9 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "threshold-threshold",
                 commands,
                 &self.pipelines.threshold,
                 &[
@@ -625,7 +760,9 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "ccl-init",
                 commands,
                 &self.pipelines.ccl_init,
                 &[
@@ -639,7 +776,9 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "ccl-compression[first]",
                 commands,
                 &self.pipelines.ccl_compression,
                 &[(0, labels.descriptor())],
@@ -650,7 +789,9 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "ccl-merge",
                 commands,
                 &self.pipelines.ccl_merge,
                 &[(0, labels.descriptor())],
@@ -661,7 +802,9 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "ccl-compression[second]",
                 commands,
                 &self.pipelines.ccl_compression,
                 &[(0, labels.descriptor())],
@@ -672,7 +815,9 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "ccl-final-labeling",
                 commands,
                 &self.pipelines.ccl_final_labeling,
                 &[
@@ -686,7 +831,9 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "blob-blob-diff",
                 commands,
                 &self.pipelines.blob_diff,
                 &[
@@ -703,7 +850,9 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "select-filter-nonzero-blob-diff-points",
                 commands,
                 &self.pipelines.filter_nonzero_blob_diff_points,
                 &[
@@ -723,8 +872,11 @@ impl Detector {
         });
 
         let blob_diff_filtered_size = self.read_counter(&blob_diff_filter_count);
-        let blob_diff_sorted =
-            self.radix_sort_blob_diff_points(&blob_diff_compacted, blob_diff_filtered_size);
+        let blob_diff_sorted = self.radix_sort_blob_diff_points(
+            &blob_diff_compacted,
+            blob_diff_filtered_size,
+            &mut pipeline_timings,
+        );
 
         let blob_extent_words_per_extent = 11usize;
         let blob_extent_capacity = usize::max(1, blob_diff_filtered_size as usize);
@@ -753,7 +905,9 @@ impl Detector {
             );
             commands.barrier_transfer_write_to_compute_read();
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-build-blob-pair-extents",
                 commands,
                 &self.pipelines.build_blob_pair_extents,
                 &[
@@ -768,7 +922,9 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-filter-blob-pair-extents",
                 commands,
                 &self.pipelines.filter_blob_pair_extents,
                 &[
@@ -804,11 +960,13 @@ impl Detector {
             &selected_blob_points,
             blob_extent_count_value,
             blob_diff_filtered_size,
+            &mut pipeline_timings,
         );
 
         let selected_blob_sorted_points = self.radix_sort_selected_blob_points(
             &selected_blob_points,
             selected_blob_point_count_value,
+            &mut pipeline_timings,
         );
 
         let line_fit_point_words_per_point = 10usize;
@@ -842,7 +1000,9 @@ impl Detector {
 
         // Phase 3: point rewrite/fit, peak grouping, quad fit, and decode prep/extract.
         self.device.run_commands(|commands| {
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-build-line-fit-points",
                 commands,
                 &self.pipelines.build_line_fit_points,
                 &[
@@ -859,7 +1019,9 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-fit-line-errors-and-peaks",
                 commands,
                 &self.pipelines.fit_line_errors_and_peaks,
                 &[
@@ -877,14 +1039,17 @@ impl Detector {
             );
         });
 
-        let sorted_peaks = self.radix_sort_peaks(&peaks, selected_blob_point_count_value);
+        let sorted_peaks =
+            self.radix_sort_peaks(&peaks, selected_blob_point_count_value, &mut pipeline_timings);
 
         self.device.run_commands(|commands| {
             commands.fill_buffer_u32_range(&peak_extents, 0, peak_extents.byte_size(), 0);
             commands.fill_buffer_u32_range(&fitted_quads, 0, fitted_quads.byte_size(), 0);
             commands.barrier_transfer_write_to_compute_read();
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-build-peak-extents",
                 commands,
                 &self.pipelines.build_peak_extents,
                 &[
@@ -899,7 +1064,9 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-fit-quads",
                 commands,
                 &self.pipelines.fit_quads,
                 &[
@@ -927,7 +1094,9 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "decode-prepare-decode-quads",
                 commands,
                 &self.pipelines.prepare_decode_quads,
                 &[
@@ -950,7 +1119,9 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            self.dispatch_with_push_constants_recorded(
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "decode-extract-candidate-bits",
                 commands,
                 &self.pipelines.extract_candidate_bits,
                 &[
@@ -982,6 +1153,7 @@ impl Detector {
 
         let fitted_quad_count_value = self.read_counter(&fitted_quad_count);
         if fitted_quad_count_value == 0 {
+            pipeline_timings.print_summary(&self.device);
             return Ok(Vec::new());
         }
 
@@ -991,11 +1163,13 @@ impl Detector {
         );
         let bits_words =
             self.download_u32_buffer(&bits, fitted_quad_count_value as usize * 8usize * 8usize);
-        Ok(self.build_detected_tags(
+        let tags = self.build_detected_tags(
             &fitted_quad_words,
             fitted_quad_count_value,
             &bits_words,
-        ))
+        );
+        pipeline_timings.print_summary(&self.device);
+        Ok(tags)
     }
 
     fn build_detected_tags(
@@ -1206,8 +1380,30 @@ impl Detector {
         Arc::new(DescriptorSet { writes })
     }
 
-    fn dispatch_with_push_constants<T: Pod + Copy>(
+    fn dispatch_with_push_constants_recorded_timed<T: Pod + Copy>(
         &self,
+        timings: &mut PipelineTimings,
+        name: &str,
+        commands: &mut CommandRecorder<'_>,
+        compute_pipeline: &Arc<ComputePipeline>,
+        bindings: &[(u32, DescriptorBuffer)],
+        push_constants: T,
+        dispatch: [u32; 3],
+    ) {
+        timings.dispatch_with_push_constants(
+            commands,
+            name,
+            compute_pipeline.as_ref(),
+            bindings,
+            &push_constants,
+            dispatch,
+        );
+    }
+
+    fn dispatch_with_push_constants_timed<T: Pod + Copy>(
+        &self,
+        timings: &mut PipelineTimings,
+        name: &str,
         compute_pipeline: Arc<ComputePipeline>,
         descriptor_set: Arc<DescriptorSet>,
         push_constants: T,
@@ -1218,28 +1414,16 @@ impl Detector {
             .iter()
             .map(|write| (write.binding, write.buffer))
             .collect();
-        self.device.dispatch_with_push_constants(
-            compute_pipeline.as_ref(),
-            &bindings,
-            &push_constants,
-            dispatch,
-        );
-    }
-
-    fn dispatch_with_push_constants_recorded<T: Pod + Copy>(
-        &self,
-        commands: &mut CommandRecorder<'_>,
-        compute_pipeline: &Arc<ComputePipeline>,
-        bindings: &[(u32, DescriptorBuffer)],
-        push_constants: T,
-        dispatch: [u32; 3],
-    ) {
-        commands.dispatch_with_push_constants(
-            compute_pipeline.as_ref(),
-            bindings,
-            &push_constants,
-            dispatch,
-        );
+        self.device.run_commands(|commands| {
+            timings.dispatch_with_push_constants(
+                commands,
+                name,
+                compute_pipeline.as_ref(),
+                &bindings,
+                &push_constants,
+                dispatch,
+            );
+        });
     }
 
     fn new_u8_storage_buffer(&self, len: usize) -> GpuBuffer<u8> {
@@ -1303,6 +1487,7 @@ impl Detector {
         &self,
         input: &GpuBuffer<u32>,
         valid_points: u32,
+        timings: &mut PipelineTimings,
     ) -> GpuBuffer<u32> {
         // Existing blob extent construction expects points sorted by (rep1, rep0).
         self.radix_sort_records_lexicographic(
@@ -1312,6 +1497,8 @@ impl Detector {
             1,
             0,
             Self::RADIX_KEY_TRANSFORM_NONE,
+            "radix-sort-blob-diff-points",
+            timings,
         )
     }
 
@@ -1323,6 +1510,7 @@ impl Detector {
         selected_points_out: &GpuBuffer<u32>,
         extent_count: u32,
         valid_points: u32,
+        timings: &mut PipelineTimings,
     ) {
         let compute_pipeline = self
             .pipelines
@@ -1337,7 +1525,9 @@ impl Detector {
                 WriteDescriptorSet::buffer(3, selected_points_out.clone()),
             ],
         );
-        self.dispatch_with_push_constants(
+        self.dispatch_with_push_constants_timed(
+            timings,
+            "filter-rewrite-selected-blob-points-with-theta",
             compute_pipeline,
             descriptor_set,
             RewriteSelectedBlobPointsPushConstants {
@@ -1356,6 +1546,7 @@ impl Detector {
         &self,
         input: &GpuBuffer<u32>,
         valid_points: u32,
+        timings: &mut PipelineTimings,
     ) -> GpuBuffer<u32> {
         self.radix_sort_records_lexicographic(
             input,
@@ -1364,10 +1555,17 @@ impl Detector {
             0,
             1,
             Self::RADIX_KEY_TRANSFORM_NONE,
+            "radix-sort-selected-blob-points",
+            timings,
         )
     }
 
-    fn radix_sort_peaks(&self, input: &GpuBuffer<u32>, valid_peaks: u32) -> GpuBuffer<u32> {
+    fn radix_sort_peaks(
+        &self,
+        input: &GpuBuffer<u32>,
+        valid_peaks: u32,
+        timings: &mut PipelineTimings,
+    ) -> GpuBuffer<u32> {
         // Existing peak extent construction expects peaks sorted by (blob_index, float(error)).
         self.radix_sort_records_lexicographic(
             input,
@@ -1376,6 +1574,8 @@ impl Detector {
             0,
             1,
             Self::RADIX_KEY_TRANSFORM_F32_ASC,
+            "radix-sort-peaks",
+            timings,
         )
     }
 
@@ -1387,6 +1587,8 @@ impl Detector {
         primary_key_word: u32,
         secondary_key_word: u32,
         secondary_key_transform: u32,
+        timing_prefix: &str,
+        timings: &mut PipelineTimings,
     ) -> GpuBuffer<u32> {
         let output_words = usize::max(1, valid_records as usize * words_per_record as usize);
         let sorted_records = self.new_u32_storage_buffer(output_words);
@@ -1414,10 +1616,15 @@ impl Detector {
             words_per_record,
             secondary_key_word,
             secondary_key_transform,
+            timings,
+            &format!("{timing_prefix}::sort-key-init"),
         );
 
         let sort_storage = self.sorter.create_key_value_storage_buffer(valid_records);
-        self.sorter.cmd_sort_key_value(
+        let secondary_sort_query = timings.reserve_radix_sort_queries(&format!(
+            "{timing_prefix}::secondary-key-sort"
+        ));
+        self.sorter.cmd_sort_key_value_with_query_pool(
             valid_records,
             &sort_keys,
             0,
@@ -1425,6 +1632,7 @@ impl Detector {
             0,
             &sort_storage,
             0,
+            Some((&timings.query_pool, secondary_sort_query)),
         );
 
         self.radix_update_keys_from_indices(
@@ -1435,8 +1643,12 @@ impl Detector {
             words_per_record,
             primary_key_word,
             Self::RADIX_KEY_TRANSFORM_NONE,
+            timings,
+            &format!("{timing_prefix}::sort-key-update"),
         );
-        self.sorter.cmd_sort_key_value(
+        let primary_sort_query =
+            timings.reserve_radix_sort_queries(&format!("{timing_prefix}::primary-key-sort"));
+        self.sorter.cmd_sort_key_value_with_query_pool(
             valid_records,
             &sort_keys,
             0,
@@ -1444,6 +1656,7 @@ impl Detector {
             0,
             &sort_storage,
             0,
+            Some((&timings.query_pool, primary_sort_query)),
         );
 
         self.radix_gather_records_by_indices(
@@ -1452,6 +1665,8 @@ impl Detector {
             &sorted_records,
             valid_records,
             words_per_record,
+            timings,
+            &format!("{timing_prefix}::gather"),
         );
 
         sorted_records
@@ -1466,6 +1681,8 @@ impl Detector {
         words_per_record: u32,
         key_word_index: u32,
         key_transform: u32,
+        timings: &mut PipelineTimings,
+        timing_name: &str,
     ) {
         let compute_pipeline = self.pipelines.radix_init_keys_indices.clone();
         let descriptor_set = self.create_descriptor_set(
@@ -1476,7 +1693,9 @@ impl Detector {
                 WriteDescriptorSet::buffer(2, indices_out.clone()),
             ],
         );
-        self.dispatch_with_push_constants(
+        self.dispatch_with_push_constants_timed(
+            timings,
+            timing_name,
             compute_pipeline,
             descriptor_set,
             RadixExtractPushConstants {
@@ -1502,6 +1721,8 @@ impl Detector {
         words_per_record: u32,
         key_word_index: u32,
         key_transform: u32,
+        timings: &mut PipelineTimings,
+        timing_name: &str,
     ) {
         let compute_pipeline = self.pipelines.radix_keys_from_indices.clone();
         let descriptor_set = self.create_descriptor_set(
@@ -1512,7 +1733,9 @@ impl Detector {
                 WriteDescriptorSet::buffer(2, keys_out.clone()),
             ],
         );
-        self.dispatch_with_push_constants(
+        self.dispatch_with_push_constants_timed(
+            timings,
+            timing_name,
             compute_pipeline,
             descriptor_set,
             RadixExtractPushConstants {
@@ -1536,6 +1759,8 @@ impl Detector {
         output_records: &GpuBuffer<u32>,
         valid_points: u32,
         words_per_record: u32,
+        timings: &mut PipelineTimings,
+        timing_name: &str,
     ) {
         let compute_pipeline = self.pipelines.radix_gather_by_indices.clone();
         let descriptor_set = self.create_descriptor_set(
@@ -1546,7 +1771,9 @@ impl Detector {
                 WriteDescriptorSet::buffer(2, output_records.clone()),
             ],
         );
-        self.dispatch_with_push_constants(
+        self.dispatch_with_push_constants_timed(
+            timings,
+            timing_name,
             compute_pipeline,
             descriptor_set,
             RadixGatherPushConstants {

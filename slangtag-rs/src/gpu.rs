@@ -39,6 +39,7 @@ struct ComputeDeviceInner {
     max_subgroup_size: u32,
     max_compute_workgroup_subgroups: u32,
     min_storage_buffer_offset_alignment: vk::DeviceSize,
+    timestamp_period_ns: f32,
 }
 
 impl Drop for ComputeDeviceInner {
@@ -479,6 +480,7 @@ impl ComputeDevice {
             .properties
             .limits
             .min_storage_buffer_offset_alignment;
+        let timestamp_period_ns = properties2.properties.limits.timestamp_period;
         let _ = properties2;
         let required_subgroup_size_stages = subgroup_props.required_subgroup_size_stages;
         let min_subgroup_size = subgroup_props.min_subgroup_size;
@@ -618,6 +620,7 @@ impl ComputeDevice {
                 max_subgroup_size,
                 max_compute_workgroup_subgroups,
                 min_storage_buffer_offset_alignment,
+                timestamp_period_ns,
             }),
         }
     }
@@ -669,6 +672,10 @@ impl ComputeDevice {
 
     pub fn min_storage_buffer_offset_alignment(&self) -> vk::DeviceSize {
         self.inner.min_storage_buffer_offset_alignment
+    }
+
+    pub fn timestamp_period_ns(&self) -> f32 {
+        self.inner.timestamp_period_ns
     }
 
     pub fn supports_required_subgroup_size(&self, subgroup_size: u32, workgroup_size: u32) -> bool {
