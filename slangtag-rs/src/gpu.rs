@@ -506,9 +506,9 @@ impl ComputeDevice {
         let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_features(&requested_features);
-        
+
         device_create_info = device_create_info.push_next(&mut subgroup_features_enabled);
-        
+
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
             .shader_int8(true)
             .storage_buffer8_bit_access(true)

@@ -65,6 +65,44 @@ pub struct DetectionSettings {
     pub decimate: Option<u8>,
     pub min_white_black_diff: u8,
     pub min_blob_size: u32,
+    pub blob_pair_filter: BlobPairFilterSettings,
+    pub quad_fit: QuadFitSettings,
+    pub decode: DecodeSettings,
+    pub apriltag: AprilTagSettings,
+}
+
+#[derive(Clone, Copy)]
+pub struct BlobPairFilterSettings {
+    pub min_tag_width: u32,
+    pub tag_width: u32,
+    pub reversed_border: u32,
+    pub normal_border: u32,
+    pub min_cluster_pixels: u32,
+    pub max_cluster_pixels: Option<u32>,
+    pub max_cluster_pixels_perimeter_scale: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct QuadFitSettings {
+    pub max_nmaxima: u32,
+    pub max_line_fit_mse: f32,
+    pub cos_critical_rad: f32,
+}
+
+#[derive(Clone, Copy)]
+pub struct DecodeSettings {
+    pub cell_size: u32,
+    pub min_stddev_otsu: f32,
+    pub cell_margin_pixels: u32,
+    pub cell_span: u32,
+    pub detect_inverted_marker: bool,
+    pub max_erroneous_border_bits_rate: f32,
+}
+
+#[derive(Clone, Copy)]
+pub struct AprilTagSettings {
+    pub error_correction_rate: f32,
+    pub max_correction_bits: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +271,56 @@ impl Default for DetectionSettings {
             decimate: Some(2),
             min_white_black_diff: 25,
             min_blob_size: 25,
+            blob_pair_filter: BlobPairFilterSettings::default(),
+            quad_fit: QuadFitSettings::default(),
+            decode: DecodeSettings::default(),
+            apriltag: AprilTagSettings::default(),
+        }
+    }
+}
+
+impl Default for BlobPairFilterSettings {
+    fn default() -> Self {
+        Self {
+            min_tag_width: 3,
+            tag_width: 1,
+            reversed_border: 1,
+            normal_border: 1,
+            min_cluster_pixels: 24,
+            max_cluster_pixels: None,
+            max_cluster_pixels_perimeter_scale: 4,
+        }
+    }
+}
+
+impl Default for QuadFitSettings {
+    fn default() -> Self {
+        Self {
+            max_nmaxima: 10,
+            max_line_fit_mse: 10.0,
+            cos_critical_rad: 0.984_807_73,
+        }
+    }
+}
+
+impl Default for DecodeSettings {
+    fn default() -> Self {
+        Self {
+            cell_size: 4,
+            min_stddev_otsu: 5.0,
+            cell_margin_pixels: 0,
+            cell_span: 4,
+            detect_inverted_marker: true,
+            max_erroneous_border_bits_rate: 0.35,
+        }
+    }
+}
+
+impl Default for AprilTagSettings {
+    fn default() -> Self {
+        Self {
+            error_correction_rate: 0.6,
+            max_correction_bits: 0,
         }
     }
 }
@@ -408,10 +496,6 @@ impl Detector {
     const MARKER_BORDER_BITS: usize = 1;
     const APRILTAG_MARKER_SIZE: usize =
         Self::MARKER_SIZE_WITH_BORDERS - (2 * Self::MARKER_BORDER_BITS);
-    const APRILTAG_ERROR_CORRECTION_RATE: f32 = 0.6;
-    const APRILTAG_MAX_CORRECTION_BITS: u32 = 0;
-    const MAX_ERRONEOUS_BITS_IN_BORDER_RATE: f32 = 0.35;
-    const DETECT_INVERTED_MARKER: bool = true;
     const RADIX_KEY_TRANSFORM_NONE: u32 = 0;
     const RADIX_KEY_TRANSFORM_F32_ASC: u32 = 1;
 
@@ -437,6 +521,16 @@ impl Detector {
     ) -> Result<Vec<DetectedTag>, ()> {
         if let Some(factor) = self.settings.decimate
             && !is_power_of_two(factor)
+        {
+            return Err(());
+        }
+        if self.settings.decode.cell_size == 0
+            || self.settings.decode.cell_span == 0
+            || self
+                .settings
+                .blob_pair_filter
+                .max_cluster_pixels_perimeter_scale
+                == 0
         {
             return Err(());
         }
@@ -526,18 +620,23 @@ impl Detector {
         );
         let selected_blob_extent_count = self.new_zeroed_u32_counter_buffer();
         let selected_blob_point_count = self.new_zeroed_u32_counter_buffer();
-        let min_tag_width = 3;
+        let blob_pair_filter = self.settings.blob_pair_filter;
+        let min_tag_width = blob_pair_filter.min_tag_width;
+        let max_cluster_pixels = blob_pair_filter.max_cluster_pixels.unwrap_or(
+            blob_pair_filter.max_cluster_pixels_perimeter_scale
+                * (thresholded_image.size.width + thresholded_image.size.height),
+        );
         self.filter_blob_pair_extents(
             &blob_extent,
             &filtered_blob_extent,
             &selected_blob_extent_count,
             &selected_blob_point_count,
             blob_extent_count_value,
-            min_tag_width,
-            1,
-            1,
-            24,
-            4 * (thresholded_image.size.width + thresholded_image.size.height),
+            blob_pair_filter.tag_width,
+            blob_pair_filter.reversed_border,
+            blob_pair_filter.normal_border,
+            blob_pair_filter.min_cluster_pixels,
+            max_cluster_pixels,
         );
         let _selected_blob_extent_count_value = self.read_counter(&selected_blob_extent_count);
         let selected_blob_point_count_value = self.read_counter(&selected_blob_point_count);
@@ -667,9 +766,9 @@ impl Detector {
                 &corners,
                 &quad_params,
                 fitted_quad_count_value,
-                8,
-                4,
-                5.0,
+                Self::MARKER_SIZE_WITH_BORDERS as u32,
+                self.settings.decode.cell_size,
+                self.settings.decode.min_stddev_otsu,
             );
 
             let bits_count = fitted_quad_count_value as usize * 8usize * 8usize;
@@ -679,10 +778,10 @@ impl Detector {
                 &quad_params,
                 &bits,
                 fitted_quad_count_value,
-                8,
-                4,
-                0,
-                4,
+                Self::MARKER_SIZE_WITH_BORDERS as u32,
+                self.settings.decode.cell_size,
+                self.settings.decode.cell_margin_pixels,
+                self.settings.decode.cell_span,
             );
 
             let bits_words = self.download_u32_buffer(&bits, bits_count);
@@ -754,7 +853,7 @@ impl Detector {
             .collect::<Vec<_>>();
         let mut border_errors = Self::get_border_errors(&candidate_bits);
 
-        if Self::DETECT_INVERTED_MARKER {
+        if self.settings.decode.detect_inverted_marker {
             let mut inverted = candidate_bits
                 .iter()
                 .map(|&bit| if bit == 0 { 1 } else { 0 })
@@ -768,14 +867,14 @@ impl Detector {
         }
 
         let max_border_errors = (Self::APRILTAG_MARKER_SIZE * Self::APRILTAG_MARKER_SIZE) as f32
-            * Self::MAX_ERRONEOUS_BITS_IN_BORDER_RATE;
+            * self.settings.decode.max_erroneous_border_bits_rate;
         if border_errors > max_border_errors as usize {
             return None;
         }
 
         let payload_bits = Self::extract_payload_bits(&candidate_bits);
         let payload_code = Self::bits_to_code(&payload_bits);
-        let (id, rotation) = Self::identify_apriltag_36h11(payload_code)?;
+        let (id, rotation) = Self::identify_apriltag_36h11(payload_code, self.settings.apriltag)?;
         Some((id, rotation, candidate_bits, payload_bits))
     }
 
@@ -832,9 +931,12 @@ impl Detector {
             )
     }
 
-    fn identify_apriltag_36h11(payload_code: u64) -> Option<(u32, u8)> {
-        let max_corrected_bits = (Self::APRILTAG_MAX_CORRECTION_BITS as f32
-            * Self::APRILTAG_ERROR_CORRECTION_RATE)
+    fn identify_apriltag_36h11(
+        payload_code: u64,
+        apriltag_settings: AprilTagSettings,
+    ) -> Option<(u32, u8)> {
+        let max_corrected_bits = (apriltag_settings.max_correction_bits as f32
+            * apriltag_settings.error_correction_rate)
             .floor() as u32;
 
         if max_corrected_bits == 0 {
@@ -1786,9 +1888,9 @@ impl Detector {
             FitQuadsPushConstants {
                 peak_extent_count,
                 filtered_blob_extent_count,
-                max_nmaxima: 10,
-                max_line_fit_mse: 10.0,
-                cos_critical_rad: 0.984_807_73,
+                max_nmaxima: self.settings.quad_fit.max_nmaxima,
+                max_line_fit_mse: self.settings.quad_fit.max_line_fit_mse,
+                cos_critical_rad: self.settings.quad_fit.cos_critical_rad,
                 min_tag_width,
                 quad_decimate,
             },
@@ -1876,17 +1978,18 @@ impl Detector {
 
 #[cfg(test)]
 mod tests {
-    use super::Detector;
+    use super::{AprilTagSettings, Detector};
 
     #[test]
     fn identifies_apriltag_36h11_code_and_rotation() {
         let marker_id = 23usize;
         let code = super::APRILTAG_36H11_CODES[marker_id];
-        let decoded = Detector::identify_apriltag_36h11(code);
+        let decoded = Detector::identify_apriltag_36h11(code, AprilTagSettings::default());
         assert_eq!(decoded, Some((marker_id as u32, 0)));
 
         let rotated = Detector::rotate_code_ccw(code, Detector::APRILTAG_MARKER_SIZE);
-        let decoded_rotated = Detector::identify_apriltag_36h11(rotated);
+        let decoded_rotated =
+            Detector::identify_apriltag_36h11(rotated, AprilTagSettings::default());
         assert_eq!(decoded_rotated, Some((marker_id as u32, 1)));
     }
 
