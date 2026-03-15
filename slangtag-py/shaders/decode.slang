@@ -20,12 +20,12 @@ float read_corner(StructuredBuffer<uint32_t> corners, uint32_t quad_index, uint3
 
 bool solve_linear_8x8(inout float a[8][9], out float x[8])
 {
-    [loop]
+    
     for (uint32_t col = 0u; col < 8u; ++col)
     {
         uint32_t pivot = col;
         float best = abs(a[pivot][col]);
-        [loop]
+        
         for (uint32_t row = col + 1u; row < 8u; ++row)
         {
             float v = abs(a[row][col]);
@@ -41,7 +41,7 @@ bool solve_linear_8x8(inout float a[8][9], out float x[8])
 
         if (pivot != col)
         {
-            [loop]
+            
             for (uint32_t k = col; k < 9u; ++k)
             {
                 float tmp = a[col][k];
@@ -51,13 +51,13 @@ bool solve_linear_8x8(inout float a[8][9], out float x[8])
         }
 
         float inv = 1.0f / a[col][col];
-        [loop]
+        
         for (uint32_t k = col; k < 9u; ++k)
         {
             a[col][k] *= inv;
         }
 
-        [loop]
+        
         for (uint32_t row = 0u; row < 8u; ++row)
         {
             if (row == col)
@@ -65,7 +65,7 @@ bool solve_linear_8x8(inout float a[8][9], out float x[8])
             float factor = a[row][col];
             if (abs(factor) <= 1e-12f)
                 continue;
-            [loop]
+            
             for (uint32_t k = col; k < 9u; ++k)
             {
                 a[row][k] -= factor * a[col][k];
@@ -73,7 +73,7 @@ bool solve_linear_8x8(inout float a[8][9], out float x[8])
         }
     }
 
-    [unroll]
+    [ForceUnroll]
     for (uint32_t i = 0u; i < 8u; ++i)
     {
         x[i] = a[i][8];
@@ -113,10 +113,10 @@ bool build_dst_to_src_homography(StructuredBuffer<uint32_t> corners,
     float v3 = read_corner(corners, quad_index, 7u);
 
     float a[8][9];
-    [unroll]
+    [ForceUnroll]
     for (uint32_t i = 0u; i < 8u; ++i)
     {
-        [unroll]
+        [ForceUnroll]
         for (uint32_t j = 0u; j < 9u; ++j)
         {
             a[i][j] = 0.0f;
@@ -263,10 +263,10 @@ void prepare_decode_quads(
     float sum = 0.0f;
     float sum_sq = 0.0f;
 
-    [loop]
+    
     for (uint32_t y = inner_start; y < inner_end; ++y)
     {
-        [loop]
+        
         for (uint32_t x = inner_start; x < inner_end; ++x)
         {
             float v = float(sample_warped(image_gray, h00, h01, h02, h10, h11, h12, h20, h21, h22, x, y));
@@ -290,7 +290,7 @@ void prepare_decode_quads(
     }
 
     uint32_t hist[256];
-    [unroll]
+    [ForceUnroll]
     for (uint32_t i = 0u; i < 256u; ++i)
     {
         hist[i] = 0u;
@@ -298,10 +298,10 @@ void prepare_decode_quads(
 
     uint32_t total = result_size * result_size;
     float total_sum = 0.0f;
-    [loop]
+    
     for (uint32_t y = 0u; y < result_size; ++y)
     {
-        [loop]
+        
         for (uint32_t x = 0u; x < result_size; ++x)
         {
             uint32_t v = uint32_t(sample_warped(image_gray, h00, h01, h02, h10, h11, h12, h20, h21, h22, x, y));
@@ -314,7 +314,7 @@ void prepare_decode_quads(
     float sum_b = 0.0f;
     uint32_t w_b = 0u;
     float max_between = -1.0f;
-    [loop]
+    
     for (uint32_t t = 0u; t < 256u; ++t)
     {
         w_b += hist[t];
@@ -388,10 +388,10 @@ void extract_candidate_bits(
     uint32_t start_x = cell_x * cell_size + cell_margin_pixels;
     uint32_t start_y = cell_y * cell_size + cell_margin_pixels;
     uint32_t white_pixels = 0u;
-    [loop]
+    
     for (uint32_t yy = 0u; yy < cell_span; ++yy)
     {
-        [loop]
+        
         for (uint32_t xx = 0u; xx < cell_span; ++xx)
         {
             uint32_t v = uint32_t(sample_warped(

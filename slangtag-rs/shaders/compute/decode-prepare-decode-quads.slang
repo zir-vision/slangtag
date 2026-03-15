@@ -2,7 +2,7 @@ import "./image_buffer.slang";
 import "../decode.slang";
 
 StructuredBuffer<uint8_t> image_gray;
-StructuredBuffer<uint32_t> corners;
+StructuredBuffer<uint32_t> fitted_quads;
 RWStructuredBuffer<uint32_t> quad_params_out;
 
 struct PushConstants
@@ -25,7 +25,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
         dispatch_thread_id.x,
         image_gray,
         pc.image_size,
-        corners,
+        fitted_quads,
         quad_params_out,
         pc.quad_count,
         pc.marker_size_with_borders,

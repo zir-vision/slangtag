@@ -746,24 +746,13 @@ impl Detector {
         let mut detected_tags = Vec::new();
 
         if fitted_quad_count_value > 0 {
-            let fitted_quad_words = self.download_u32_buffer(
-                &fitted_quads,
-                fitted_quad_count_value as usize * fitted_quad_words_per_quad,
-            );
-            let mut corners_words = Vec::with_capacity(fitted_quad_count_value as usize * 8);
-            for i in 0..(fitted_quad_count_value as usize) {
-                let base = i * fitted_quad_words_per_quad;
-                corners_words.extend_from_slice(&fitted_quad_words[(base + 3)..(base + 11)]);
-            }
-            let corners = self.upload_u32_storage_buffer(&corners_words);
-
             let quad_param_words_per_quad = 12usize;
             let quad_params = self.new_u32_storage_buffer(
                 usize::max(1, fitted_quad_count_value as usize) * quad_param_words_per_quad,
             );
             self.prepare_decode_quads(
                 &input_gpu_image,
-                &corners,
+                &fitted_quads,
                 &quad_params,
                 fitted_quad_count_value,
                 Self::MARKER_SIZE_WITH_BORDERS as u32,
@@ -784,6 +773,10 @@ impl Detector {
                 self.settings.decode.cell_span,
             );
 
+            let fitted_quad_words = self.download_u32_buffer(
+                &fitted_quads,
+                fitted_quad_count_value as usize * fitted_quad_words_per_quad,
+            );
             let bits_words = self.download_u32_buffer(&bits, bits_count);
             detected_tags =
                 self.build_detected_tags(&fitted_quad_words, fitted_quad_count_value, &bits_words);
@@ -1064,16 +1057,6 @@ impl Detector {
 
     fn read_counter(&self, counter: &GpuBuffer<u32>) -> u32 {
         counter.read(1)[0]
-    }
-
-    fn upload_u32_storage_buffer(&self, data: &[u32]) -> GpuBuffer<u32> {
-        self.device.upload_buffer(
-            data,
-            ash::vk::BufferUsageFlags::STORAGE_BUFFER
-                | ash::vk::BufferUsageFlags::TRANSFER_SRC
-                | ash::vk::BufferUsageFlags::TRANSFER_DST,
-            false,
-        )
     }
 
     fn download_u32_buffer(&self, source: &GpuBuffer<u32>, len: usize) -> Vec<u32> {
@@ -1901,7 +1884,7 @@ impl Detector {
     fn prepare_decode_quads(
         &self,
         image_gray: &GPUImage<u8>,
-        corners: &GpuBuffer<u32>,
+        fitted_quads: &GpuBuffer<u32>,
         quad_params_out: &GpuBuffer<u32>,
         quad_count: u32,
         marker_size_with_borders: u32,
@@ -1913,7 +1896,7 @@ impl Detector {
             &compute_pipeline,
             vec![
                 WriteDescriptorSet::buffer(0, image_gray.image.clone()),
-                WriteDescriptorSet::buffer(1, corners.clone()),
+                WriteDescriptorSet::buffer(1, fitted_quads.clone()),
                 WriteDescriptorSet::buffer(2, quad_params_out.clone()),
             ],
         );
