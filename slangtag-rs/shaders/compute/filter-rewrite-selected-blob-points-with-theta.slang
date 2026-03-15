@@ -2,6 +2,7 @@ import "../filter.slang";
 
 StructuredBuffer<uint32_t> sorted_points;
 StructuredBuffer<uint32_t> extents_in;
+StructuredBuffer<uint32_t> point_extent_indices;
 StructuredBuffer<uint32_t> filtered_extents;
 RWStructuredBuffer<uint32_t> selected_points_out;
 struct PushConstants
@@ -21,6 +22,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
         dispatch_thread_id.x,
         sorted_points,
         extents_in,
+        point_extent_indices,
         filtered_extents,
         selected_points_out,
         pc.extent_count,

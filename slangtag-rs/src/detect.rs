@@ -140,7 +140,6 @@ struct DetectionPipelines {
     radix_keys_from_indices: Arc<ComputePipeline>,
     radix_gather_by_indices: Arc<ComputePipeline>,
     build_blob_pair_extents: Arc<ComputePipeline>,
-    filter_blob_pair_extents: Arc<ComputePipeline>,
     rewrite_selected_blob_points_with_theta: Arc<ComputePipeline>,
     build_line_fit_points: Arc<ComputePipeline>,
     fit_line_errors_and_peaks: Arc<ComputePipeline>,
@@ -210,10 +209,6 @@ impl DetectionPipelines {
             build_blob_pair_extents: Detector::create_compute_pipeline(
                 device,
                 include_u32!(compute_shader_path!("filter-build-blob-pair-extents")),
-            ),
-            filter_blob_pair_extents: Detector::create_compute_pipeline(
-                device,
-                include_u32!(compute_shader_path!("filter-filter-blob-pair-extents")),
             ),
             rewrite_selected_blob_points_with_theta: Detector::create_compute_pipeline(
                 device,
@@ -495,6 +490,17 @@ struct TotalPointsPushConstants {
 
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone)]
+struct BuildBlobPairExtentsPushConstants {
+    valid_points: u32,
+    tag_width: u32,
+    reversed_border: u32,
+    normal_border: u32,
+    min_cluster_pixels: u32,
+    max_cluster_pixels: u32,
+}
+
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone)]
 struct RadixExtractPushConstants {
     valid_points: u32,
     words_per_record: u32,
@@ -511,17 +517,6 @@ struct RadixGatherPushConstants {
 
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone)]
-struct FilterBlobPairExtentsPushConstants {
-    extent_count: u32,
-    tag_width: u32,
-    reversed_border: u32,
-    normal_border: u32,
-    min_cluster_pixels: u32,
-    max_cluster_pixels: u32,
-}
-
-#[repr(C)]
-#[derive(Pod, Zeroable, Copy, Clone)]
 struct RewriteSelectedBlobPointsPushConstants {
     extent_count: u32,
     valid_points: u32,
@@ -531,6 +526,7 @@ struct RewriteSelectedBlobPointsPushConstants {
 #[derive(Pod, Zeroable, Copy, Clone)]
 struct BuildLineFitPointsPushConstants {
     decimated_size: Size,
+    extent_count: u32,
     point_count: u32,
     decimate: u32,
 }
@@ -540,6 +536,7 @@ struct BuildLineFitPointsPushConstants {
 struct FitLineErrorsAndPeaksPushConstants {
     extent_count: u32,
     point_count: u32,
+    pass: u32,
 }
 
 #[repr(C)]
@@ -884,6 +881,8 @@ impl Detector {
             self.new_u32_storage_buffer(blob_extent_capacity * blob_extent_words_per_extent);
         let filtered_blob_extent =
             self.new_u32_storage_buffer(blob_extent_capacity * blob_extent_words_per_extent);
+        let point_extent_indices =
+            self.new_u32_storage_buffer(usize::max(1, blob_diff_filtered_size as usize));
         let blob_extent_count = self.new_zeroed_u32_counter_buffer();
         let selected_blob_extent_count = self.new_zeroed_u32_counter_buffer();
         let selected_blob_point_count = self.new_zeroed_u32_counter_buffer();
@@ -914,34 +913,24 @@ impl Detector {
                     (0, blob_diff_sorted.descriptor()),
                     (1, blob_extent.descriptor()),
                     (2, blob_extent_count.descriptor()),
+                    (3, filtered_blob_extent.descriptor()),
+                    (4, selected_blob_extent_count.descriptor()),
+                    (5, selected_blob_point_count.descriptor()),
+                    (6, point_extent_indices.descriptor()),
                 ],
-                TotalPointsPushConstants {
-                    total_points: blob_diff_filtered_size,
-                },
-                [1, 1, 1],
-            );
-            commands.barrier_shader_write_to_shader_read();
-
-            self.dispatch_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
-                "filter-filter-blob-pair-extents",
-                commands,
-                &self.pipelines.filter_blob_pair_extents,
-                &[
-                    (0, blob_extent.descriptor()),
-                    (1, filtered_blob_extent.descriptor()),
-                    (2, selected_blob_extent_count.descriptor()),
-                    (3, selected_blob_point_count.descriptor()),
-                ],
-                FilterBlobPairExtentsPushConstants {
-                    extent_count: blob_diff_filtered_size,
+                BuildBlobPairExtentsPushConstants {
+                    valid_points: blob_diff_filtered_size,
                     tag_width: blob_pair_filter.tag_width,
                     reversed_border: blob_pair_filter.reversed_border,
                     normal_border: blob_pair_filter.normal_border,
                     min_cluster_pixels: blob_pair_filter.min_cluster_pixels,
                     max_cluster_pixels,
                 },
-                [1, 1, 1],
+                [
+                    dispatch_groups_1d(blob_diff_filtered_size, Self::ONE_D_LOCAL_SIZE_X),
+                    1,
+                    1,
+                ],
             );
         });
 
@@ -956,6 +945,7 @@ impl Detector {
         self.rewrite_selected_blob_points_with_theta(
             &blob_diff_sorted,
             &blob_extent,
+            &point_extent_indices,
             &filtered_blob_extent,
             &selected_blob_points,
             blob_extent_count_value,
@@ -1008,14 +998,20 @@ impl Detector {
                 &[
                     (0, selected_blob_sorted_points.descriptor()),
                     (1, decimated_image.image.descriptor()),
-                    (2, line_fit_points.descriptor()),
+                    (2, filtered_blob_extent.descriptor()),
+                    (3, line_fit_points.descriptor()),
                 ],
                 BuildLineFitPointsPushConstants {
                     decimated_size: decimated_image.size,
+                    extent_count: blob_extent_count_value,
                     point_count: selected_blob_point_count_value,
                     decimate: decimate_factor,
                 },
-                [1, 1, 1],
+                [
+                    dispatch_groups_1d(blob_extent_count_value, Self::ONE_D_LOCAL_SIZE_X),
+                    1,
+                    1,
+                ],
             );
             commands.barrier_shader_write_to_shader_read();
 
@@ -1034,8 +1030,63 @@ impl Detector {
                 FitLineErrorsAndPeaksPushConstants {
                     extent_count: blob_extent_count_value,
                     point_count: selected_blob_point_count_value,
+                    pass: 0,
                 },
-                [1, 1, 1],
+                [
+                    dispatch_groups_1d(selected_blob_point_count_value, Self::ONE_D_LOCAL_SIZE_X),
+                    1,
+                    1,
+                ],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-fit-line-errors-and-peaks[filter]",
+                commands,
+                &self.pipelines.fit_line_errors_and_peaks,
+                &[
+                    (0, line_fit_points.descriptor()),
+                    (1, filtered_blob_extent.descriptor()),
+                    (2, errs.descriptor()),
+                    (3, filtered_errs.descriptor()),
+                    (4, peaks.descriptor()),
+                ],
+                FitLineErrorsAndPeaksPushConstants {
+                    extent_count: blob_extent_count_value,
+                    point_count: selected_blob_point_count_value,
+                    pass: 1,
+                },
+                [
+                    dispatch_groups_1d(selected_blob_point_count_value, Self::ONE_D_LOCAL_SIZE_X),
+                    1,
+                    1,
+                ],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-fit-line-errors-and-peaks[peaks]",
+                commands,
+                &self.pipelines.fit_line_errors_and_peaks,
+                &[
+                    (0, line_fit_points.descriptor()),
+                    (1, filtered_blob_extent.descriptor()),
+                    (2, errs.descriptor()),
+                    (3, filtered_errs.descriptor()),
+                    (4, peaks.descriptor()),
+                ],
+                FitLineErrorsAndPeaksPushConstants {
+                    extent_count: blob_extent_count_value,
+                    point_count: selected_blob_point_count_value,
+                    pass: 2,
+                },
+                [
+                    dispatch_groups_1d(selected_blob_point_count_value, Self::ONE_D_LOCAL_SIZE_X),
+                    1,
+                    1,
+                ],
             );
         });
 
@@ -1044,7 +1095,6 @@ impl Detector {
 
         self.device.run_commands(|commands| {
             commands.fill_buffer_u32_range(&peak_extents, 0, peak_extents.byte_size(), 0);
-            commands.fill_buffer_u32_range(&fitted_quads, 0, fitted_quads.byte_size(), 0);
             commands.barrier_transfer_write_to_compute_read();
 
             self.dispatch_with_push_constants_recorded_timed(
@@ -1060,9 +1110,23 @@ impl Detector {
                 TotalPointsPushConstants {
                     total_points: selected_blob_point_count_value,
                 },
-                [1, 1, 1],
+                [
+                    dispatch_groups_1d(selected_blob_point_count_value, Self::ONE_D_LOCAL_SIZE_X),
+                    1,
+                    1,
+                ],
             );
-            commands.barrier_shader_write_to_shader_read();
+        });
+
+        let peak_extent_count_value = self.read_counter(&peak_extent_count);
+        if peak_extent_count_value == 0 {
+            pipeline_timings.print_summary(&self.device);
+            return Ok(Vec::new());
+        }
+
+        self.device.run_commands(|commands| {
+            commands.fill_buffer_u32_range(&fitted_quads, 0, fitted_quads.byte_size(), 0);
+            commands.barrier_transfer_write_to_compute_read();
 
             self.dispatch_with_push_constants_recorded_timed(
                 &mut pipeline_timings,
@@ -1078,7 +1142,7 @@ impl Detector {
                     (5, fitted_quad_count.descriptor()),
                 ],
                 FitQuadsPushConstants {
-                    peak_extent_count: selected_blob_point_count_value,
+                    peak_extent_count: peak_extent_count_value,
                     filtered_blob_extent_count: blob_extent_count_value,
                     max_nmaxima: self.settings.quad_fit.max_nmaxima,
                     max_line_fit_mse: self.settings.quad_fit.max_line_fit_mse,
@@ -1087,13 +1151,20 @@ impl Detector {
                     quad_decimate: decimate_factor as f32,
                 },
                 [
-                    dispatch_groups_1d(selected_blob_point_count_value, Self::ONE_D_LOCAL_SIZE_X),
+                    dispatch_groups_1d(peak_extent_count_value, Self::ONE_D_LOCAL_SIZE_X),
                     1,
                     1,
                 ],
             );
-            commands.barrier_shader_write_to_shader_read();
+        });
 
+        let fitted_quad_count_value = self.read_counter(&fitted_quad_count);
+        if fitted_quad_count_value == 0 {
+            pipeline_timings.print_summary(&self.device);
+            return Ok(Vec::new());
+        }
+
+        self.device.run_commands(|commands| {
             self.dispatch_with_push_constants_recorded_timed(
                 &mut pipeline_timings,
                 "decode-prepare-decode-quads",
@@ -1106,13 +1177,13 @@ impl Detector {
                 ],
                 PrepareDecodeQuadsPushConstants {
                     image_size: input_gpu_image.size,
-                    quad_count: selected_blob_point_count_value,
+                    quad_count: fitted_quad_count_value,
                     marker_size_with_borders: Self::MARKER_SIZE_WITH_BORDERS as u32,
                     cell_size: self.settings.decode.cell_size,
                     min_stddev_otsu: self.settings.decode.min_stddev_otsu,
                 },
                 [
-                    dispatch_groups_1d(selected_blob_point_count_value, Self::ONE_D_LOCAL_SIZE_X),
+                    dispatch_groups_1d(fitted_quad_count_value, Self::ONE_D_LOCAL_SIZE_X),
                     1,
                     1,
                 ],
@@ -1131,7 +1202,7 @@ impl Detector {
                 ],
                 ExtractCandidateBitsPushConstants {
                     image_size: input_gpu_image.size,
-                    quad_count: selected_blob_point_count_value,
+                    quad_count: fitted_quad_count_value,
                     marker_size_with_borders: Self::MARKER_SIZE_WITH_BORDERS as u32,
                     cell_size: self.settings.decode.cell_size,
                     cell_margin_pixels: self.settings.decode.cell_margin_pixels,
@@ -1139,7 +1210,7 @@ impl Detector {
                 },
                 [
                     dispatch_groups_1d(
-                        selected_blob_point_count_value.saturating_mul(
+                        fitted_quad_count_value.saturating_mul(
                             (Self::MARKER_SIZE_WITH_BORDERS * Self::MARKER_SIZE_WITH_BORDERS)
                                 as u32,
                         ),
@@ -1150,12 +1221,6 @@ impl Detector {
                 ],
             );
         });
-
-        let fitted_quad_count_value = self.read_counter(&fitted_quad_count);
-        if fitted_quad_count_value == 0 {
-            pipeline_timings.print_summary(&self.device);
-            return Ok(Vec::new());
-        }
 
         let fitted_quad_words = self.download_u32_buffer(
             &fitted_quads,
@@ -1506,6 +1571,7 @@ impl Detector {
         &self,
         sorted_points: &GpuBuffer<u32>,
         extents_in: &GpuBuffer<u32>,
+        point_extent_indices: &GpuBuffer<u32>,
         filtered_extents: &GpuBuffer<u32>,
         selected_points_out: &GpuBuffer<u32>,
         extent_count: u32,
@@ -1521,8 +1587,9 @@ impl Detector {
             vec![
                 WriteDescriptorSet::buffer(0, sorted_points.clone()),
                 WriteDescriptorSet::buffer(1, extents_in.clone()),
-                WriteDescriptorSet::buffer(2, filtered_extents.clone()),
-                WriteDescriptorSet::buffer(3, selected_points_out.clone()),
+                WriteDescriptorSet::buffer(2, point_extent_indices.clone()),
+                WriteDescriptorSet::buffer(3, filtered_extents.clone()),
+                WriteDescriptorSet::buffer(4, selected_points_out.clone()),
             ],
         );
         self.dispatch_with_push_constants_timed(

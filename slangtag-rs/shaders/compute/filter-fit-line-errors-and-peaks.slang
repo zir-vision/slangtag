@@ -9,13 +9,14 @@ struct PushConstants
 {
     uint32_t extent_count;
     uint32_t point_count;
+    uint32_t pass;
 };
 
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc;
 
 [shader("compute")]
-[numthreads(1, 1, 1)]
+[numthreads(256, 1, 1)]
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     fit_line_errors_and_peaks(
@@ -26,5 +27,6 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
         filtered_errs_out,
         peaks_out,
         pc.extent_count,
-        pc.point_count);
+        pc.point_count,
+        pc.pass);
 }

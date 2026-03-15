@@ -69,7 +69,7 @@ uint32_t read_blob_diff_point_word(StructuredBuffer<uint32_t> points, uint32_t p
     return points[point_index * kBlobDiffWordsPerPoint + word_index];
 }
 
-uint32_t read_extent_word(StructuredBuffer<uint32_t> extents, uint32_t extent_index, uint32_t word_index)
+uint32_t read_extent_word<T : IArray<uint32_t>>(T extents, uint32_t extent_index, uint32_t word_index)
 {
     return extents[extent_index * kBlobExtentWordsPerExtent + word_index];
 }
@@ -163,81 +163,129 @@ void build_blob_pair_extents(uint tid,
                              StructuredBuffer<uint32_t> sorted_points,
                              RWStructuredBuffer<uint32_t> extents_out,
                              RWStructuredBuffer<uint32_t> extent_count_out,
-                             uint32_t valid_points)
+                             RWStructuredBuffer<uint32_t> filtered_extents_out,
+                             RWStructuredBuffer<uint32_t> selected_extent_count_out,
+                             RWStructuredBuffer<uint32_t> selected_point_count_out,
+                             RWStructuredBuffer<uint32_t> point_extent_indices_out,
+                             uint32_t valid_points,
+                             uint32_t tag_width,
+                             uint32_t reversed_border,
+                             uint32_t normal_border,
+                             uint32_t min_cluster_pixels,
+                             uint32_t max_cluster_pixels)
 {
-    if (tid != 0u)
+    if (tid >= valid_points)
         return;
 
-    uint32_t extent_count = 0u;
-    uint32_t i = 0u;
-
-    while (i < valid_points)
+    uint32_t rep0 = read_blob_diff_point_word(sorted_points, tid, kPointRep0Word);
+    uint32_t rep1 = read_blob_diff_point_word(sorted_points, tid, kPointRep1Word);
+    if (tid > 0u)
     {
-        uint32_t rep0 = read_blob_diff_point_word(sorted_points, i, kPointRep0Word);
-        uint32_t rep1 = read_blob_diff_point_word(sorted_points, i, kPointRep1Word);
-
-        uint32_t min_x = read_blob_diff_point_word(sorted_points, i, kPointXWord);
-        uint32_t max_x = min_x;
-        uint32_t min_y = read_blob_diff_point_word(sorted_points, i, kPointYWord);
-        uint32_t max_y = min_y;
-        uint32_t start = i;
-        uint32_t count = 0u;
-
-        int pxgx_plus_pygy_sum = 0;
-        int gx_sum = 0;
-        int gy_sum = 0;
-
-        while (i < valid_points)
-        {
-            uint32_t point_rep0 = read_blob_diff_point_word(sorted_points, i, kPointRep0Word);
-            uint32_t point_rep1 = read_blob_diff_point_word(sorted_points, i, kPointRep1Word);
-            if (point_rep0 != rep0 || point_rep1 != rep1)
-                break;
-
-            uint32_t x = read_blob_diff_point_word(sorted_points, i, kPointXWord);
-            uint32_t y = read_blob_diff_point_word(sorted_points, i, kPointYWord);
-            if (x < min_x)
-                min_x = x;
-            if (x > max_x)
-                max_x = x;
-            if (y < min_y)
-                min_y = y;
-            if (y > max_y)
-                max_y = y;
-
-            int gx;
-            int gy;
-            dxy_to_gradient(read_blob_diff_point_word(sorted_points, i, kPointDxyWord), gx, gy);
-
-            if (read_blob_diff_point_word(sorted_points, i, kPointBlackToWhiteWord) == 0u)
-            {
-                gx = -gx;
-                gy = -gy;
-            }
-
-            pxgx_plus_pygy_sum += int(x) * gx + int(y) * gy;
-            gx_sum += gx;
-            gy_sum += gy;
-            count += 1u;
-            i += 1u;
-        }
-
-        write_extent_word(extents_out, extent_count, kExtentRep0Word, rep0);
-        write_extent_word(extents_out, extent_count, kExtentRep1Word, rep1);
-        write_extent_word(extents_out, extent_count, kExtentMinXWord, min_x);
-        write_extent_word(extents_out, extent_count, kExtentMaxXWord, max_x);
-        write_extent_word(extents_out, extent_count, kExtentMinYWord, min_y);
-        write_extent_word(extents_out, extent_count, kExtentMaxYWord, max_y);
-        write_extent_word(extents_out, extent_count, kExtentStartingOffsetWord, start);
-        write_extent_word(extents_out, extent_count, kExtentCountWord, count);
-        write_extent_word(extents_out, extent_count, kExtentPxGxPyGySumWord, asuint(pxgx_plus_pygy_sum));
-        write_extent_word(extents_out, extent_count, kExtentGxSumWord, asuint(gx_sum));
-        write_extent_word(extents_out, extent_count, kExtentGySumWord, asuint(gy_sum));
-
-        extent_count += 1u;
+        uint32_t previous_rep0 = read_blob_diff_point_word(sorted_points, tid - 1u, kPointRep0Word);
+        uint32_t previous_rep1 = read_blob_diff_point_word(sorted_points, tid - 1u, kPointRep1Word);
+        if (previous_rep0 == rep0 && previous_rep1 == rep1)
+            return;
     }
 
-    extent_count_out[0] = extent_count;
+    uint32_t min_x = read_blob_diff_point_word(sorted_points, tid, kPointXWord);
+    uint32_t max_x = min_x;
+    uint32_t min_y = read_blob_diff_point_word(sorted_points, tid, kPointYWord);
+    uint32_t max_y = min_y;
+    uint32_t count = 0u;
+    int pxgx_plus_pygy_sum = 0;
+    int gx_sum = 0;
+    int gy_sum = 0;
+
+    uint32_t i = tid;
+    while (i < valid_points)
+    {
+        uint32_t point_rep0 = read_blob_diff_point_word(sorted_points, i, kPointRep0Word);
+        uint32_t point_rep1 = read_blob_diff_point_word(sorted_points, i, kPointRep1Word);
+        if (point_rep0 != rep0 || point_rep1 != rep1)
+            break;
+
+        uint32_t x = read_blob_diff_point_word(sorted_points, i, kPointXWord);
+        uint32_t y = read_blob_diff_point_word(sorted_points, i, kPointYWord);
+        if (x < min_x)
+            min_x = x;
+        if (x > max_x)
+            max_x = x;
+        if (y < min_y)
+            min_y = y;
+        if (y > max_y)
+            max_y = y;
+
+        int gx;
+        int gy;
+        dxy_to_gradient(read_blob_diff_point_word(sorted_points, i, kPointDxyWord), gx, gy);
+
+        if (read_blob_diff_point_word(sorted_points, i, kPointBlackToWhiteWord) == 0u)
+        {
+            gx = -gx;
+            gy = -gy;
+        }
+
+        pxgx_plus_pygy_sum += int(x) * gx + int(y) * gy;
+        gx_sum += gx;
+        gy_sum += gy;
+        count += 1u;
+        i += 1u;
+    }
+
+    uint32_t extent_index;
+    InterlockedAdd(extent_count_out[0], 1u, extent_index);
+
+    for (uint32_t point_index = tid; point_index < i; ++point_index)
+    {
+        point_extent_indices_out[point_index] = extent_index;
+    }
+
+    write_extent_word(extents_out, extent_index, kExtentMinXWord, min_x);
+    write_extent_word(extents_out, extent_index, kExtentMaxXWord, max_x);
+    write_extent_word(extents_out, extent_index, kExtentMinYWord, min_y);
+    write_extent_word(extents_out, extent_index, kExtentMaxYWord, max_y);
+    write_extent_word(extents_out, extent_index, kExtentStartingOffsetWord, tid);
+    write_extent_word(extents_out, extent_index, kExtentCountWord, count);
+
+    float extent_dot = blob_extent_dot_from_moments(
+        pxgx_plus_pygy_sum,
+        gx_sum,
+        gy_sum,
+        min_x,
+        max_x,
+        min_y,
+        max_y);
+
+    bool selected = select_blob_extent_from_values(
+        count,
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+        extent_dot,
+        tag_width,
+        reversed_border,
+        normal_border,
+        min_cluster_pixels,
+        max_cluster_pixels);
+
+    if (!selected)
+        return;
+
+    uint32_t selected_point_start;
+    InterlockedAdd(selected_point_count_out[0], count, selected_point_start);
+    write_extent_word(filtered_extents_out, extent_index, kExtentMinXWord, min_x);
+    write_extent_word(filtered_extents_out, extent_index, kExtentMaxXWord, max_x);
+    write_extent_word(filtered_extents_out, extent_index, kExtentMinYWord, min_y);
+    write_extent_word(filtered_extents_out, extent_index, kExtentMaxYWord, max_y);
+    write_extent_word(filtered_extents_out, extent_index, kExtentStartingOffsetWord, selected_point_start);
+    write_extent_word(filtered_extents_out, extent_index, kExtentCountWord, count);
+    write_extent_word(filtered_extents_out, extent_index, kExtentPxGxPyGySumWord, asuint(pxgx_plus_pygy_sum));
+    write_extent_word(filtered_extents_out, extent_index, kExtentGxSumWord, asuint(gx_sum));
+    write_extent_word(filtered_extents_out, extent_index, kExtentGySumWord, asuint(gy_sum));
+
+    uint32_t selected_extent_index;
+    InterlockedAdd(selected_extent_count_out[0], 1u, selected_extent_index);
 }
 
 float blob_extent_cx(StructuredBuffer<uint32_t> extents, uint32_t extent_index)
@@ -254,7 +302,7 @@ float blob_extent_cy(StructuredBuffer<uint32_t> extents, uint32_t extent_index)
     return 0.5f * (float(min_y) + float(max_y)) - 0.028581f;
 }
 
-float blob_extent_dot(StructuredBuffer<uint32_t> extents, uint32_t extent_index)
+float blob_extent_dot<T : IArray<uint32_t>>(T extents, uint32_t extent_index)
 {
     int pxgx_plus_pygy_sum = asint(read_extent_word(extents, extent_index, kExtentPxGxPyGySumWord));
     int gx_sum = asint(read_extent_word(extents, extent_index, kExtentGxSumWord));
@@ -269,7 +317,53 @@ float blob_extent_dot(StructuredBuffer<uint32_t> extents, uint32_t extent_index)
         + 0.028581f * float(gy_sum);
 }
 
-bool select_blob_extent(StructuredBuffer<uint32_t> extents,
+float blob_extent_dot_from_moments(
+    int pxgx_plus_pygy_sum,
+    int gx_sum,
+    int gy_sum,
+    uint32_t min_x,
+    uint32_t max_x,
+    uint32_t min_y,
+    uint32_t max_y)
+{
+    return float(pxgx_plus_pygy_sum * 2 - (int(min_x) + int(max_x)) * gx_sum - (int(min_y) + int(max_y)) * gy_sum)
+        * 0.5f
+        - 0.05118f * float(gx_sum)
+        + 0.028581f * float(gy_sum);
+}
+
+bool select_blob_extent_from_values(
+    uint32_t count,
+    uint32_t min_x,
+    uint32_t max_x,
+    uint32_t min_y,
+    uint32_t max_y,
+    float extent_dot,
+    uint32_t tag_width,
+    uint32_t reversed_border,
+    uint32_t normal_border,
+    uint32_t min_cluster_pixels,
+    uint32_t max_cluster_pixels)
+{
+    uint32_t effective_min_cluster_pixels = max(24u, min_cluster_pixels);
+    if (count < effective_min_cluster_pixels)
+        return false;
+    if (count > max_cluster_pixels)
+        return false;
+
+    if ((max_x - min_x) * (max_y - min_y) < tag_width)
+        return false;
+
+    bool quad_reversed_border = extent_dot < 0.0f;
+    if (reversed_border == 0u && quad_reversed_border)
+        return false;
+    if (normal_border == 0u && !quad_reversed_border)
+        return false;
+
+    return true;
+}
+
+bool select_blob_extent<T : IArray<uint32_t>>(T extents,
                         uint32_t extent_index,
                         uint32_t tag_width,
                         uint32_t reversed_border,
@@ -402,6 +496,7 @@ void rewrite_selected_blob_points_with_theta(
     uint tid,
     StructuredBuffer<uint32_t> sorted_points,
     StructuredBuffer<uint32_t> extents_in,
+    StructuredBuffer<uint32_t> point_extent_indices,
     StructuredBuffer<uint32_t> filtered_extents,
     RWStructuredBuffer<uint32_t> selected_points_out,
     uint32_t extent_count,
@@ -410,8 +505,8 @@ void rewrite_selected_blob_points_with_theta(
     if (tid >= valid_points)
         return;
 
-    uint32_t extent_index = find_extent_index_for_point(extents_in, extent_count, tid);
-    if (extent_index == 0xFFFFFFFFu)
+    uint32_t extent_index = point_extent_indices[tid];
+    if (extent_index >= extent_count)
         return;
 
     uint32_t selected_count = read_extent_word(filtered_extents, extent_index, kExtentCountWord);
@@ -613,14 +708,21 @@ void build_line_fit_points_buffer(
     StructuredBuffer<uint32_t> sorted_selected_points,
     StructuredBuffer<uint8_t> decimated_image,
     ImageSize decimated_size,
+    StructuredBuffer<uint32_t> filtered_extents,
     RWStructuredBuffer<uint32_t> line_fit_points_out,
+    uint32_t extent_count,
     uint32_t point_count,
     uint32_t decimate)
 {
-    if (tid != 0u)
+    if (tid >= extent_count)
         return;
 
-    uint32_t previous_blob_index = 0xFFFFFFFFu;
+    uint32_t blob_index = tid;
+    uint32_t start = read_extent_word(filtered_extents, blob_index, kExtentStartingOffsetWord);
+    uint32_t count = read_extent_word(filtered_extents, blob_index, kExtentCountWord);
+    if (count == 0u)
+        return;
+
     int running_Mx = 0;
     int running_My = 0;
     int running_W = 0;
@@ -628,8 +730,12 @@ void build_line_fit_points_buffer(
     int64_t running_Myy = 0;
     int64_t running_Mxy = 0;
 
-    for (uint32_t i = 0u; i < point_count; ++i)
+    for (uint32_t local_index = 0u; local_index < count; ++local_index)
     {
+        uint32_t i = start + local_index;
+        if (i >= point_count)
+            return;
+
         uint32_t blob_index = read_selected_blob_point_word(sorted_selected_points, i, kSelectedPointBlobIndexWord);
         uint32_t x = read_selected_blob_point_word(sorted_selected_points, i, kSelectedPointXWord);
         uint32_t y = read_selected_blob_point_word(sorted_selected_points, i, kSelectedPointYWord);
@@ -656,17 +762,6 @@ void build_line_fit_points_buffer(
         int64_t point_Mxx = int64_t(W) * int64_t(ix2) * int64_t(ix2);
         int64_t point_Mxy = int64_t(W) * int64_t(ix2) * int64_t(iy2);
         int64_t point_Myy = int64_t(W) * int64_t(iy2) * int64_t(iy2);
-
-        if (blob_index != previous_blob_index)
-        {
-            running_Mx = 0;
-            running_My = 0;
-            running_W = 0;
-            running_Mxx = 0;
-            running_Myy = 0;
-            running_Mxy = 0;
-            previous_blob_index = blob_index;
-        }
 
         running_Mx += point_Mx;
         running_My += point_My;
@@ -696,22 +791,20 @@ void fit_line_errors_and_peaks(
     RWStructuredBuffer<uint32_t> filtered_errs_out,
     RWStructuredBuffer<uint32_t> peaks_out,
     uint32_t extent_count,
-    uint32_t point_count)
+    uint32_t point_count,
+    uint32_t pass)
 {
-    if (tid != 0u)
+    if (tid >= point_count)
         return;
 
-    for (uint32_t i = 0u; i < point_count; ++i)
+    if (pass == 0u)
     {
-        errs_out[i] = asuint(0.0f);
-        filtered_errs_out[i] = asuint(0.0f);
-        write_peak_word(peaks_out, i, kPeakBlobIndexWord, 0xFFFFu);
-        write_peak_word(peaks_out, i, kPeakErrorWord, asuint(0.0f));
-        write_peak_word(peaks_out, i, kPeakPointIndexWord, i);
-    }
+        errs_out[tid] = asuint(0.0f);
+        filtered_errs_out[tid] = asuint(0.0f);
+        write_peak_word(peaks_out, tid, kPeakBlobIndexWord, 0xFFFFu);
+        write_peak_word(peaks_out, tid, kPeakErrorWord, asuint(0.0f));
+        write_peak_word(peaks_out, tid, kPeakPointIndexWord, tid);
 
-    for (uint32_t i = 0u; i < point_count; ++i)
-    {
         int Mx_dummy;
         int My_dummy;
         int W_dummy;
@@ -719,17 +812,17 @@ void fit_line_errors_and_peaks(
         int64_t Mxx_dummy;
         int64_t Myy_dummy;
         int64_t Mxy_dummy;
-        read_line_fit_point(line_fit_points, i, Mx_dummy, My_dummy, W_dummy, blob_index, Mxx_dummy, Myy_dummy, Mxy_dummy);
+        read_line_fit_point(line_fit_points, tid, Mx_dummy, My_dummy, W_dummy, blob_index, Mxx_dummy, Myy_dummy, Mxy_dummy);
 
         if (blob_index >= extent_count)
-            continue;
+            return;
 
         uint32_t start = read_extent_word(filtered_extents, blob_index, kExtentStartingOffsetWord);
         uint32_t count = read_extent_word(filtered_extents, blob_index, kExtentCountWord);
-        if (count == 0u || i < start || i >= start + count)
-            continue;
+        if (count == 0u || tid < start || tid >= start + count)
+            return;
 
-        uint32_t local_index = i - start;
+        uint32_t local_index = tid - start;
         uint32_t ksz = min(20u, count / 12u);
         uint32_t i0 = (local_index + 2u * count - ksz) % count;
         uint32_t i1 = (local_index + count + ksz) % count;
@@ -819,10 +912,11 @@ void fit_line_errors_and_peaks(
         }
 
         float err = fit_line_error(N, Mx, My, Mxx, Myy, Mxy, W);
-        errs_out[i] = asuint(err);
+        errs_out[tid] = asuint(err);
+        return;
     }
 
-    for (uint32_t i = 0u; i < point_count; ++i)
+    if (pass == 1u)
     {
         int Mx_dummy;
         int My_dummy;
@@ -831,17 +925,17 @@ void fit_line_errors_and_peaks(
         int64_t Mxx_dummy;
         int64_t Myy_dummy;
         int64_t Mxy_dummy;
-        read_line_fit_point(line_fit_points, i, Mx_dummy, My_dummy, W_dummy, blob_index, Mxx_dummy, Myy_dummy, Mxy_dummy);
+        read_line_fit_point(line_fit_points, tid, Mx_dummy, My_dummy, W_dummy, blob_index, Mxx_dummy, Myy_dummy, Mxy_dummy);
 
         if (blob_index >= extent_count)
-            continue;
+            return;
 
         uint32_t start = read_extent_word(filtered_extents, blob_index, kExtentStartingOffsetWord);
         uint32_t count = read_extent_word(filtered_extents, blob_index, kExtentCountWord);
-        if (count == 0u || i < start || i >= start + count)
-            continue;
+        if (count == 0u || tid < start || tid >= start + count)
+            return;
 
-        int local_index = int(i - start);
+        int local_index = int(tid - start);
         float filtered_err = 0.0f;
         for (int j = 0; j < 7; ++j)
         {
@@ -850,10 +944,11 @@ void fit_line_errors_and_peaks(
             filtered_err += asfloat(errs_out[neighbor_index]) * line_fit_filter_coefficient(j);
         }
 
-        filtered_errs_out[i] = asuint(filtered_err);
+        filtered_errs_out[tid] = asuint(filtered_err);
+        return;
     }
 
-    for (uint32_t i = 0u; i < point_count; ++i)
+    if (pass == 2u)
     {
         int Mx_dummy;
         int My_dummy;
@@ -862,28 +957,28 @@ void fit_line_errors_and_peaks(
         int64_t Mxx_dummy;
         int64_t Myy_dummy;
         int64_t Mxy_dummy;
-        read_line_fit_point(line_fit_points, i, Mx_dummy, My_dummy, W_dummy, blob_index, Mxx_dummy, Myy_dummy, Mxy_dummy);
+        read_line_fit_point(line_fit_points, tid, Mx_dummy, My_dummy, W_dummy, blob_index, Mxx_dummy, Myy_dummy, Mxy_dummy);
 
         if (blob_index >= extent_count)
-            continue;
+            return;
 
         uint32_t start = read_extent_word(filtered_extents, blob_index, kExtentStartingOffsetWord);
         uint32_t count = read_extent_word(filtered_extents, blob_index, kExtentCountWord);
-        if (count == 0u || i < start || i >= start + count)
-            continue;
+        if (count == 0u || tid < start || tid >= start + count)
+            return;
 
-        uint32_t local_index = i - start;
+        uint32_t local_index = tid - start;
         uint32_t before_index = start + ((local_index + count - 1u) % count);
         uint32_t after_index = start + ((local_index + 1u) % count);
 
         float before_error = asfloat(filtered_errs_out[before_index]);
-        float my_error = asfloat(filtered_errs_out[i]);
+        float my_error = asfloat(filtered_errs_out[tid]);
         float after_error = asfloat(filtered_errs_out[after_index]);
         bool is_peak = my_error > before_error && my_error > after_error;
 
-        write_peak_word(peaks_out, i, kPeakBlobIndexWord, is_peak ? blob_index : 0xFFFFu);
-        write_peak_word(peaks_out, i, kPeakErrorWord, asuint(-my_error));
-        write_peak_word(peaks_out, i, kPeakPointIndexWord, i);
+        write_peak_word(peaks_out, tid, kPeakBlobIndexWord, is_peak ? blob_index : 0xFFFFu);
+        write_peak_word(peaks_out, tid, kPeakErrorWord, asuint(-my_error));
+        write_peak_word(peaks_out, tid, kPeakPointIndexWord, tid);
     }
 }
 
@@ -894,38 +989,33 @@ void build_peak_extents(
     RWStructuredBuffer<uint32_t> peak_extent_count_out,
     uint32_t valid_peaks)
 {
-    if (tid != 0u)
+    if (tid >= valid_peaks)
         return;
 
-    if (valid_peaks == 0u)
-    {
-        peak_extent_count_out[0] = 0u;
+    uint32_t blob_index = read_peak_word(sorted_peaks, tid, kPeakBlobIndexWord);
+    if (blob_index == 0xFFFFu)
         return;
-    }
 
-    uint32_t peak_extent_count = 0u;
-    uint32_t i = 0u;
-    while (i < valid_peaks)
+    if (tid > 0u)
     {
-        uint32_t blob_index = read_peak_word(sorted_peaks, i, kPeakBlobIndexWord);
-        uint32_t start = i;
-        uint32_t count = 1u;
-
-        while (i + count < valid_peaks &&
-               read_peak_word(sorted_peaks, i + count, kPeakBlobIndexWord) == blob_index)
-        {
-            count += 1u;
-        }
-
-        write_peak_extent_word(peak_extents_out, peak_extent_count, kPeakExtentBlobIndexWord, blob_index);
-        write_peak_extent_word(peak_extents_out, peak_extent_count, kPeakExtentStartingOffsetWord, start);
-        write_peak_extent_word(peak_extents_out, peak_extent_count, kPeakExtentCountWord, count);
-
-        peak_extent_count += 1u;
-        i += count;
+        uint32_t previous_blob_index = read_peak_word(sorted_peaks, tid - 1u, kPeakBlobIndexWord);
+        if (previous_blob_index == blob_index)
+            return;
     }
 
-    peak_extent_count_out[0] = peak_extent_count;
+    uint32_t start = tid;
+    uint32_t count = 1u;
+    while (start + count < valid_peaks &&
+           read_peak_word(sorted_peaks, start + count, kPeakBlobIndexWord) == blob_index)
+    {
+        count += 1u;
+    }
+
+    uint32_t peak_extent_index;
+    InterlockedAdd(peak_extent_count_out[0], 1u, peak_extent_index);
+    write_peak_extent_word(peak_extents_out, peak_extent_index, kPeakExtentBlobIndexWord, blob_index);
+    write_peak_extent_word(peak_extents_out, peak_extent_index, kPeakExtentStartingOffsetWord, start);
+    write_peak_extent_word(peak_extents_out, peak_extent_index, kPeakExtentCountWord, count);
 }
 
 struct QuadLineFitMoments
