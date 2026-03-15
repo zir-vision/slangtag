@@ -10,8 +10,6 @@ groupshared uint localHistogram[RADIX];
 [shader("compute")]
 [numthreads(WORKGROUP_SIZE)]
 void main(uint3 groupThreadID: SV_GroupThreadID, uint3 groupId: SV_GroupID, uniform int pass) {
-  printf("upsweep groupThreadID: (%u, %u, %u), groupId: (%u, %u, %u), pass: %d\n", groupThreadID.x,
-         groupThreadID.y, groupThreadID.z, groupId.x, groupId.y, groupId.z, pass);
   uint elementCount = elementCounts[0];
 
   uint index = groupThreadID.x;

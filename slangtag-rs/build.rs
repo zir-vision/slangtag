@@ -57,7 +57,6 @@ fn main() {
 
         let status = Command::new(&slangc)
             .arg(&source)
-            .arg("-g3")
             .arg("-entry")
             .arg("main")
             .arg("-stage")

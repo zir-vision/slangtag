@@ -37,9 +37,6 @@ uint GetBitCount(uint4 value) {
 [numthreads(WORKGROUP_SIZE)]
 void main(uint3 groupThreadID: SV_GroupThreadID, uint3 groupId: SV_GroupID,
           uint groupIndex: SV_GroupIndex, uniform int pass) {
-  printf("downsweep groupThreadID: (%u, %u, %u), groupId: (%u, %u, %u), groupIndex: %u\n",
-         groupThreadID.x, groupThreadID.y, groupThreadID.z, groupId.x, groupId.y, groupId.z,
-         groupIndex);
   uint elementCount = elementCounts[0];
 
   uint laneIndex = WaveGetLaneIndex();          // 0..31 or 0..63
