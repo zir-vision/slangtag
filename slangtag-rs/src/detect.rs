@@ -1,23 +1,31 @@
-use crate::{ComputeDevice, GPUImage, Size, compute_shader_path};
+use crate::gpu::{BufferMemory, ComputePipeline, DescriptorBuffer, GpuBuffer};
+use crate::{ComputeDevice, GPUImage, Size, compute_shader_path, include_u32};
 use bytemuck::{Pod, Zeroable};
 use image::{DynamicImage, GrayImage, ImageBuffer};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
-use vulkano::buffer::BufferContents;
-use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::sync::{self, GpuFuture};
-use vulkano::{
-    buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
-    pipeline::{
-        ComputePipeline, Pipeline, PipelineLayout, PipelineShaderStageCreateInfo,
-        compute::ComputePipelineCreateInfo, layout::PipelineDescriptorSetLayoutCreateInfo,
-    },
-    shader::{ShaderModuleCreateInfo, spirv::bytes_to_words},
-};
 
 include!("apriltag36h11_codes.rs");
+
+#[derive(Clone)]
+struct WriteDescriptorSet {
+    binding: u32,
+    buffer: DescriptorBuffer,
+}
+
+impl WriteDescriptorSet {
+    fn buffer<T: Pod + Copy>(binding: u32, buffer: GpuBuffer<T>) -> Self {
+        Self {
+            binding,
+            buffer: buffer.descriptor(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DescriptorSet {
+    writes: Vec<WriteDescriptorSet>,
+}
 
 #[derive(Copy, Clone)]
 struct RotatedTagCode {
@@ -112,123 +120,123 @@ impl DetectionPipelines {
         Self {
             decimate: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("threshold-decimate")),
+                include_u32!(compute_shader_path!("threshold-decimate")),
             ),
             minmax: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("threshold-minmax")),
+                include_u32!(compute_shader_path!("threshold-minmax")),
             ),
             filter_minmax: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("threshold-filter-minmax")),
+                include_u32!(compute_shader_path!("threshold-filter-minmax")),
             ),
             threshold: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("threshold-threshold")),
+                include_u32!(compute_shader_path!("threshold-threshold")),
             ),
             ccl_init: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("ccl-init")),
+                include_u32!(compute_shader_path!("ccl-init")),
             ),
             ccl_compression: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("ccl-compression")),
+                include_u32!(compute_shader_path!("ccl-compression")),
             ),
             ccl_merge: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("ccl-merge")),
+                include_u32!(compute_shader_path!("ccl-merge")),
             ),
             ccl_final_labeling: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("ccl-final-labeling")),
+                include_u32!(compute_shader_path!("ccl-final-labeling")),
             ),
             blob_diff: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("blob-blob-diff")),
+                include_u32!(compute_shader_path!("blob-blob-diff")),
             ),
             count_nonzero_blob_diff_points: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!(
+                include_u32!(compute_shader_path!(
                     "select-count-nonzero-blob-diff-points"
                 )),
             ),
             filter_nonzero_blob_diff_points: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!(
+                include_u32!(compute_shader_path!(
                     "select-filter-nonzero-blob-diff-points"
                 )),
             ),
             prepare_blob_diff_points: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("sort-prepare-blob-diff-points")),
+                include_u32!(compute_shader_path!("sort-prepare-blob-diff-points")),
             ),
             bitonic_sort_blob_diff_points: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("sort-bitonic-sort-blob-diff-points")),
+                include_u32!(compute_shader_path!("sort-bitonic-sort-blob-diff-points")),
             ),
             build_blob_pair_extents: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("filter-build-blob-pair-extents")),
+                include_u32!(compute_shader_path!("filter-build-blob-pair-extents")),
             ),
             filter_blob_pair_extents: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("filter-filter-blob-pair-extents")),
+                include_u32!(compute_shader_path!("filter-filter-blob-pair-extents")),
             ),
             rewrite_selected_blob_points_with_theta: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!(
+                include_u32!(compute_shader_path!(
                     "filter-rewrite-selected-blob-points-with-theta"
                 )),
             ),
             prepare_selected_blob_points: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("sort-prepare-selected-blob-points")),
+                include_u32!(compute_shader_path!("sort-prepare-selected-blob-points")),
             ),
             bitonic_sort_selected_blob_points: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!(
+                include_u32!(compute_shader_path!(
                     "sort-bitonic-sort-selected-blob-points"
                 )),
             ),
             build_line_fit_points: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("filter-build-line-fit-points")),
+                include_u32!(compute_shader_path!("filter-build-line-fit-points")),
             ),
             fit_line_errors_and_peaks: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("filter-fit-line-errors-and-peaks")),
+                include_u32!(compute_shader_path!("filter-fit-line-errors-and-peaks")),
             ),
             count_valid_peaks: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("select-count-valid-peaks")),
+                include_u32!(compute_shader_path!("select-count-valid-peaks")),
             ),
             filter_valid_peaks: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("select-filter-valid-peaks")),
+                include_u32!(compute_shader_path!("select-filter-valid-peaks")),
             ),
             prepare_peaks: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("sort-prepare-peaks")),
+                include_u32!(compute_shader_path!("sort-prepare-peaks")),
             ),
             bitonic_sort_peaks: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("sort-bitonic-sort-peaks")),
+                include_u32!(compute_shader_path!("sort-bitonic-sort-peaks")),
             ),
             build_peak_extents: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("filter-build-peak-extents")),
+                include_u32!(compute_shader_path!("filter-build-peak-extents")),
             ),
             fit_quads: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("filter-fit-quads")),
+                include_u32!(compute_shader_path!("filter-fit-quads")),
             ),
             prepare_decode_quads: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("decode-prepare-decode-quads")),
+                include_u32!(compute_shader_path!("decode-prepare-decode-quads")),
             ),
             extract_candidate_bits: Detector::create_compute_pipeline(
                 device,
-                include_bytes!(compute_shader_path!("decode-extract-candidate-bits")),
+                include_u32!(compute_shader_path!("decode-extract-candidate-bits")),
             ),
         }
     }
@@ -558,7 +566,7 @@ impl Detector {
             24,
             4 * (thresholded_image.size.width + thresholded_image.size.height),
         );
-        let selected_blob_extent_count_value = self.read_counter(&selected_blob_extent_count);
+        let _selected_blob_extent_count_value = self.read_counter(&selected_blob_extent_count);
         let selected_blob_point_count_value = self.read_counter(&selected_blob_point_count);
 
         let selected_blob_point_words_per_point = 4usize;
@@ -923,246 +931,104 @@ impl Detector {
 
     fn create_compute_pipeline(
         device: &ComputeDevice,
-        module_bytes: &[u8],
+        module_bytes: &[u32],
     ) -> Arc<ComputePipeline> {
-        let shader = unsafe {
-            vulkano::shader::ShaderModule::new(
-                device.device.clone(),
-                ShaderModuleCreateInfo::new(&bytes_to_words(module_bytes).unwrap()),
-            )
-            .expect("failed to create shader module")
-        };
-
-        let entry_point = shader
-            .entry_point("main")
-            .expect("failed to find entry point in shader");
-
-        let stage = PipelineShaderStageCreateInfo::new(entry_point);
-        let layout = PipelineLayout::new(
-            device.device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-                .into_pipeline_layout_create_info(device.device.clone())
-                .unwrap(),
-        )
-        .expect("failed to create pipeline layout");
-
-        ComputePipeline::new(
-            device.device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(stage, layout),
-        )
-        .expect("failed to create compute pipeline")
+        Arc::new(device.create_compute_pipeline(module_bytes, None))
     }
 
     fn create_descriptor_set(
         &self,
-        compute_pipeline: &Arc<ComputePipeline>,
+        _compute_pipeline: &Arc<ComputePipeline>,
         writes: Vec<WriteDescriptorSet>,
     ) -> Arc<DescriptorSet> {
-        let pipeline_layout = compute_pipeline.layout();
-        let descriptor_set_layout = pipeline_layout
-            .set_layouts()
-            .first()
-            .expect("missing descriptor set layout");
-
-        DescriptorSet::new(
-            self.device.descriptor_set_allocator.clone(),
-            descriptor_set_layout.clone(),
-            writes,
-            [],
-        )
-        .expect("failed to create descriptor set")
+        Arc::new(DescriptorSet { writes })
     }
 
-    fn dispatch_with_push_constants<T: Pod + Copy + BufferContents>(
+    fn dispatch_with_push_constants<T: Pod + Copy>(
         &self,
         compute_pipeline: Arc<ComputePipeline>,
         descriptor_set: Arc<DescriptorSet>,
         push_constants: T,
         dispatch: [u32; 3],
     ) {
-        let mut builder = AutoCommandBufferBuilder::primary(
-            self.device.command_buffer_allocator.clone(),
-            self.device.queue_family_index,
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .expect("failed to create command buffer builder");
-
-        unsafe {
-            builder
-                .bind_pipeline_compute(compute_pipeline.clone())
-                .expect("failed to bind compute pipeline")
-                .bind_descriptor_sets(
-                    vulkano::pipeline::PipelineBindPoint::Compute,
-                    compute_pipeline.layout().clone(),
-                    0,
-                    descriptor_set,
-                )
-                .expect("failed to bind descriptor set")
-                .push_constants(compute_pipeline.layout().clone(), 0, push_constants)
-                .expect("failed to push constants")
-                .dispatch(dispatch)
-                .expect("failed to dispatch compute shader");
-        }
-
-        let command_buffer = builder.build().expect("failed to build command buffer");
-        let future = sync::now(self.device.device.clone())
-            .then_execute(self.device.queue.clone(), command_buffer)
-            .expect("failed to execute command buffer")
-            .then_signal_fence_and_flush()
-            .expect("failed to flush command buffer");
-        future.wait(None).expect("failed to wait for compute work");
+        let bindings: Vec<(u32, DescriptorBuffer)> = descriptor_set
+            .writes
+            .iter()
+            .map(|write| (write.binding, write.buffer))
+            .collect();
+        self.device.dispatch_with_push_constants(
+            compute_pipeline.as_ref(),
+            &bindings,
+            &push_constants,
+            dispatch,
+        );
     }
 
-    fn new_u8_storage_buffer(&self, len: usize) -> Subbuffer<[u8]> {
-        Buffer::new_unsized(
-            self.device.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-                ..Default::default()
-            },
-            len.try_into().expect("buffer length exceeds GPU limits"),
+    fn new_u8_storage_buffer(&self, len: usize) -> GpuBuffer<u8> {
+        self.device.create_buffer(
+            len,
+            ash::vk::BufferUsageFlags::STORAGE_BUFFER
+                | ash::vk::BufferUsageFlags::TRANSFER_SRC
+                | ash::vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemory::DeviceLocal,
         )
-        .expect("failed to create u8 storage buffer")
     }
 
-    fn new_u32_storage_buffer(&self, len: usize) -> Subbuffer<[u32]> {
-        Buffer::new_unsized(
-            self.device.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-                ..Default::default()
-            },
-            len.try_into().expect("buffer length exceeds GPU limits"),
+    fn new_u32_storage_buffer(&self, len: usize) -> GpuBuffer<u32> {
+        self.device.create_buffer(
+            len,
+            ash::vk::BufferUsageFlags::STORAGE_BUFFER
+                | ash::vk::BufferUsageFlags::TRANSFER_SRC
+                | ash::vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemory::DeviceLocal,
         )
-        .expect("failed to create u32 storage buffer")
     }
 
-    fn new_zeroed_u32_storage_buffer(&self, len: usize) -> Subbuffer<[u32]> {
-        let buf = Buffer::new_unsized(
-            self.device.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER
-                    | BufferUsage::TRANSFER_SRC
-                    | BufferUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            len as u64,
-        )
-        .expect("failed to create zeroed u32 storage buffer");
-
-        // Fill buffer using vkCmdFillBuffer
-        let mut builder = AutoCommandBufferBuilder::primary(
-            self.device.command_buffer_allocator.clone(),
-            self.device.queue_family_index,
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .expect("failed to create command buffer builder");
-        builder
-            .fill_buffer(buf.clone(), 0)
-            .expect("failed to record fill buffer command");
-        let command_buffer = builder.build().expect("failed to build command buffer");
-        let future = sync::now(self.device.device.clone())
-            .then_execute(self.device.queue.clone(), command_buffer)
-            .expect("failed to execute command buffer")
-            .then_signal_fence_and_flush()
-            .expect("failed to flush command buffer");
-        future.wait(None).expect("failed to wait for buffer fill");
+    fn new_zeroed_u32_storage_buffer(&self, len: usize) -> GpuBuffer<u32> {
+        let buf = self.device.create_buffer(
+            len,
+            ash::vk::BufferUsageFlags::STORAGE_BUFFER
+                | ash::vk::BufferUsageFlags::TRANSFER_SRC
+                | ash::vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemory::HostSequentialWrite,
+        );
+        self.device.fill_buffer_u32(&buf, 0);
         buf
     }
 
-    fn new_zeroed_u32_counter_buffer(&self) -> Subbuffer<[u32]> {
-        Buffer::from_iter(
-            self.device.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER
-                    | BufferUsage::TRANSFER_SRC
-                    | BufferUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_RANDOM_ACCESS,
-                ..Default::default()
-            },
-            std::iter::once(0u32),
+    fn new_zeroed_u32_counter_buffer(&self) -> GpuBuffer<u32> {
+        self.device.upload_buffer(
+            &[0u32],
+            ash::vk::BufferUsageFlags::STORAGE_BUFFER
+                | ash::vk::BufferUsageFlags::TRANSFER_SRC
+                | ash::vk::BufferUsageFlags::TRANSFER_DST,
+            false,
         )
-        .expect("failed to create zeroed u32 counter buffer")
     }
 
-    fn read_counter(&self, counter: &Subbuffer<[u32]>) -> u32 {
-        counter.read().expect("failed to map counter buffer")[0]
+    fn read_counter(&self, counter: &GpuBuffer<u32>) -> u32 {
+        counter.read(1)[0]
     }
 
-    fn upload_u32_storage_buffer(&self, data: &[u32]) -> Subbuffer<[u32]> {
-        Buffer::from_iter(
-            self.device.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            data.iter().copied(),
+    fn upload_u32_storage_buffer(&self, data: &[u32]) -> GpuBuffer<u32> {
+        self.device.upload_buffer(
+            data,
+            ash::vk::BufferUsageFlags::STORAGE_BUFFER
+                | ash::vk::BufferUsageFlags::TRANSFER_SRC
+                | ash::vk::BufferUsageFlags::TRANSFER_DST,
+            false,
         )
-        .expect("failed to upload u32 storage buffer")
     }
 
-    fn download_u32_buffer(&self, source: &Subbuffer<[u32]>, len: usize) -> Vec<u32> {
-        let destination: Subbuffer<[u32]> = Buffer::new_unsized(
-            self.device.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_RANDOM_ACCESS,
-                ..Default::default()
-            },
-            len.try_into().expect("buffer length exceeds GPU limits"),
-        )
-        .expect("failed to create destination buffer");
-
-        let mut builder = AutoCommandBufferBuilder::primary(
-            self.device.command_buffer_allocator.clone(),
-            self.device.queue_family_index,
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .expect("failed to create command buffer builder");
-
-        builder
-            .copy_buffer(CopyBufferInfo::buffers(source.clone(), destination.clone()))
-            .expect("failed to copy u32 buffer to host");
-
-        let command_buffer = builder.build().expect("failed to build command buffer");
-        let future = sync::now(self.device.device.clone())
-            .then_execute(self.device.queue.clone(), command_buffer)
-            .expect("failed to execute command buffer")
-            .then_signal_fence_and_flush()
-            .expect("failed to flush command buffer");
-        future.wait(None).expect("failed to wait for buffer copy");
-
-        destination
-            .read()
-            .expect("failed to map destination buffer")
-            .to_vec()
+    fn download_u32_buffer(&self, source: &GpuBuffer<u32>, len: usize) -> Vec<u32> {
+        let destination = self.device.create_buffer(
+            len,
+            ash::vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemory::HostRandomAccess,
+        );
+        self.device
+            .copy_buffer(source, &destination, destination.byte_size());
+        destination.read(len)
     }
 
     fn decimate(&self, image: &GPUImage<u8>, factor: u8) -> GPUImage<u8> {
@@ -1196,7 +1062,7 @@ impl Detector {
         GPUImage::new(self.device.clone(), decimated_image_buffer, decimated_size)
     }
 
-    fn minmax(&self, decimated_image: &GPUImage<u8>) -> (Subbuffer<[u8]>, Size) {
+    fn minmax(&self, decimated_image: &GPUImage<u8>) -> (GpuBuffer<u8>, Size) {
         let compute_pipeline = self.pipelines.minmax.clone();
 
         let minmax_size = Size::new(
@@ -1226,7 +1092,7 @@ impl Detector {
         (minmax_image, minmax_size)
     }
 
-    fn filter_minmax(&self, minmax_image: &Subbuffer<[u8]>, minmax_size: Size) -> Subbuffer<[u8]> {
+    fn filter_minmax(&self, minmax_image: &GpuBuffer<u8>, minmax_size: Size) -> GpuBuffer<u8> {
         let compute_pipeline = self.pipelines.filter_minmax.clone();
 
         let filtered_image = self.new_u8_storage_buffer(minmax_size.total_pixels() * 2);
@@ -1255,7 +1121,7 @@ impl Detector {
     fn threshold(
         &self,
         decimated_image: &GPUImage<u8>,
-        filtered_minmax_image: &Subbuffer<[u8]>,
+        filtered_minmax_image: &GpuBuffer<u8>,
         filtered_size: Size,
         min_white_black_diff: u8,
     ) -> GPUImage<u8> {
@@ -1288,7 +1154,7 @@ impl Detector {
         GPUImage::new(self.device.clone(), thresholded_image, thresholded_size)
     }
 
-    fn ccl_init(&self, thresholded_image: &GPUImage<u8>) -> Subbuffer<[u32]> {
+    fn ccl_init(&self, thresholded_image: &GPUImage<u8>) -> GpuBuffer<u32> {
         let compute_pipeline = self.pipelines.ccl_init.clone();
 
         let labels = self.new_u32_storage_buffer(thresholded_image.size.total_pixels());
@@ -1317,7 +1183,7 @@ impl Detector {
         labels
     }
 
-    fn ccl_compression(&self, labels: &Subbuffer<[u32]>, image_size: Size) {
+    fn ccl_compression(&self, labels: &GpuBuffer<u32>, image_size: Size) {
         let compute_pipeline = self.pipelines.ccl_compression.clone();
 
         let descriptor_set = self.create_descriptor_set(
@@ -1334,7 +1200,7 @@ impl Detector {
         );
     }
 
-    fn ccl_merge(&self, labels: &Subbuffer<[u32]>, image_size: Size) {
+    fn ccl_merge(&self, labels: &GpuBuffer<u32>, image_size: Size) {
         let compute_pipeline = self.pipelines.ccl_merge.clone();
 
         let descriptor_set = self.create_descriptor_set(
@@ -1353,8 +1219,8 @@ impl Detector {
 
     fn ccl_final_labeling(
         &self,
-        labels: &Subbuffer<[u32]>,
-        union_markers_size: &Subbuffer<[u32]>,
+        labels: &GpuBuffer<u32>,
+        union_markers_size: &GpuBuffer<u32>,
         image_size: Size,
     ) {
         let compute_pipeline = self.pipelines.ccl_final_labeling.clone();
@@ -1379,9 +1245,9 @@ impl Detector {
     fn blob_diff(
         &self,
         thresholded_image: &GPUImage<u8>,
-        labels: &Subbuffer<[u32]>,
-        union_markers_size: &Subbuffer<[u32]>,
-        result: &Subbuffer<[u32]>,
+        labels: &GpuBuffer<u32>,
+        union_markers_size: &GpuBuffer<u32>,
+        result: &GpuBuffer<u32>,
         min_blob_size: u32,
     ) {
         let compute_pipeline = self.pipelines.blob_diff.clone();
@@ -1412,8 +1278,8 @@ impl Detector {
 
     fn count_nonzero_blob_diff_points(
         &self,
-        input: &Subbuffer<[u32]>,
-        count_out: &Subbuffer<[u32]>,
+        input: &GpuBuffer<u32>,
+        count_out: &GpuBuffer<u32>,
         total_points: u32,
     ) {
         let compute_pipeline = self.pipelines.count_nonzero_blob_diff_points.clone();
@@ -1438,9 +1304,9 @@ impl Detector {
 
     fn filter_nonzero_blob_diff_points(
         &self,
-        input: &Subbuffer<[u32]>,
-        output: &Subbuffer<[u32]>,
-        output_count: &Subbuffer<[u32]>,
+        input: &GpuBuffer<u32>,
+        output: &GpuBuffer<u32>,
+        output_count: &GpuBuffer<u32>,
         total_points: u32,
     ) {
         let compute_pipeline = self.pipelines.filter_nonzero_blob_diff_points.clone();
@@ -1466,8 +1332,8 @@ impl Detector {
 
     fn prepare_blob_diff_points(
         &self,
-        input: &Subbuffer<[u32]>,
-        output: &Subbuffer<[u32]>,
+        input: &GpuBuffer<u32>,
+        output: &GpuBuffer<u32>,
         valid_points: u32,
         total_points: u32,
     ) {
@@ -1494,7 +1360,7 @@ impl Detector {
         );
     }
 
-    fn bitonic_sort_blob_diff_points(&self, points: &Subbuffer<[u32]>, total_points: u32) {
+    fn bitonic_sort_blob_diff_points(&self, points: &GpuBuffer<u32>, total_points: u32) {
         if total_points <= 1 {
             return;
         }
@@ -1527,9 +1393,9 @@ impl Detector {
 
     fn build_blob_pair_extents(
         &self,
-        sorted_points: &Subbuffer<[u32]>,
-        extents_out: &Subbuffer<[u32]>,
-        extent_count_out: &Subbuffer<[u32]>,
+        sorted_points: &GpuBuffer<u32>,
+        extents_out: &GpuBuffer<u32>,
+        extent_count_out: &GpuBuffer<u32>,
         valid_points: u32,
     ) {
         let compute_pipeline = self.pipelines.build_blob_pair_extents.clone();
@@ -1553,10 +1419,10 @@ impl Detector {
 
     fn filter_blob_pair_extents(
         &self,
-        extents_in: &Subbuffer<[u32]>,
-        extents_out: &Subbuffer<[u32]>,
-        selected_extent_count_out: &Subbuffer<[u32]>,
-        selected_point_count_out: &Subbuffer<[u32]>,
+        extents_in: &GpuBuffer<u32>,
+        extents_out: &GpuBuffer<u32>,
+        selected_extent_count_out: &GpuBuffer<u32>,
+        selected_point_count_out: &GpuBuffer<u32>,
         extent_count: u32,
         tag_width: u32,
         reversed_border: u32,
@@ -1591,10 +1457,10 @@ impl Detector {
 
     fn rewrite_selected_blob_points_with_theta(
         &self,
-        sorted_points: &Subbuffer<[u32]>,
-        extents_in: &Subbuffer<[u32]>,
-        filtered_extents: &Subbuffer<[u32]>,
-        selected_points_out: &Subbuffer<[u32]>,
+        sorted_points: &GpuBuffer<u32>,
+        extents_in: &GpuBuffer<u32>,
+        filtered_extents: &GpuBuffer<u32>,
+        selected_points_out: &GpuBuffer<u32>,
         extent_count: u32,
         valid_points: u32,
     ) {
@@ -1628,8 +1494,8 @@ impl Detector {
 
     fn prepare_selected_blob_points(
         &self,
-        input: &Subbuffer<[u32]>,
-        output: &Subbuffer<[u32]>,
+        input: &GpuBuffer<u32>,
+        output: &GpuBuffer<u32>,
         valid_points: u32,
         total_points: u32,
     ) {
@@ -1656,7 +1522,7 @@ impl Detector {
         );
     }
 
-    fn bitonic_sort_selected_blob_points(&self, points: &Subbuffer<[u32]>, total_points: u32) {
+    fn bitonic_sort_selected_blob_points(&self, points: &GpuBuffer<u32>, total_points: u32) {
         if total_points <= 1 {
             return;
         }
@@ -1689,9 +1555,9 @@ impl Detector {
 
     fn build_line_fit_points(
         &self,
-        sorted_selected_points: &Subbuffer<[u32]>,
+        sorted_selected_points: &GpuBuffer<u32>,
         decimated_image: &GPUImage<u8>,
-        line_fit_points_out: &Subbuffer<[u32]>,
+        line_fit_points_out: &GpuBuffer<u32>,
         point_count: u32,
         decimate: u32,
     ) {
@@ -1718,11 +1584,11 @@ impl Detector {
 
     fn fit_line_errors_and_peaks(
         &self,
-        line_fit_points: &Subbuffer<[u32]>,
-        filtered_extents: &Subbuffer<[u32]>,
-        errs_out: &Subbuffer<[u32]>,
-        filtered_errs_out: &Subbuffer<[u32]>,
-        peaks_out: &Subbuffer<[u32]>,
+        line_fit_points: &GpuBuffer<u32>,
+        filtered_extents: &GpuBuffer<u32>,
+        errs_out: &GpuBuffer<u32>,
+        filtered_errs_out: &GpuBuffer<u32>,
+        peaks_out: &GpuBuffer<u32>,
         extent_count: u32,
         point_count: u32,
     ) {
@@ -1750,8 +1616,8 @@ impl Detector {
 
     fn count_valid_peaks(
         &self,
-        input: &Subbuffer<[u32]>,
-        count_out: &Subbuffer<[u32]>,
+        input: &GpuBuffer<u32>,
+        count_out: &GpuBuffer<u32>,
         total_peaks: u32,
     ) {
         let compute_pipeline = self.pipelines.count_valid_peaks.clone();
@@ -1778,9 +1644,9 @@ impl Detector {
 
     fn filter_valid_peaks(
         &self,
-        input: &Subbuffer<[u32]>,
-        output: &Subbuffer<[u32]>,
-        output_count: &Subbuffer<[u32]>,
+        input: &GpuBuffer<u32>,
+        output: &GpuBuffer<u32>,
+        output_count: &GpuBuffer<u32>,
         total_peaks: u32,
     ) {
         let compute_pipeline = self.pipelines.filter_valid_peaks.clone();
@@ -1808,8 +1674,8 @@ impl Detector {
 
     fn prepare_peaks(
         &self,
-        input: &Subbuffer<[u32]>,
-        output: &Subbuffer<[u32]>,
+        input: &GpuBuffer<u32>,
+        output: &GpuBuffer<u32>,
         valid_peaks: u32,
         total_peaks: u32,
     ) {
@@ -1836,7 +1702,7 @@ impl Detector {
         );
     }
 
-    fn bitonic_sort_peaks(&self, peaks: &Subbuffer<[u32]>, total_peaks: u32) {
+    fn bitonic_sort_peaks(&self, peaks: &GpuBuffer<u32>, total_peaks: u32) {
         if total_peaks <= 1 {
             return;
         }
@@ -1873,9 +1739,9 @@ impl Detector {
 
     fn build_peak_extents(
         &self,
-        sorted_peaks: &Subbuffer<[u32]>,
-        peak_extents_out: &Subbuffer<[u32]>,
-        peak_extent_count_out: &Subbuffer<[u32]>,
+        sorted_peaks: &GpuBuffer<u32>,
+        peak_extents_out: &GpuBuffer<u32>,
+        peak_extent_count_out: &GpuBuffer<u32>,
         valid_peaks: u32,
     ) {
         let compute_pipeline = self.pipelines.build_peak_extents.clone();
@@ -1899,12 +1765,12 @@ impl Detector {
 
     fn fit_quads(
         &self,
-        sorted_peaks: &Subbuffer<[u32]>,
-        peak_extents: &Subbuffer<[u32]>,
-        line_fit_points: &Subbuffer<[u32]>,
-        filtered_blob_extents: &Subbuffer<[u32]>,
-        fitted_quads_out: &Subbuffer<[u32]>,
-        fitted_quad_count_out: &Subbuffer<[u32]>,
+        sorted_peaks: &GpuBuffer<u32>,
+        peak_extents: &GpuBuffer<u32>,
+        line_fit_points: &GpuBuffer<u32>,
+        filtered_blob_extents: &GpuBuffer<u32>,
+        fitted_quads_out: &GpuBuffer<u32>,
+        fitted_quad_count_out: &GpuBuffer<u32>,
         peak_extent_count: u32,
         filtered_blob_extent_count: u32,
         min_tag_width: u32,
@@ -1941,8 +1807,8 @@ impl Detector {
     fn prepare_decode_quads(
         &self,
         image_gray: &GPUImage<u8>,
-        corners: &Subbuffer<[u32]>,
-        quad_params_out: &Subbuffer<[u32]>,
+        corners: &GpuBuffer<u32>,
+        quad_params_out: &GpuBuffer<u32>,
         quad_count: u32,
         marker_size_with_borders: u32,
         cell_size: u32,
@@ -1978,8 +1844,8 @@ impl Detector {
     fn extract_candidate_bits(
         &self,
         image_gray: &GPUImage<u8>,
-        quad_params: &Subbuffer<[u32]>,
-        bits_out: &Subbuffer<[u32]>,
+        quad_params: &GpuBuffer<u32>,
+        bits_out: &GpuBuffer<u32>,
         quad_count: u32,
         marker_size_with_borders: u32,
         cell_size: u32,

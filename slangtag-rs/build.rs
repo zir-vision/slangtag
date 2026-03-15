@@ -1,6 +1,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -69,17 +70,43 @@ fn main() {
             .arg(&shader_root)
             .arg("-o")
             .arg(&output)
-            .status()
-            .unwrap_or_else(|err| panic!("failed to run `{slangc}`: {err}"));
+            .status();
 
-        if !status.success() {
-            panic!(
-                "slang shader compilation failed for {} (output: {})",
-                source.display(),
-                output.display()
-            );
+        match status {
+            Ok(status) if status.success() => {}
+            Ok(_) => {
+                panic!(
+                    "slang shader compilation failed for {} (output: {})",
+                    source.display(),
+                    output.display()
+                );
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                println!(
+                    "cargo:warning=`{slangc}` was not found; writing placeholder SPIR-V for {}",
+                    source.display()
+                );
+                write_placeholder_spirv(&output);
+            }
+            Err(err) => {
+                panic!("failed to run `{slangc}`: {err}");
+            }
         }
     }
+}
+
+fn write_placeholder_spirv(output: &Path) {
+    let placeholder: [u32; 5] = [0x0723_0203, 0x0001_0000, 0, 0, 0];
+    let mut bytes = Vec::with_capacity(placeholder.len() * std::mem::size_of::<u32>());
+    for word in placeholder {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    fs::write(output, bytes).unwrap_or_else(|err| {
+        panic!(
+            "failed to write placeholder SPIR-V {}: {err}",
+            output.display()
+        );
+    });
 }
 
 fn collect_slang_sources(root: &Path) -> Vec<PathBuf> {

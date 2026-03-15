@@ -61,26 +61,37 @@ void main(uint3 groupThreadID: SV_GroupThreadID, uint3 groupId: SV_GroupID,
     GroupMemoryBarrierWithGroupSync();
   }
 
-  if (radix == 0) {
-    // one workgroup is responsible for global histogram prefix sum
-    if (index < RADIX) {
-      uint value = globalHistogram[RADIX * pass + index];
-      uint excl = WavePrefixSum(value);
-      uint sum = WaveActiveSum(value);
+  if (radix == 0)
+  {
+      bool active = (index < RADIX);
+      uint value = 0;
+      uint excl0 = 0;
+      uint sum0 = 0;
 
-      if (WaveIsFirstLane()) {
-        intermediate[waveIndex] = sum;
+      if (active)
+      {
+          value = globalHistogram[RADIX * pass + index];
+          excl0 = WavePrefixSum(value);
+          sum0 = WaveActiveSum(value);
+
+          if (WaveIsFirstLane())
+              intermediate[waveIndex] = sum0;
       }
+
       GroupMemoryBarrierWithGroupSync();
 
-      if (index < RADIX / laneCount) {
-        uint excl = WavePrefixSum(intermediate[index]);
-        intermediate[index] = excl;
+      if (index < RADIX / laneCount)
+      {
+          uint t = intermediate[index];
+          intermediate[index] = WavePrefixSum(t);
       }
+
       GroupMemoryBarrierWithGroupSync();
 
-      excl += intermediate[waveIndex];
-      globalHistogram[RADIX * pass + index] = excl;
-    }
+      if (active)
+      {
+          excl0 += intermediate[waveIndex];
+          globalHistogram[RADIX * pass + index] = excl0;
+      }
   }
 }

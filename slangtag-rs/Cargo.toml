@@ -9,7 +9,7 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 image = "0.25.9"
 num-traits = "0.2.19"
 tracing = "0.1.44"
-vulkano = "0.35.2"
+vk-mem = "0.5.0"
 
 [[bin]]
 name = "slangtag"

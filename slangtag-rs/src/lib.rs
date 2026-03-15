@@ -1,4 +1,5 @@
 pub mod detect;
+pub mod gpu;
 pub mod sort;
 
 #[macro_export]
@@ -8,22 +9,44 @@ macro_rules! compute_shader_path {
     };
 }
 
+#[macro_export]
+macro_rules! include_u32 {
+    ($path:expr $(,)?) => {{
+        // 1. Get a slice of the bytes to check its length
+        const BYTES: &[u8] = include_bytes!($path);
+        const LEN: usize = BYTES.len();
+        
+        // 2. Compile-time assertion: ensure length is divisible by 4
+        // If the file is the wrong size, the compiler will hard-stop here.
+        const _: () = assert!(
+            LEN % 4 == 0, 
+            "Included file length must be a multiple of 4 bytes"
+        );
+
+        // 3. Define a wrapper struct that forces 4-byte alignment
+        #[repr(C, align(4))]
+        struct Aligned<const N: usize>([u8; N]);
+
+        // 4. Bake the included data into the binary inside our aligned struct.
+        // `include_bytes!` returns `&[u8; N]`, so we dereference it to store the array.
+        static ALIGNED_DATA: Aligned<LEN> = Aligned(*include_bytes!($path));
+
+        // 5. Safely cast the aligned byte pointer to a u32 slice
+        unsafe {
+            std::slice::from_raw_parts(
+                ALIGNED_DATA.0.as_ptr().cast::<u32>(),
+                LEN / 4,
+            )
+        }
+    }};
+}
+
 use bytemuck::{Pod, Zeroable};
-use image::{DynamicImage, ImageBuffer, Pixel, Primitive};
-use num_traits::real::Real;
+use gpu::{BufferMemory, GpuBuffer};
+use image::{ImageBuffer, Primitive};
 use std::fmt::Debug;
-use std::ops::Deref;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::{fs, io, process::Command};
-use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo};
-use vulkano::device::{Device, DeviceCreateInfo, QueueCreateInfo};
-use vulkano::device::{DeviceFeatures, QueueFlags};
-use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::sync::GpuFuture;
-use vulkano::{VulkanLibrary, sync};
+
+pub use gpu::{ComputeDevice, ComputePipeline, DescriptorBuffer, GpuQueryPool};
 
 #[repr(C)]
 #[derive(Pod, Zeroable, Clone, Copy)]
@@ -42,24 +65,19 @@ impl Size {
     }
 }
 
-/// GPUImage is a grayscale image in GPU memory.
-/// T is a marker type for the image format, e.g. u8 for 8-bit grayscale, f32 for 32-bit float grayscale, etc.
 #[derive(Clone)]
-pub struct GPUImage<T> {
-    pub(crate) image: Subbuffer<[T]>,
+pub struct GPUImage<T: Pod + Copy> {
+    pub(crate) image: GpuBuffer<T>,
     pub(crate) size: Size,
     device: ComputeDevice,
-
-    // _marker: std::marker::PhantomData<T>,
 }
 
-impl<T: BufferContents + Primitive + Debug> GPUImage<T> {
-    pub fn new(device: ComputeDevice, image: Subbuffer<[T]>, size: Size) -> Self {
+impl<T: Pod + Copy + Primitive + Debug> GPUImage<T> {
+    pub fn new(device: ComputeDevice, image: GpuBuffer<T>, size: Size) -> Self {
         Self {
             image,
             size,
             device,
-            // _marker: std::marker::PhantomData,
         }
     }
 
@@ -68,72 +86,28 @@ impl<T: BufferContents + Primitive + Debug> GPUImage<T> {
         image: ImageBuffer<image::Luma<T>, Vec<T>>,
     ) -> Self {
         let size = Size::new(image.width(), image.height());
-        let flat_data: Vec<T> = image.into_raw();
+        let flat_data = image.into_raw();
+        let pixel_count = size.total_pixels();
 
-        // Create a staging buffer for the image data
-        let transfer_buffer: Subbuffer<[T]> = Buffer::from_iter(
-            device.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::TRANSFER_SRC,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            flat_data.into_iter(),
-        )
-        .expect("failed to create transfer buffer");
-
-        // Create the GPU image buffer that will hold the data on the GPU
-        // This buffer should be device-local for optimal performance, and we'll copy the data from the staging buffer
-        let gpu_image: Subbuffer<[T]> = Buffer::new_unsized(
-            device.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::TRANSFER_DST | BufferUsage::STORAGE_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-                ..Default::default()
-            },
-            size.total_pixels()
-                .try_into()
-                .expect("image size exceeds buffer limits"),
-        )
-        .expect("failed to create GPU image buffer");
-
-        // Copy data from the staging buffer to the GPU image buffer
-        let mut builder = AutoCommandBufferBuilder::primary(
-            device.command_buffer_allocator.clone(),
-            device.queue_family_index,
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
-
-        builder
-            .copy_buffer(CopyBufferInfo::buffers(
-                transfer_buffer.clone(),
-                gpu_image.clone(),
-            ))
-            .unwrap();
-
-        let command_buffer = builder.build().unwrap();
-
-        let future = sync::now(device.device.clone())
-            .then_execute(device.queue.clone(), command_buffer)
-            .unwrap()
-            .then_signal_fence_and_flush()
-            .unwrap();
-
-        future.wait(None).unwrap();
+        let transfer =
+            device.upload_buffer(&flat_data, ash::vk::BufferUsageFlags::TRANSFER_SRC, false);
+        let gpu_image = device.create_buffer::<T>(
+            pixel_count,
+            ash::vk::BufferUsageFlags::STORAGE_BUFFER
+                | ash::vk::BufferUsageFlags::TRANSFER_DST
+                | ash::vk::BufferUsageFlags::TRANSFER_SRC,
+            BufferMemory::DeviceLocal,
+        );
+        device.copy_buffer(
+            &transfer,
+            &gpu_image,
+            (pixel_count * std::mem::size_of::<T>()) as ash::vk::DeviceSize,
+        );
 
         Self {
             image: gpu_image,
             size,
             device,
-            // _marker: std::marker::PhantomData,
         }
     }
 
@@ -142,208 +116,38 @@ impl<T: BufferContents + Primitive + Debug> GPUImage<T> {
         image: ImageBuffer<image::Luma<T>, Vec<T>>,
     ) -> Self {
         let size = Size::new(image.width(), image.height());
-        let flat_data: Vec<T> = image.into_raw();
-
-        // Create the GPU image buffer that will hold the data on the GPU
-        let gpu_image: Subbuffer<[T]> = Buffer::from_iter(
-            device.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            flat_data.into_iter(),
-        )
-        .expect("failed to create GPU image buffer");
+        let flat_data = image.into_raw();
+        let gpu_image = device.upload_buffer(
+            &flat_data,
+            ash::vk::BufferUsageFlags::STORAGE_BUFFER | ash::vk::BufferUsageFlags::TRANSFER_SRC,
+            true,
+        );
 
         Self {
             image: gpu_image,
             size,
             device,
-            // _marker: std::marker::PhantomData,
         }
     }
 
     pub fn data(&self) -> Vec<T> {
-        let destination: Subbuffer<[T]> = Buffer::new_unsized(
-            self.device.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_RANDOM_ACCESS,
-                ..Default::default()
-            },
-            self.size
-                .total_pixels()
-                .try_into()
-                .expect("image size exceeds buffer limits"),
-        )
-        .expect("failed to create destination buffer");
-
-        let mut builder = AutoCommandBufferBuilder::primary(
-            self.device.command_buffer_allocator.clone(),
-            self.device.queue_family_index,
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
-
-        builder
-            .copy_buffer(CopyBufferInfo::buffers(
-                self.image.clone(),
-                destination.clone(),
-            ))
-            .unwrap();
-
-        let command_buffer = builder.build().unwrap();
-
-        let future = sync::now(self.device.device.clone())
-            .then_execute(self.device.queue.clone(), command_buffer)
-            .unwrap()
-            .then_signal_fence_and_flush() // same as signal fence, and then flush
-            .unwrap();
-
-        future.wait(None).unwrap();
-
-        let data = destination.read().unwrap();
-
-        data.to_vec()
+        let pixel_count = self.size.total_pixels();
+        let destination = self.device.create_buffer::<T>(
+            pixel_count,
+            ash::vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemory::HostRandomAccess,
+        );
+        self.device.copy_buffer(
+            &self.image,
+            &destination,
+            (pixel_count * std::mem::size_of::<T>()) as ash::vk::DeviceSize,
+        );
+        destination.read(pixel_count)
     }
 
     pub fn to_image_buffer(&self) -> ImageBuffer<image::Luma<T>, Vec<T>> {
         let data = self.data();
-        println!("Read {} pixels from GPU image", data.len());
-        println!("Pixel data sample: {:?}", data.get(0..10));
         ImageBuffer::from_raw(self.size.width, self.size.height, data)
             .expect("failed to create image buffer from GPU image data")
-    }
-}
-
-#[derive(Clone)]
-pub struct ComputeDevice {
-    pub(crate) device: Arc<vulkano::device::Device>,
-    pub(crate) queue: Arc<vulkano::device::Queue>,
-    pub(crate) memory_allocator: Arc<vulkano::memory::allocator::StandardMemoryAllocator>,
-    pub(crate) command_buffer_allocator:
-        Arc<vulkano::command_buffer::allocator::StandardCommandBufferAllocator>,
-    pub(crate) descriptor_set_allocator:
-        Arc<vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator>,
-    pub(crate) queue_family_index: u32,
-}
-
-impl ComputeDevice {
-    pub fn new_default() -> ComputeDevice {
-        let library = VulkanLibrary::new().expect("no local Vulkan library/DLL");
-        // Print available layers for debugging purposes
-        // println!("Available Vulkan layers:");
-        // for layer in library
-        //     .layer_properties()
-        //     .expect("could not get layer properties")
-        // {
-        //     println!("  - {}: {}", layer.name(), layer.implementation_version());
-        //     println!("Supported layer extensions:");
-        //     for layer in library
-        //         .supported_layer_extensions(layer.name())
-        //         .expect("could not get supported layer extensions")
-        //     {
-        //         println!("    - {}: {}", layer.0, layer.1);
-        //     }
-        // }
-        let instance = Instance::new(
-            library,
-            InstanceCreateInfo {
-                enabled_layers: vec![
-                    "VK_LAYER_KHRONOS_validation".to_string(),
-
-                    "VK_LAYER_LUNARG_crash_diagnostic".to_string(),
-                ],
-                enabled_validation_features: vec![
-                    vulkano::instance::debug::ValidationFeatureEnable::DebugPrintf
-                ],
-                enabled_extensions: vulkano::instance::InstanceExtensions {
-                    ext_validation_features: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .expect("failed to create instance");
-
-        let physical_device = instance
-            .enumerate_physical_devices()
-            .expect("could not enumerate devices")
-            .next()
-            .expect("no devices available");
-
-        let queue_family_index = physical_device
-            .queue_family_properties()
-            .iter()
-            .position(|queue_family_properties| {
-                queue_family_properties
-                    .queue_flags
-                    .contains(QueueFlags::COMPUTE)
-            })
-            .expect("couldn't find a graphical queue family")
-            as u32;
-
-        let supported_features = physical_device.supported_features();
-        let enabled_features = DeviceFeatures {
-            shader_int8: supported_features.shader_int8,
-            shader_int64: supported_features.shader_int64,
-            subgroup_size_control: supported_features.subgroup_size_control,
-            robust_buffer_access: true,
-            robust_buffer_access2: true,
-            ..Default::default()
-        };
-
-        let (device, mut queues) = Device::new(
-            physical_device,
-            DeviceCreateInfo {
-                // here we pass the desired queue family to use by index
-                queue_create_infos: vec![QueueCreateInfo {
-                    queue_family_index,
-                    ..Default::default()
-                }],
-                enabled_features,
-                enabled_extensions: vulkano::device::DeviceExtensions {
-                    khr_push_descriptor: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .expect("failed to create device");
-        let queue = queues.next().unwrap();
-
-        let memory_allocator = Arc::new(
-            vulkano::memory::allocator::StandardMemoryAllocator::new_default(device.clone()),
-        );
-        let command_buffer_allocator = Arc::new(
-            vulkano::command_buffer::allocator::StandardCommandBufferAllocator::new(
-                device.clone(),
-                vulkano::command_buffer::allocator::StandardCommandBufferAllocatorCreateInfo::default(),
-            ),
-        );
-        let descriptor_set_allocator = Arc::new(
-            vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator::new(
-                device.clone(),
-                Default::default(),
-            ),
-        );
-
-        ComputeDevice {
-            device,
-            queue,
-            memory_allocator,
-            command_buffer_allocator,
-            descriptor_set_allocator,
-            queue_family_index,
-        }
     }
 }

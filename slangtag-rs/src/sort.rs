@@ -1,75 +1,53 @@
-use crate::{ComputeDevice, compute_shader_path};
+use crate::gpu::{BufferMemory, ComputePipeline, DescriptorBuffer, GpuBuffer, GpuQueryPool};
+use crate::{ComputeDevice, compute_shader_path, include_u32};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use std::collections::BTreeMap;
 use std::sync::Arc;
-use vulkano::{NonExhaustive, VulkanObject};
-use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferBeginInfo, CommandBufferLevel, CommandBufferUsage,
-    CopyBufferInfo, RecordingCommandBuffer,
-};
-use vulkano::descriptor_set::{
-    DescriptorSet, WriteDescriptorSet,
-    layout::{
-        DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo,
-        DescriptorType,
-    },
-};
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::pipeline::Pipeline;
-use vulkano::pipeline::{
-    ComputePipeline, PipelineLayout, PipelineShaderStageCreateInfo,
-    compute::ComputePipelineCreateInfo,
-    layout::{PipelineLayoutCreateInfo, PushConstantRange},
-};
-use vulkano::shader::{ShaderModuleCreateInfo, ShaderStages, spirv::bytes_to_words};
-use vulkano::sync::{self, AccessFlags, DependencyInfo, GpuFuture, MemoryBarrier, PipelineStages};
 
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone)]
 struct PassPushConstants {
-    pass: i32,
+    pass: u32,
 }
 
 struct RadixSortPipelines {
     upsweep: Arc<ComputePipeline>,
     spine: Arc<ComputePipeline>,
     downsweep: Arc<ComputePipeline>,
+    downsweep_key_value: Arc<ComputePipeline>,
 }
 
 impl RadixSortPipelines {
-    fn new(
-        device: &ComputeDevice,
-        layout: &Arc<PipelineLayout>,
-        required_subgroup_size: u32,
-    ) -> Self {
+    fn new(device: &ComputeDevice) -> Self {
         Self {
-            upsweep: RadixSorter::create_compute_pipeline(
-                device,
-                include_bytes!(compute_shader_path!("radix/upsweep")),
-                layout.clone(),
-                required_subgroup_size,
-            ),
-            spine: RadixSorter::create_compute_pipeline(
-                device,
-                include_bytes!(compute_shader_path!("radix/spine")),
-                layout.clone(),
-                required_subgroup_size,
-            ),
-            downsweep: RadixSorter::create_compute_pipeline(
-                device,
-                include_bytes!(compute_shader_path!("radix/downsweep")),
-                layout.clone(),
-                required_subgroup_size,
-            ),
+            upsweep: Arc::new(device.create_compute_pipeline(
+                include_u32!(compute_shader_path!("radix/upsweep")),
+                Some(32),
+            )),
+            spine: Arc::new(device.create_compute_pipeline(
+                include_u32!(compute_shader_path!("radix/spine")),
+                Some(32),
+            )),
+            downsweep: Arc::new(device.create_compute_pipeline(
+                include_u32!(compute_shader_path!("radix/downsweep")),
+                Some(32),
+            )),
+            downsweep_key_value: Arc::new(device.create_compute_pipeline(
+                include_u32!(compute_shader_path!("radix/downsweep_key_value")),
+                Some(32),
+            )),
         }
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RadixSorterStorageRequirements {
+    pub size: vk::DeviceSize,
+    pub usage: vk::BufferUsageFlags,
+}
+
 pub struct RadixSorter {
     device: ComputeDevice,
-    pipeline_layout: Arc<PipelineLayout>,
     pipelines: RadixSortPipelines,
 }
 
@@ -79,24 +57,65 @@ impl RadixSorter {
     const PARTITION_DIVISION: u32 = 8;
     const PARTITION_SIZE: u32 = Self::WORKGROUP_SIZE * Self::PARTITION_DIVISION;
     const PASSES: u32 = 4;
-    const REQUIRED_SUBGROUP_SIZE: u32 = 32;
+
     const BINDING_ELEMENT_COUNTS: u32 = 0;
     const BINDING_GLOBAL_HISTOGRAM: u32 = 1;
     const BINDING_PARTITION_HISTOGRAM: u32 = 2;
     const BINDING_KEYS_IN: u32 = 3;
     const BINDING_KEYS_OUT: u32 = 4;
     const BINDING_VALUES_IN: u32 = 5;
-    const BINDING_VALUES_OUT: u32 = 6;    
+    const BINDING_VALUES_OUT: u32 = 6;
+
+    pub const TIMESTAMP_QUERY_COUNT: u32 = 15;
 
     pub fn new(device: ComputeDevice) -> Self {
-        let required_subgroup_size = Self::required_subgroup_size(&device);
-        let pipeline_layout = Self::create_pipeline_layout(&device);
-        let pipelines = RadixSortPipelines::new(&device, &pipeline_layout, required_subgroup_size);
-        Self {
-            device,
-            pipeline_layout,
-            pipelines,
+        let pipelines = RadixSortPipelines::new(&device);
+        Self { device, pipelines }
+    }
+
+    pub fn get_storage_requirements(&self, max_element_count: u32) -> RadixSorterStorageRequirements {
+        let align = self.required_alignment();
+        let element_count_size = Self::align(std::mem::size_of::<u32>() as vk::DeviceSize, align);
+        let histogram_size = Self::histogram_size(max_element_count, align);
+        let inout_size = Self::inout_size(max_element_count, align);
+
+        let histogram_offset = element_count_size;
+        let inout_offset = histogram_offset + histogram_size;
+        let storage_size = inout_offset + inout_size;
+
+        RadixSorterStorageRequirements {
+            size: storage_size,
+            usage: vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
         }
+    }
+
+    pub fn get_key_value_storage_requirements(
+        &self,
+        max_element_count: u32,
+    ) -> RadixSorterStorageRequirements {
+        let align = self.required_alignment();
+        let element_count_size = Self::align(std::mem::size_of::<u32>() as vk::DeviceSize, align);
+        let histogram_size = Self::histogram_size(max_element_count, align);
+        let inout_size = Self::inout_size(max_element_count, align);
+
+        let histogram_offset = element_count_size;
+        let inout_offset = histogram_offset + histogram_size;
+        let storage_size = inout_offset + Self::align(inout_size, align) + inout_size;
+
+        RadixSorterStorageRequirements {
+            size: storage_size,
+            usage: vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        }
+    }
+
+    pub fn create_storage_buffer(&self, max_element_count: u32) -> GpuBuffer<u32> {
+        self.create_storage_buffer_with_requirements(self.get_storage_requirements(max_element_count))
+    }
+
+    pub fn create_key_value_storage_buffer(&self, max_element_count: u32) -> GpuBuffer<u32> {
+        self.create_storage_buffer_with_requirements(
+            self.get_key_value_storage_requirements(max_element_count),
+        )
     }
 
     pub fn sort_u32(&self, keys: &[u32]) -> Vec<u32> {
@@ -105,402 +124,521 @@ impl RadixSorter {
         }
 
         let gpu_keys = self.upload_u32_storage_buffer(keys);
-        let keys_out = self.sort_u32_do(&gpu_keys, keys.len() as u32);
+        let storage = self.create_storage_buffer(keys.len() as u32);
+        self.cmd_sort(keys.len() as u32, &gpu_keys, 0, &storage, 0);
         self.download_u32_buffer(&gpu_keys, keys.len())
     }
 
-    pub fn sort_u32_do(&self, keys: &Subbuffer<[u32]>, element_count: u32) -> Option<Subbuffer<[u32]>> {
+    pub fn sort_u32_do(&self, keys: &GpuBuffer<u32>, element_count: u32) -> Option<GpuBuffer<u32>> {
         if element_count <= 1 {
             return None;
         }
 
-        assert!(
-            (element_count as u64) <= keys.len() as u64,
-            "element_count ({element_count}) exceeds key buffer length ({})",
-            keys.len()
-        );
-
-        let partition_count = element_count.div_ceil(Self::PARTITION_SIZE);
-
-        let element_counts = Buffer::from_iter(
-            self.device.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            std::iter::once(element_count),
-        )
-        .expect("failed to create element-count buffer");
-
-        
-
-        let global_histogram =
-            self.new_zeroed_u32_storage_buffer((Self::RADIX * Self::PASSES) as usize);
-        let partition_histogram =
-            self.new_zeroed_u32_storage_buffer((Self::RADIX * partition_count) as usize);
-        let keys_out = self.new_u32_storage_buffer(keys.len() as usize);
-        let mut command_buffer = RecordingCommandBuffer::new(
-            self.device.command_buffer_allocator.clone(),
-            self.device.queue_family_index,
-            CommandBufferLevel::Primary,
-            CommandBufferBeginInfo {
-                usage: CommandBufferUsage::OneTimeSubmit,
-                ..Default::default()
-            },
-        )
-        .expect("failed to create recording command buffer");
-
-
-        for pass in 0..(Self::PASSES as i32) {
-            let mut descriptor_writes = vec![
-                WriteDescriptorSet::buffer(Self::BINDING_ELEMENT_COUNTS, element_counts.clone()),
-                WriteDescriptorSet::buffer(
-                    Self::BINDING_GLOBAL_HISTOGRAM,
-                    global_histogram.clone(),
-                ),
-                WriteDescriptorSet::buffer(
-                    Self::BINDING_PARTITION_HISTOGRAM,
-                    partition_histogram.clone(),
-                ),
-                WriteDescriptorSet::buffer(Self::BINDING_KEYS_IN, keys.clone()),
-                WriteDescriptorSet::buffer(Self::BINDING_KEYS_OUT, keys_out.clone()),
-            ];
-            if pass % 2 == 1 {
-                descriptor_writes.swap(3, 4);
-            }
-            unsafe {
-                command_buffer
-                    .push_descriptor_set(
-                        vulkano::pipeline::PipelineBindPoint::Compute,
-                        &self.pipeline_layout.clone(),
-                        0,
-                        &descriptor_writes,
-                    )
-                    .expect("failed to push descriptor set");
-                command_buffer
-                    .push_constants(
-                        &self.pipeline_layout.clone(),
-                        0,
-                        &PassPushConstants { pass },
-                    )
-                    .expect("failed to push constants");
-                command_buffer
-                    .bind_pipeline_compute(&self.pipelines.upsweep.clone())
-                    .expect("failed to bind upsweep pipeline");
-                command_buffer
-                    .dispatch([partition_count, 1, 1])
-                    .expect("failed to dispatch upsweep");
-                command_buffer
-                    .pipeline_barrier(&Self::shader_write_read_barrier())
-                    .expect("failed to record pipeline barrier after upsweep");
-                command_buffer
-                    .bind_pipeline_compute(&self.pipelines.spine.clone())
-                    .expect("failed to bind spine pipeline");
-                command_buffer
-                    .dispatch([Self::RADIX, 1, 1])
-                    .expect("failed to dispatch spine");
-                command_buffer
-                    .pipeline_barrier(&Self::shader_write_read_barrier())
-                    .expect("failed to record pipeline barrier after spine");
-                command_buffer
-                    .bind_pipeline_compute(&self.pipelines.downsweep.clone())
-                    .expect("failed to bind downsweep pipeline");
-                command_buffer
-                    .dispatch([partition_count, 1, 1])
-                    .expect("failed to dispatch downsweep");
-                if pass < 3 {
-                    command_buffer
-                        .pipeline_barrier(&Self::shader_write_read_barrier())
-                        .expect("failed to record pipeline barrier after downsweep");
-                }
-
-            }
-        }
-
-        let command_buffer = unsafe { command_buffer.end() }.expect("failed to end command buffer");
-        let command_buffer_handle = vec![command_buffer.handle()];
-        let submit_info = ash::vk::SubmitInfo::default().command_buffers(&command_buffer_handle);
-        let fence = vulkano::sync::fence::Fence::new(
-            self.device.device.clone(),
-            vulkano::sync::fence::FenceCreateInfo {
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        
-        self.device
-            .queue
-            .with(|guard| unsafe {
-                (self.device.device.fns().v1_0.queue_submit)(
-                    self.device.queue.handle(),
-                    1,
-                    &raw const submit_info,
-                    fence.handle(),
-                )
-                .result()
-                .unwrap();
-            });
-        fence.wait(None).expect("failed to wait for command buffer execution");
-
-        Some(keys_out)
+        let storage = self.create_storage_buffer(element_count);
+        self.cmd_sort(element_count, keys, 0, &storage, 0);
+        Some(keys.clone())
     }
 
-    fn create_compute_pipeline(
-        device: &ComputeDevice,
-        module_bytes: &[u8],
-        layout: Arc<PipelineLayout>,
-        required_subgroup_size: u32,
-    ) -> Arc<ComputePipeline> {
-        let shader = unsafe {
-            vulkano::shader::ShaderModule::new(
-                device.device.clone(),
-                ShaderModuleCreateInfo::new(&bytes_to_words(module_bytes).unwrap()),
-            )
-            .expect("failed to create shader module")
+    pub fn cmd_sort(
+        &self,
+        element_count: u32,
+        keys_buffer: &GpuBuffer<u32>,
+        keys_offset: vk::DeviceSize,
+        storage_buffer: &GpuBuffer<u32>,
+        storage_offset: vk::DeviceSize,
+    ) {
+        self.cmd_sort_with_query_pool(
+            element_count,
+            keys_buffer,
+            keys_offset,
+            storage_buffer,
+            storage_offset,
+            None,
+        );
+    }
+
+    pub fn cmd_sort_with_query_pool(
+        &self,
+        element_count: u32,
+        keys_buffer: &GpuBuffer<u32>,
+        keys_offset: vk::DeviceSize,
+        storage_buffer: &GpuBuffer<u32>,
+        storage_offset: vk::DeviceSize,
+        query_pool: Option<(&GpuQueryPool, u32)>,
+    ) {
+        if element_count <= 1 {
+            return;
+        }
+
+        self.gpu_sort(
+            element_count,
+            Some(element_count),
+            None,
+            keys_buffer,
+            keys_offset,
+            None,
+            storage_buffer,
+            storage_offset,
+            query_pool,
+        );
+    }
+
+    pub fn cmd_sort_indirect(
+        &self,
+        max_element_count: u32,
+        indirect_buffer: &GpuBuffer<u32>,
+        indirect_offset: vk::DeviceSize,
+        keys_buffer: &GpuBuffer<u32>,
+        keys_offset: vk::DeviceSize,
+        storage_buffer: &GpuBuffer<u32>,
+        storage_offset: vk::DeviceSize,
+    ) {
+        self.cmd_sort_indirect_with_query_pool(
+            max_element_count,
+            indirect_buffer,
+            indirect_offset,
+            keys_buffer,
+            keys_offset,
+            storage_buffer,
+            storage_offset,
+            None,
+        );
+    }
+
+    pub fn cmd_sort_indirect_with_query_pool(
+        &self,
+        max_element_count: u32,
+        indirect_buffer: &GpuBuffer<u32>,
+        indirect_offset: vk::DeviceSize,
+        keys_buffer: &GpuBuffer<u32>,
+        keys_offset: vk::DeviceSize,
+        storage_buffer: &GpuBuffer<u32>,
+        storage_offset: vk::DeviceSize,
+        query_pool: Option<(&GpuQueryPool, u32)>,
+    ) {
+        if max_element_count <= 1 {
+            return;
+        }
+
+        self.gpu_sort(
+            max_element_count,
+            None,
+            Some((indirect_buffer, indirect_offset)),
+            keys_buffer,
+            keys_offset,
+            None,
+            storage_buffer,
+            storage_offset,
+            query_pool,
+        );
+    }
+
+    pub fn cmd_sort_key_value(
+        &self,
+        element_count: u32,
+        keys_buffer: &GpuBuffer<u32>,
+        keys_offset: vk::DeviceSize,
+        values_buffer: &GpuBuffer<u32>,
+        values_offset: vk::DeviceSize,
+        storage_buffer: &GpuBuffer<u32>,
+        storage_offset: vk::DeviceSize,
+    ) {
+        self.cmd_sort_key_value_with_query_pool(
+            element_count,
+            keys_buffer,
+            keys_offset,
+            values_buffer,
+            values_offset,
+            storage_buffer,
+            storage_offset,
+            None,
+        );
+    }
+
+    pub fn cmd_sort_key_value_with_query_pool(
+        &self,
+        element_count: u32,
+        keys_buffer: &GpuBuffer<u32>,
+        keys_offset: vk::DeviceSize,
+        values_buffer: &GpuBuffer<u32>,
+        values_offset: vk::DeviceSize,
+        storage_buffer: &GpuBuffer<u32>,
+        storage_offset: vk::DeviceSize,
+        query_pool: Option<(&GpuQueryPool, u32)>,
+    ) {
+        if element_count <= 1 {
+            return;
+        }
+
+        self.gpu_sort(
+            element_count,
+            Some(element_count),
+            None,
+            keys_buffer,
+            keys_offset,
+            Some((values_buffer, values_offset)),
+            storage_buffer,
+            storage_offset,
+            query_pool,
+        );
+    }
+
+    pub fn cmd_sort_key_value_indirect(
+        &self,
+        max_element_count: u32,
+        indirect_buffer: &GpuBuffer<u32>,
+        indirect_offset: vk::DeviceSize,
+        keys_buffer: &GpuBuffer<u32>,
+        keys_offset: vk::DeviceSize,
+        values_buffer: &GpuBuffer<u32>,
+        values_offset: vk::DeviceSize,
+        storage_buffer: &GpuBuffer<u32>,
+        storage_offset: vk::DeviceSize,
+    ) {
+        self.cmd_sort_key_value_indirect_with_query_pool(
+            max_element_count,
+            indirect_buffer,
+            indirect_offset,
+            keys_buffer,
+            keys_offset,
+            values_buffer,
+            values_offset,
+            storage_buffer,
+            storage_offset,
+            None,
+        );
+    }
+
+    pub fn cmd_sort_key_value_indirect_with_query_pool(
+        &self,
+        max_element_count: u32,
+        indirect_buffer: &GpuBuffer<u32>,
+        indirect_offset: vk::DeviceSize,
+        keys_buffer: &GpuBuffer<u32>,
+        keys_offset: vk::DeviceSize,
+        values_buffer: &GpuBuffer<u32>,
+        values_offset: vk::DeviceSize,
+        storage_buffer: &GpuBuffer<u32>,
+        storage_offset: vk::DeviceSize,
+        query_pool: Option<(&GpuQueryPool, u32)>,
+    ) {
+        if max_element_count <= 1 {
+            return;
+        }
+
+        self.gpu_sort(
+            max_element_count,
+            None,
+            Some((indirect_buffer, indirect_offset)),
+            keys_buffer,
+            keys_offset,
+            Some((values_buffer, values_offset)),
+            storage_buffer,
+            storage_offset,
+            query_pool,
+        );
+    }
+
+    fn gpu_sort(
+        &self,
+        max_element_count: u32,
+        direct_element_count: Option<u32>,
+        indirect_count: Option<(&GpuBuffer<u32>, vk::DeviceSize)>,
+        keys_buffer: &GpuBuffer<u32>,
+        keys_offset: vk::DeviceSize,
+        values_buffer: Option<(&GpuBuffer<u32>, vk::DeviceSize)>,
+        storage_buffer: &GpuBuffer<u32>,
+        storage_offset: vk::DeviceSize,
+        query_pool: Option<(&GpuQueryPool, u32)>,
+    ) {
+        assert!(
+            direct_element_count.is_some() ^ indirect_count.is_some(),
+            "exactly one of direct or indirect element count must be provided"
+        );
+        assert!(max_element_count > 0, "max_element_count must be non-zero");
+
+        let align = self.required_alignment();
+        Self::assert_alignment(keys_offset, align, "keys_offset");
+        Self::assert_alignment(storage_offset, align, "storage_offset");
+
+        if let Some((_, values_offset)) = values_buffer {
+            Self::assert_alignment(values_offset, align, "values_offset");
+        }
+
+        let element_count_size = Self::align(std::mem::size_of::<u32>() as vk::DeviceSize, align);
+        let histogram_size = Self::histogram_size(max_element_count, align);
+        let inout_size = Self::inout_size(max_element_count, align);
+
+        let element_count_offset = storage_offset;
+        let histogram_offset = element_count_offset + element_count_size;
+        let inout_offset = histogram_offset + histogram_size;
+
+        let global_histogram_size =
+            (Self::PASSES as vk::DeviceSize) * (Self::RADIX as vk::DeviceSize) * 4;
+        let partition_histogram_offset = histogram_offset + global_histogram_size;
+        let partition_count = Self::round_up(max_element_count, Self::PARTITION_SIZE);
+        let partition_histogram_size =
+            (partition_count as vk::DeviceSize) * (Self::RADIX as vk::DeviceSize) * 4;
+
+        let value_inout_offset = inout_offset + Self::align(inout_size, align);
+
+        let storage_requirements = if values_buffer.is_some() {
+            self.get_key_value_storage_requirements(max_element_count)
+        } else {
+            self.get_storage_requirements(max_element_count)
         };
 
-        let entry_point = shader
-            .entry_point("main")
-            .expect("failed to find entry point in shader");
-
-        let mut stage = PipelineShaderStageCreateInfo::new(entry_point);
-        stage.required_subgroup_size = Some(required_subgroup_size);
-
-        ComputePipeline::new(
-            device.device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(stage, layout),
-        )
-        .expect("failed to create compute pipeline")
-    }
-
-    fn required_subgroup_size(device: &ComputeDevice) -> u32 {
-        let properties = device.device.physical_device().properties();
-        let supported = device.device.enabled_features().subgroup_size_control
-            && properties
-                .required_subgroup_size_stages
-                .unwrap_or_default()
-                .intersects(ShaderStages::COMPUTE)
-            && properties.min_subgroup_size.unwrap_or(1) <= Self::REQUIRED_SUBGROUP_SIZE
-            && properties.max_subgroup_size.unwrap_or(u32::MAX) >= Self::REQUIRED_SUBGROUP_SIZE
-            && properties
-                .max_compute_workgroup_subgroups
-                .unwrap_or(0)
-                .saturating_mul(Self::REQUIRED_SUBGROUP_SIZE)
-                >= Self::WORKGROUP_SIZE;
-
-        assert!(
-            supported,
-            "RadixSorter requires a 32-lane compute subgroup. \
-             Enable `subgroup_size_control` and run on hardware that supports required subgroup size 32."
+        Self::assert_range(
+            storage_buffer.byte_size(),
+            storage_offset,
+            storage_requirements.size,
+            "storage_buffer",
         );
+        Self::assert_range(keys_buffer.byte_size(), keys_offset, inout_size, "keys_buffer");
 
-        Self::REQUIRED_SUBGROUP_SIZE
-    }
-
-    fn shader_write_read_barrier() -> DependencyInfo {
-        let mut dependency = DependencyInfo::default();
-        dependency.memory_barriers.push(MemoryBarrier {
-            src_stages: PipelineStages::COMPUTE_SHADER,
-            src_access: AccessFlags::SHADER_WRITE,
-            dst_stages: PipelineStages::COMPUTE_SHADER,
-            dst_access: AccessFlags::SHADER_READ,
-            ..Default::default()
-        });
-        dependency
-    }
-
-    fn create_pipeline_layout(device: &ComputeDevice) -> Arc<PipelineLayout> {
-        let mut bindings = BTreeMap::new();
-        for binding in [
-            Self::BINDING_ELEMENT_COUNTS,
-            Self::BINDING_GLOBAL_HISTOGRAM,
-            Self::BINDING_PARTITION_HISTOGRAM,
-            Self::BINDING_KEYS_IN,
-            Self::BINDING_KEYS_OUT,
-            // Self::BINDING_VALUES_IN,
-            // Self::BINDING_VALUES_OUT,
-        ] {
-            let mut layout_binding =
-                DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageBuffer);
-            layout_binding.stages = ShaderStages::COMPUTE;
-            layout_binding.descriptor_count = 1;
-            bindings.insert(binding, layout_binding);
+        if let Some((values, values_offset)) = values_buffer {
+            Self::assert_range(values.byte_size(), values_offset, inout_size, "values_buffer");
         }
 
-        let descriptor_set_layout = DescriptorSetLayout::new(
-            device.device.clone(),
-            DescriptorSetLayoutCreateInfo {
-                bindings,
-                flags: vulkano::descriptor_set::layout::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR,
-                ..Default::default()
-            },
-        )
-        .expect("failed to create radix descriptor set layout");
+        self.device.run_commands(|commands| {
+            if let Some((query_pool, query)) = query_pool {
+                commands.reset_query_pool(query_pool, query, Self::TIMESTAMP_QUERY_COUNT);
+                commands.write_timestamp(vk::PipelineStageFlags::ALL_COMMANDS, query_pool, query + 0);
+            }
 
-        PipelineLayout::new(
-            device.device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![descriptor_set_layout],
-                push_constant_ranges: vec![PushConstantRange {
-                    stages: ShaderStages::COMPUTE,
-                    offset: 0,
-                    size: std::mem::size_of::<PassPushConstants>() as u32,
-                }],
-                ..Default::default()
-            },
-        )
-        .expect("failed to create radix pipeline layout")
+            if let Some(element_count) = direct_element_count {
+                assert!(
+                    element_count <= max_element_count,
+                    "element_count ({element_count}) exceeds max_element_count ({max_element_count})"
+                );
+                commands.update_buffer_u32(storage_buffer, element_count_offset, element_count);
+            }
+
+            if let Some((indirect_buffer, indirect_offset)) = indirect_count {
+                Self::assert_alignment(
+                    indirect_offset,
+                    std::mem::size_of::<u32>() as vk::DeviceSize,
+                    "indirect_offset",
+                );
+                Self::assert_range(
+                    indirect_buffer.byte_size(),
+                    indirect_offset,
+                    std::mem::size_of::<u32>() as vk::DeviceSize,
+                    "indirect_buffer",
+                );
+                commands.copy_buffer_region(
+                    indirect_buffer,
+                    indirect_offset,
+                    storage_buffer,
+                    element_count_offset,
+                    std::mem::size_of::<u32>() as vk::DeviceSize,
+                );
+            }
+
+            commands.fill_buffer_u32_range(storage_buffer, histogram_offset, global_histogram_size, 0);
+            commands.barrier_transfer_write_to_compute_read();
+
+            if let Some((query_pool, query)) = query_pool {
+                commands.write_timestamp(vk::PipelineStageFlags::TRANSFER, query_pool, query + 1);
+            }
+
+            for pass in 0..Self::PASSES {
+                let mut keys_in = keys_buffer.descriptor_range(keys_offset, inout_size);
+                let mut keys_out = storage_buffer.descriptor_range(inout_offset, inout_size);
+
+                let mut values_in_out: Option<(DescriptorBuffer, DescriptorBuffer)> =
+                    values_buffer.map(|(values, values_offset)| {
+                        (
+                            values.descriptor_range(values_offset, inout_size),
+                            storage_buffer.descriptor_range(value_inout_offset, inout_size),
+                        )
+                    });
+
+                if pass % 2 == 1 {
+                    std::mem::swap(&mut keys_in, &mut keys_out);
+                    if let Some((values_in, values_out)) = values_in_out.as_mut() {
+                        std::mem::swap(values_in, values_out);
+                    }
+                }
+
+                let mut descriptor_bindings = vec![
+                    (
+                        Self::BINDING_ELEMENT_COUNTS,
+                        storage_buffer.descriptor_range(
+                            element_count_offset,
+                            std::mem::size_of::<u32>() as vk::DeviceSize,
+                        ),
+                    ),
+                    (
+                        Self::BINDING_GLOBAL_HISTOGRAM,
+                        storage_buffer.descriptor_range(histogram_offset, global_histogram_size),
+                    ),
+                    (
+                        Self::BINDING_PARTITION_HISTOGRAM,
+                        storage_buffer
+                            .descriptor_range(partition_histogram_offset, partition_histogram_size),
+                    ),
+                    (Self::BINDING_KEYS_IN, keys_in),
+                    (Self::BINDING_KEYS_OUT, keys_out),
+                ];
+
+                if let Some((values_in, values_out)) = values_in_out {
+                    descriptor_bindings.push((Self::BINDING_VALUES_IN, values_in));
+                    descriptor_bindings.push((Self::BINDING_VALUES_OUT, values_out));
+                }
+
+                commands.dispatch_with_push_constants(
+                    self.pipelines.upsweep.as_ref(),
+                    &descriptor_bindings,
+                    &PassPushConstants { pass },
+                    [partition_count, 1, 1],
+                );
+                if let Some((query_pool, query)) = query_pool {
+                    commands.write_timestamp(
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        query_pool,
+                        query + 2 + 3 * pass + 0,
+                    );
+                }
+                commands.barrier_shader_write_to_shader_read();
+
+                commands.dispatch_with_push_constants(
+                    self.pipelines.spine.as_ref(),
+                    &descriptor_bindings,
+                    &PassPushConstants { pass },
+                    [Self::RADIX, 1, 1],
+                );
+                if let Some((query_pool, query)) = query_pool {
+                    commands.write_timestamp(
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        query_pool,
+                        query + 2 + 3 * pass + 1,
+                    );
+                }
+                commands.barrier_shader_write_to_shader_read();
+
+                let downsweep_pipeline = if values_buffer.is_some() {
+                    self.pipelines.downsweep_key_value.as_ref()
+                } else {
+                    self.pipelines.downsweep.as_ref()
+                };
+                commands.dispatch_with_push_constants(
+                    downsweep_pipeline,
+                    &descriptor_bindings,
+                    &PassPushConstants { pass },
+                    [partition_count, 1, 1],
+                );
+                if let Some((query_pool, query)) = query_pool {
+                    commands.write_timestamp(
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        query_pool,
+                        query + 2 + 3 * pass + 2,
+                    );
+                }
+
+                if pass < (Self::PASSES - 1) {
+                    commands.barrier_shader_write_to_shader_read();
+                }
+            }
+
+            if let Some((query_pool, query)) = query_pool {
+                commands.write_timestamp(vk::PipelineStageFlags::ALL_COMMANDS, query_pool, query + 14);
+            }
+        });
     }
 
-    fn create_descriptor_set(&self, writes: Vec<WriteDescriptorSet>) -> Arc<DescriptorSet> {
-        let descriptor_set_layout = self
-            .pipeline_layout
-            .set_layouts()
-            .first()
-            .expect("missing descriptor set layout");
-
-        DescriptorSet::new(
-            self.device.descriptor_set_allocator.clone(),
-            descriptor_set_layout.clone(),
-            writes,
-            [],
-        )
-        .expect("failed to create descriptor set")
+    fn required_alignment(&self) -> vk::DeviceSize {
+        self.device
+            .min_storage_buffer_offset_alignment()
+            .max(std::mem::size_of::<u32>() as vk::DeviceSize)
     }
 
-    fn new_u32_storage_buffer(&self, len: usize) -> Subbuffer<[u32]> {
-        Buffer::new_unsized(
-            self.device.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER
-                    | BufferUsage::TRANSFER_SRC
-                    | BufferUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-                ..Default::default()
-            },
-            len as u64,
-        )
-        .expect("failed to create u32 storage buffer")
+    fn round_up(a: u32, b: u32) -> u32 {
+        a.div_ceil(b)
     }
 
-    fn new_zeroed_u32_storage_buffer(&self, len: usize) -> Subbuffer<[u32]> {
-        let buf = Buffer::new_unsized(
-            self.device.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER
-                    | BufferUsage::TRANSFER_SRC
-                    | BufferUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            len as u64,
-        )
-        .expect("failed to create zeroed u32 storage buffer");
-
-        let mut builder = AutoCommandBufferBuilder::primary(
-            self.device.command_buffer_allocator.clone(),
-            self.device.queue_family_index,
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .expect("failed to create command buffer builder");
-        builder
-            .fill_buffer(buf.clone(), 0)
-            .expect("failed to record fill buffer command");
-
-        let command_buffer = builder.build().expect("failed to build command buffer");
-        let future = sync::now(self.device.device.clone())
-            .then_execute(self.device.queue.clone(), command_buffer)
-            .expect("failed to execute command buffer")
-            .then_signal_fence_and_flush()
-            .expect("failed to flush command buffer");
-        future.wait(None).expect("failed to wait for buffer fill");
-
-        buf
+    fn align(a: vk::DeviceSize, b: vk::DeviceSize) -> vk::DeviceSize {
+        a.div_ceil(b) * b
     }
 
-    fn upload_u32_storage_buffer(&self, data: &[u32]) -> Subbuffer<[u32]> {
-        Buffer::from_iter(
-            self.device.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            data.iter().copied(),
-        )
-        .expect("failed to upload u32 storage buffer")
+    fn histogram_size(element_count: u32, align: vk::DeviceSize) -> vk::DeviceSize {
+        let partition_count = Self::round_up(element_count, Self::PARTITION_SIZE);
+        let words = 4u64
+            + (Self::PASSES as u64) * (Self::RADIX as u64)
+            + (partition_count as u64) * (Self::RADIX as u64);
+        Self::align(words * (std::mem::size_of::<u32>() as vk::DeviceSize), align)
     }
 
-    fn download_u32_buffer(&self, source: &Subbuffer<[u32]>, len: usize) -> Vec<u32> {
-        let destination: Subbuffer<[u32]> = Buffer::new_unsized(
-            self.device.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_RANDOM_ACCESS,
-                ..Default::default()
-            },
-            len as u64,
-        )
-        .expect("failed to create destination buffer");
-
-        self.copy_u32_buffer(source, &destination);
-
-        destination
-            .read()
-            .expect("failed to map destination buffer")
-            .to_vec()
+    fn inout_size(element_count: u32, align: vk::DeviceSize) -> vk::DeviceSize {
+        let bytes = (element_count as vk::DeviceSize) * (std::mem::size_of::<u32>() as vk::DeviceSize);
+        Self::align(bytes, align)
     }
 
-    fn copy_u32_buffer(&self, src: &Subbuffer<[u32]>, dst: &Subbuffer<[u32]>) {
-        let mut builder = AutoCommandBufferBuilder::primary(
-            self.device.command_buffer_allocator.clone(),
-            self.device.queue_family_index,
-            CommandBufferUsage::OneTimeSubmit,
+    fn assert_alignment(offset: vk::DeviceSize, align: vk::DeviceSize, label: &str) {
+        assert!(
+            offset % align == 0,
+            "{label} ({offset}) must be aligned to {align} bytes"
+        );
+    }
+
+    fn assert_range(
+        buffer_size: vk::DeviceSize,
+        offset: vk::DeviceSize,
+        size: vk::DeviceSize,
+        label: &str,
+    ) {
+        let end = offset
+            .checked_add(size)
+            .unwrap_or_else(|| panic!("{label} range overflow: offset={offset}, size={size}"));
+        assert!(
+            end <= buffer_size,
+            "{label} range out of bounds: offset={offset}, size={size}, buffer_size={buffer_size}"
+        );
+    }
+
+    fn create_storage_buffer_with_requirements(
+        &self,
+        requirements: RadixSorterStorageRequirements,
+    ) -> GpuBuffer<u32> {
+        assert!(
+            requirements.size % (std::mem::size_of::<u32>() as vk::DeviceSize) == 0,
+            "storage requirement size ({}) is not aligned to u32",
+            requirements.size
+        );
+
+        let word_len = usize::try_from(requirements.size / (std::mem::size_of::<u32>() as u64))
+            .expect("storage requirement size does not fit in usize");
+
+        self.device
+            .create_buffer(word_len, requirements.usage, BufferMemory::DeviceLocal)
+    }
+
+    fn upload_u32_storage_buffer(&self, data: &[u32]) -> GpuBuffer<u32> {
+        self.device.upload_buffer(
+            data,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST,
+            true,
         )
-        .expect("failed to create command buffer builder");
+    }
 
-        builder
-            .copy_buffer(CopyBufferInfo::buffers(src.clone(), dst.clone()))
-            .expect("failed to record copy buffer command");
-
-        let command_buffer = builder.build().expect("failed to build command buffer");
-        let future = sync::now(self.device.device.clone())
-            .then_execute(self.device.queue.clone(), command_buffer)
-            .expect("failed to execute command buffer")
-            .then_signal_fence_and_flush()
-            .expect("failed to flush command buffer");
-        future.wait(None).expect("failed to wait for buffer copy");
+    fn download_u32_buffer(&self, source: &GpuBuffer<u32>, len: usize) -> Vec<u32> {
+        let destination = self.device.create_buffer(
+            len,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemory::HostRandomAccess,
+        );
+        self.device
+            .copy_buffer(source, &destination, destination.byte_size());
+        destination.read(len)
     }
 }
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
-    use std::{
-        sync::{Mutex, OnceLock},
-    };
+    use std::sync::{Mutex, OnceLock};
 
     fn test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -516,7 +654,6 @@ mod tests {
     }
 
     fn assert_gpu_sort_matches_cpu(input: &[u32]) {
-
         let _guard = test_lock().lock().expect("test lock poisoned");
 
         let Some(sorter) = maybe_sorter() else {
