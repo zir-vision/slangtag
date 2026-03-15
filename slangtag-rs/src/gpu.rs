@@ -52,8 +52,7 @@ impl Drop for ComputeDeviceInner {
             let _ = self.device.device_wait_idle();
             self.device
                 .free_command_buffers(self.command_pool, &[self.command_buffer]);
-            self.device
-                .destroy_fence(self.submit_fence, None);
+            self.device.destroy_fence(self.submit_fence, None);
             ManuallyDrop::drop(&mut self.allocator);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
@@ -170,9 +169,12 @@ impl<'a> CommandRecorder<'a> {
     ) {
         query_pool.assert_range(first_query, query_count);
         unsafe {
-            self.inner
-                .device
-                .cmd_reset_query_pool(self.command_buffer, query_pool.query_pool, first_query, query_count);
+            self.inner.device.cmd_reset_query_pool(
+                self.command_buffer,
+                query_pool.query_pool,
+                first_query,
+                query_count,
+            );
         }
     }
 
@@ -188,9 +190,12 @@ impl<'a> CommandRecorder<'a> {
         );
         query_pool.assert_range(query, 1);
         unsafe {
-            self.inner
-                .device
-                .cmd_write_timestamp(self.command_buffer, stage, query_pool.query_pool, query);
+            self.inner.device.cmd_write_timestamp(
+                self.command_buffer,
+                stage,
+                query_pool.query_pool,
+                query,
+            );
         }
     }
 
@@ -222,9 +227,12 @@ impl<'a> CommandRecorder<'a> {
                 .src_offset(src_offset)
                 .dst_offset(dst_offset)
                 .size(bytes)];
-            self.inner
-                .device
-                .cmd_copy_buffer(self.command_buffer, src.raw.buffer, dst.raw.buffer, &copy_regions);
+            self.inner.device.cmd_copy_buffer(
+                self.command_buffer,
+                src.raw.buffer,
+                dst.raw.buffer,
+                &copy_regions,
+            );
         }
     }
 
@@ -244,13 +252,22 @@ impl<'a> CommandRecorder<'a> {
         );
 
         unsafe {
-            self.inner
-                .device
-                .cmd_fill_buffer(self.command_buffer, buffer.raw.buffer, offset, size, value);
+            self.inner.device.cmd_fill_buffer(
+                self.command_buffer,
+                buffer.raw.buffer,
+                offset,
+                size,
+                value,
+            );
         }
     }
 
-    pub fn update_buffer_u32(&mut self, buffer: &GpuBuffer<u32>, offset: vk::DeviceSize, value: u32) {
+    pub fn update_buffer_u32(
+        &mut self,
+        buffer: &GpuBuffer<u32>,
+        offset: vk::DeviceSize,
+        value: u32,
+    ) {
         assert!(
             offset % (std::mem::size_of::<u32>() as vk::DeviceSize) == 0,
             "update offset ({offset}) must be aligned to 4 bytes"
@@ -467,26 +484,37 @@ impl ComputeDevice {
         let min_subgroup_size = subgroup_props.min_subgroup_size;
         let max_subgroup_size = subgroup_props.max_subgroup_size;
         let max_compute_workgroup_subgroups = subgroup_props.max_compute_workgroup_subgroups;
-        assert!(min_subgroup_size <= 32 && max_subgroup_size >= 32, "Vulkan device must support subgroup size of at least 32");
+        assert!(
+            min_subgroup_size <= 32 && max_subgroup_size >= 32,
+            "Vulkan device must support subgroup size of at least 32"
+        );
 
         let queue_priority = [1.0f32];
         let queue_info = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
             .queue_priorities(&queue_priority)];
 
-        let enable_subgroup_size_control = subgroup_features.subgroup_size_control == vk::TRUE;
-        assert!(enable_subgroup_size_control, "Vulkan device does not support subgroup size control");
+        assert!(
+            subgroup_features.subgroup_size_control == vk::TRUE,
+            "Vulkan device does not support subgroup size control"
+        );
         let mut subgroup_features_enabled =
             vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
-                .subgroup_size_control(enable_subgroup_size_control)
-                .compute_full_subgroups(enable_subgroup_size_control);
+                .subgroup_size_control(true)
+                .compute_full_subgroups(true);
 
         let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_features(&requested_features);
-        if enable_subgroup_size_control {
-            device_create_info = device_create_info.push_next(&mut subgroup_features_enabled);
-        }
+        
+        device_create_info = device_create_info.push_next(&mut subgroup_features_enabled);
+        
+        let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
+            .shader_int8(true)
+            .storage_buffer8_bit_access(true)
+            .uniform_and_storage_buffer8_bit_access(true);
+
+        device_create_info = device_create_info.push_next(&mut features12);
 
         let device = unsafe {
             instance
@@ -584,7 +612,7 @@ impl ComputeDevice {
                 allocator: ManuallyDrop::new(allocator),
                 submit_lock: Mutex::new(()),
                 descriptor_pool_lock: Mutex::new(()),
-                subgroup_size_control_enabled: enable_subgroup_size_control,
+                subgroup_size_control_enabled: true,
                 required_subgroup_size_stages,
                 min_subgroup_size,
                 max_subgroup_size,
@@ -663,8 +691,6 @@ impl ComputeDevice {
         module_words: &[u32],
         required_subgroup_size: Option<u32>,
     ) -> ComputePipeline {
-        
-
         let shader_info = vk::ShaderModuleCreateInfo::default().code(module_words);
         let shader_module = unsafe {
             self.inner
@@ -902,10 +928,10 @@ impl ComputeDevice {
                 .lock()
                 .expect("failed to lock descriptor pool");
             unsafe {
-                let _ = self.inner.device.free_descriptor_sets(
-                    self.inner.descriptor_pool,
-                    &recorder.descriptor_sets,
-                );
+                let _ = self
+                    .inner
+                    .device
+                    .free_descriptor_sets(self.inner.descriptor_pool, &recorder.descriptor_sets);
             }
         }
     }
@@ -992,7 +1018,11 @@ impl<T: Pod + Copy> GpuBuffer<T> {
         DescriptorBuffer::from(self)
     }
 
-    pub fn descriptor_range(&self, offset: vk::DeviceSize, range: vk::DeviceSize) -> DescriptorBuffer {
+    pub fn descriptor_range(
+        &self,
+        offset: vk::DeviceSize,
+        range: vk::DeviceSize,
+    ) -> DescriptorBuffer {
         assert!(
             offset.saturating_add(range) <= self.raw.bytes,
             "descriptor range exceeds allocation: offset={} range={} size={}",
@@ -1018,9 +1048,9 @@ impl GpuQueryPool {
     }
 
     fn assert_range(&self, first_query: u32, query_count: u32) {
-        let end = first_query
-            .checked_add(query_count)
-            .unwrap_or_else(|| panic!("query range overflow: first={first_query}, count={query_count}"));
+        let end = first_query.checked_add(query_count).unwrap_or_else(|| {
+            panic!("query range overflow: first={first_query}, count={query_count}")
+        });
         assert!(
             end <= self.query_count,
             "query range out of bounds: first={} count={} total={}",

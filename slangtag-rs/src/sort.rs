@@ -73,7 +73,10 @@ impl RadixSorter {
         Self { device, pipelines }
     }
 
-    pub fn get_storage_requirements(&self, max_element_count: u32) -> RadixSorterStorageRequirements {
+    pub fn get_storage_requirements(
+        &self,
+        max_element_count: u32,
+    ) -> RadixSorterStorageRequirements {
         let align = self.required_alignment();
         let element_count_size = Self::align(std::mem::size_of::<u32>() as vk::DeviceSize, align);
         let histogram_size = Self::histogram_size(max_element_count, align);
@@ -109,7 +112,9 @@ impl RadixSorter {
     }
 
     pub fn create_storage_buffer(&self, max_element_count: u32) -> GpuBuffer<u32> {
-        self.create_storage_buffer_with_requirements(self.get_storage_requirements(max_element_count))
+        self.create_storage_buffer_with_requirements(
+            self.get_storage_requirements(max_element_count),
+        )
     }
 
     pub fn create_key_value_storage_buffer(&self, max_element_count: u32) -> GpuBuffer<u32> {
@@ -394,10 +399,20 @@ impl RadixSorter {
             storage_requirements.size,
             "storage_buffer",
         );
-        Self::assert_range(keys_buffer.byte_size(), keys_offset, inout_size, "keys_buffer");
+        Self::assert_range(
+            keys_buffer.byte_size(),
+            keys_offset,
+            inout_size,
+            "keys_buffer",
+        );
 
         if let Some((values, values_offset)) = values_buffer {
-            Self::assert_range(values.byte_size(), values_offset, inout_size, "values_buffer");
+            Self::assert_range(
+                values.byte_size(),
+                values_offset,
+                inout_size,
+                "values_buffer",
+            );
         }
 
         self.device.run_commands(|commands| {
@@ -566,11 +581,15 @@ impl RadixSorter {
         let words = 4u64
             + (Self::PASSES as u64) * (Self::RADIX as u64)
             + (partition_count as u64) * (Self::RADIX as u64);
-        Self::align(words * (std::mem::size_of::<u32>() as vk::DeviceSize), align)
+        Self::align(
+            words * (std::mem::size_of::<u32>() as vk::DeviceSize),
+            align,
+        )
     }
 
     fn inout_size(element_count: u32, align: vk::DeviceSize) -> vk::DeviceSize {
-        let bytes = (element_count as vk::DeviceSize) * (std::mem::size_of::<u32>() as vk::DeviceSize);
+        let bytes =
+            (element_count as vk::DeviceSize) * (std::mem::size_of::<u32>() as vk::DeviceSize);
         Self::align(bytes, align)
     }
 

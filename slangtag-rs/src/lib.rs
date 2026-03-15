@@ -15,11 +15,11 @@ macro_rules! include_u32 {
         // 1. Get a slice of the bytes to check its length
         const BYTES: &[u8] = include_bytes!($path);
         const LEN: usize = BYTES.len();
-        
+
         // 2. Compile-time assertion: ensure length is divisible by 4
         // If the file is the wrong size, the compiler will hard-stop here.
         const _: () = assert!(
-            LEN % 4 == 0, 
+            LEN % 4 == 0,
             "Included file length must be a multiple of 4 bytes"
         );
 
@@ -32,12 +32,7 @@ macro_rules! include_u32 {
         static ALIGNED_DATA: Aligned<LEN> = Aligned(*include_bytes!($path));
 
         // 5. Safely cast the aligned byte pointer to a u32 slice
-        unsafe {
-            std::slice::from_raw_parts(
-                ALIGNED_DATA.0.as_ptr().cast::<u32>(),
-                LEN / 4,
-            )
-        }
+        unsafe { std::slice::from_raw_parts(ALIGNED_DATA.0.as_ptr().cast::<u32>(), LEN / 4) }
     }};
 }
 

@@ -1,4 +1,5 @@
 use crate::gpu::{BufferMemory, ComputePipeline, DescriptorBuffer, GpuBuffer};
+use crate::sort::RadixSorter;
 use crate::{ComputeDevice, GPUImage, Size, compute_shader_path, include_u32};
 use bytemuck::{Pod, Zeroable};
 use image::{DynamicImage, GrayImage, ImageBuffer};
@@ -82,6 +83,7 @@ pub struct Detector {
     device: ComputeDevice,
     settings: DetectionSettings,
     pipelines: DetectionPipelines,
+    sorter: RadixSorter,
 }
 
 struct DetectionPipelines {
@@ -96,19 +98,16 @@ struct DetectionPipelines {
     blob_diff: Arc<ComputePipeline>,
     count_nonzero_blob_diff_points: Arc<ComputePipeline>,
     filter_nonzero_blob_diff_points: Arc<ComputePipeline>,
-    prepare_blob_diff_points: Arc<ComputePipeline>,
-    bitonic_sort_blob_diff_points: Arc<ComputePipeline>,
+    radix_init_keys_indices: Arc<ComputePipeline>,
+    radix_keys_from_indices: Arc<ComputePipeline>,
+    radix_gather_by_indices: Arc<ComputePipeline>,
     build_blob_pair_extents: Arc<ComputePipeline>,
     filter_blob_pair_extents: Arc<ComputePipeline>,
     rewrite_selected_blob_points_with_theta: Arc<ComputePipeline>,
-    prepare_selected_blob_points: Arc<ComputePipeline>,
-    bitonic_sort_selected_blob_points: Arc<ComputePipeline>,
     build_line_fit_points: Arc<ComputePipeline>,
     fit_line_errors_and_peaks: Arc<ComputePipeline>,
     count_valid_peaks: Arc<ComputePipeline>,
     filter_valid_peaks: Arc<ComputePipeline>,
-    prepare_peaks: Arc<ComputePipeline>,
-    bitonic_sort_peaks: Arc<ComputePipeline>,
     build_peak_extents: Arc<ComputePipeline>,
     fit_quads: Arc<ComputePipeline>,
     prepare_decode_quads: Arc<ComputePipeline>,
@@ -166,13 +165,17 @@ impl DetectionPipelines {
                     "select-filter-nonzero-blob-diff-points"
                 )),
             ),
-            prepare_blob_diff_points: Detector::create_compute_pipeline(
+            radix_init_keys_indices: Detector::create_compute_pipeline(
                 device,
-                include_u32!(compute_shader_path!("sort-prepare-blob-diff-points")),
+                include_u32!(compute_shader_path!("sort-radix-init-keys-indices")),
             ),
-            bitonic_sort_blob_diff_points: Detector::create_compute_pipeline(
+            radix_keys_from_indices: Detector::create_compute_pipeline(
                 device,
-                include_u32!(compute_shader_path!("sort-bitonic-sort-blob-diff-points")),
+                include_u32!(compute_shader_path!("sort-radix-keys-from-indices")),
+            ),
+            radix_gather_by_indices: Detector::create_compute_pipeline(
+                device,
+                include_u32!(compute_shader_path!("sort-radix-gather-by-indices")),
             ),
             build_blob_pair_extents: Detector::create_compute_pipeline(
                 device,
@@ -186,16 +189,6 @@ impl DetectionPipelines {
                 device,
                 include_u32!(compute_shader_path!(
                     "filter-rewrite-selected-blob-points-with-theta"
-                )),
-            ),
-            prepare_selected_blob_points: Detector::create_compute_pipeline(
-                device,
-                include_u32!(compute_shader_path!("sort-prepare-selected-blob-points")),
-            ),
-            bitonic_sort_selected_blob_points: Detector::create_compute_pipeline(
-                device,
-                include_u32!(compute_shader_path!(
-                    "sort-bitonic-sort-selected-blob-points"
                 )),
             ),
             build_line_fit_points: Detector::create_compute_pipeline(
@@ -213,14 +206,6 @@ impl DetectionPipelines {
             filter_valid_peaks: Detector::create_compute_pipeline(
                 device,
                 include_u32!(compute_shader_path!("select-filter-valid-peaks")),
-            ),
-            prepare_peaks: Detector::create_compute_pipeline(
-                device,
-                include_u32!(compute_shader_path!("sort-prepare-peaks")),
-            ),
-            bitonic_sort_peaks: Detector::create_compute_pipeline(
-                device,
-                include_u32!(compute_shader_path!("sort-bitonic-sort-peaks")),
             ),
             build_peak_extents: Detector::create_compute_pipeline(
                 device,
@@ -254,14 +239,6 @@ impl Default for DetectionSettings {
 
 fn is_power_of_two(n: u8) -> bool {
     n != 0 && (n & (n - 1)) == 0
-}
-
-fn next_power_of_two(value: u32) -> u32 {
-    if value <= 1 {
-        1
-    } else {
-        value.next_power_of_two()
-    }
 }
 
 fn dispatch_groups_1d(total_invocations: u32, local_size_x: u32) -> u32 {
@@ -323,17 +300,18 @@ struct TotalPointsPushConstants {
 
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone)]
-struct SortPreparePushConstants {
+struct RadixExtractPushConstants {
     valid_points: u32,
-    total_points: u32,
+    words_per_record: u32,
+    key_word_index: u32,
+    key_transform: u32,
 }
 
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone)]
-struct BitonicSortPushConstants {
-    total_points: u32,
-    j: u32,
-    k: u32,
+struct RadixGatherPushConstants {
+    valid_points: u32,
+    words_per_record: u32,
 }
 
 #[repr(C)]
@@ -434,13 +412,17 @@ impl Detector {
     const APRILTAG_MAX_CORRECTION_BITS: u32 = 0;
     const MAX_ERRONEOUS_BITS_IN_BORDER_RATE: f32 = 0.35;
     const DETECT_INVERTED_MARKER: bool = true;
+    const RADIX_KEY_TRANSFORM_NONE: u32 = 0;
+    const RADIX_KEY_TRANSFORM_F32_ASC: u32 = 1;
 
     pub fn new(device: ComputeDevice, settings: DetectionSettings) -> Self {
         let pipelines = DetectionPipelines::new(&device);
+        let sorter = RadixSorter::new(device.clone());
         Self {
             device,
             settings,
             pipelines,
+            sorter,
         }
     }
 
@@ -523,17 +505,8 @@ impl Detector {
         );
         let blob_diff_filtered_size = self.read_counter(&blob_diff_filter_count);
 
-        let blob_diff_sort_points = next_power_of_two(blob_diff_filtered_size);
-        let blob_diff_sorted = self.new_u32_storage_buffer(
-            usize::max(1, blob_diff_sort_points as usize) * blob_diff_words_per_point,
-        );
-        self.prepare_blob_diff_points(
-            &blob_diff_compacted,
-            &blob_diff_sorted,
-            blob_diff_filtered_size,
-            blob_diff_sort_points,
-        );
-        self.bitonic_sort_blob_diff_points(&blob_diff_sorted, blob_diff_sort_points);
+        let blob_diff_sorted =
+            self.radix_sort_blob_diff_points(&blob_diff_compacted, blob_diff_filtered_size);
 
         let blob_extent_words_per_extent = 11usize;
         let blob_extent = self.new_u32_storage_buffer(
@@ -583,19 +556,9 @@ impl Detector {
             blob_diff_filtered_size,
         );
 
-        let selected_blob_sort_points = next_power_of_two(selected_blob_point_count_value);
-        let selected_blob_sorted_points = self.new_u32_storage_buffer(
-            usize::max(1, selected_blob_sort_points as usize) * selected_blob_point_words_per_point,
-        );
-        self.prepare_selected_blob_points(
+        let selected_blob_sorted_points = self.radix_sort_selected_blob_points(
             &selected_blob_points,
-            &selected_blob_sorted_points,
             selected_blob_point_count_value,
-            selected_blob_sort_points,
-        );
-        self.bitonic_sort_selected_blob_points(
-            &selected_blob_sorted_points,
-            selected_blob_sort_points,
         );
 
         let line_fit_point_words_per_point = 10usize;
@@ -648,16 +611,7 @@ impl Detector {
         }
         let compacted_peak_count_value = self.read_counter(&compacted_peak_count);
 
-        let peak_sort_points = next_power_of_two(compacted_peak_count_value);
-        let sorted_peaks = self
-            .new_u32_storage_buffer(usize::max(1, peak_sort_points as usize) * peak_words_per_peak);
-        self.prepare_peaks(
-            &compacted_peaks,
-            &sorted_peaks,
-            compacted_peak_count_value,
-            peak_sort_points,
-        );
-        self.bitonic_sort_peaks(&sorted_peaks, peak_sort_points);
+        let sorted_peaks = self.radix_sort_peaks(&compacted_peaks, compacted_peak_count_value);
 
         let peak_extent_words_per_extent = 3usize;
         let peak_extents = self.new_u32_storage_buffer(
@@ -1330,65 +1284,20 @@ impl Detector {
         );
     }
 
-    fn prepare_blob_diff_points(
+    fn radix_sort_blob_diff_points(
         &self,
         input: &GpuBuffer<u32>,
-        output: &GpuBuffer<u32>,
         valid_points: u32,
-        total_points: u32,
-    ) {
-        let compute_pipeline = self.pipelines.prepare_blob_diff_points.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, input.clone()),
-                WriteDescriptorSet::buffer(1, output.clone()),
-            ],
-        );
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            SortPreparePushConstants {
-                valid_points,
-                total_points,
-            },
-            [
-                dispatch_groups_1d(total_points, Self::ONE_D_LOCAL_SIZE_X),
-                1,
-                1,
-            ],
-        );
-    }
-
-    fn bitonic_sort_blob_diff_points(&self, points: &GpuBuffer<u32>, total_points: u32) {
-        if total_points <= 1 {
-            return;
-        }
-
-        let compute_pipeline = self.pipelines.bitonic_sort_blob_diff_points.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![WriteDescriptorSet::buffer(0, points.clone())],
-        );
-
-        let mut k = 2;
-        while k <= total_points {
-            let mut j = k / 2;
-            while j > 0 {
-                self.dispatch_with_push_constants(
-                    compute_pipeline.clone(),
-                    descriptor_set.clone(),
-                    BitonicSortPushConstants { total_points, j, k },
-                    [
-                        dispatch_groups_1d(total_points, Self::ONE_D_LOCAL_SIZE_X),
-                        1,
-                        1,
-                    ],
-                );
-                j /= 2;
-            }
-            k *= 2;
-        }
+    ) -> GpuBuffer<u32> {
+        // Existing blob extent construction expects points sorted by (rep1, rep0).
+        self.radix_sort_records_lexicographic(
+            input,
+            valid_points,
+            6,
+            1,
+            0,
+            Self::RADIX_KEY_TRANSFORM_NONE,
+        )
     }
 
     fn build_blob_pair_extents(
@@ -1492,65 +1401,19 @@ impl Detector {
         );
     }
 
-    fn prepare_selected_blob_points(
+    fn radix_sort_selected_blob_points(
         &self,
         input: &GpuBuffer<u32>,
-        output: &GpuBuffer<u32>,
         valid_points: u32,
-        total_points: u32,
-    ) {
-        let compute_pipeline = self.pipelines.prepare_selected_blob_points.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, input.clone()),
-                WriteDescriptorSet::buffer(1, output.clone()),
-            ],
-        );
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            SortPreparePushConstants {
-                valid_points,
-                total_points,
-            },
-            [
-                dispatch_groups_1d(total_points, Self::ONE_D_LOCAL_SIZE_X),
-                1,
-                1,
-            ],
-        );
-    }
-
-    fn bitonic_sort_selected_blob_points(&self, points: &GpuBuffer<u32>, total_points: u32) {
-        if total_points <= 1 {
-            return;
-        }
-
-        let compute_pipeline = self.pipelines.bitonic_sort_selected_blob_points.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![WriteDescriptorSet::buffer(0, points.clone())],
-        );
-
-        let mut k = 2;
-        while k <= total_points {
-            let mut j = k / 2;
-            while j > 0 {
-                self.dispatch_with_push_constants(
-                    compute_pipeline.clone(),
-                    descriptor_set.clone(),
-                    BitonicSortPushConstants { total_points, j, k },
-                    [
-                        dispatch_groups_1d(total_points, Self::ONE_D_LOCAL_SIZE_X),
-                        1,
-                        1,
-                    ],
-                );
-                j /= 2;
-            }
-            k *= 2;
-        }
+    ) -> GpuBuffer<u32> {
+        self.radix_sort_records_lexicographic(
+            input,
+            valid_points,
+            4,
+            0,
+            1,
+            Self::RADIX_KEY_TRANSFORM_NONE,
+        )
     }
 
     fn build_line_fit_points(
@@ -1672,69 +1535,198 @@ impl Detector {
         );
     }
 
-    fn prepare_peaks(
+    fn radix_sort_peaks(&self, input: &GpuBuffer<u32>, valid_peaks: u32) -> GpuBuffer<u32> {
+        // Existing peak extent construction expects peaks sorted by (blob_index, float(error)).
+        self.radix_sort_records_lexicographic(
+            input,
+            valid_peaks,
+            3,
+            0,
+            1,
+            Self::RADIX_KEY_TRANSFORM_F32_ASC,
+        )
+    }
+
+    fn radix_sort_records_lexicographic(
         &self,
         input: &GpuBuffer<u32>,
-        output: &GpuBuffer<u32>,
-        valid_peaks: u32,
-        total_peaks: u32,
+        valid_records: u32,
+        words_per_record: u32,
+        primary_key_word: u32,
+        secondary_key_word: u32,
+        secondary_key_transform: u32,
+    ) -> GpuBuffer<u32> {
+        let output_words = usize::max(1, valid_records as usize * words_per_record as usize);
+        let sorted_records = self.new_u32_storage_buffer(output_words);
+
+        if valid_records == 0 {
+            return sorted_records;
+        }
+
+        if valid_records == 1 {
+            let bytes = (words_per_record as ash::vk::DeviceSize)
+                * (std::mem::size_of::<u32>() as ash::vk::DeviceSize);
+            self.device
+                .copy_buffer_region(input, 0, &sorted_records, 0, bytes);
+            return sorted_records;
+        }
+
+        let sort_keys = self.new_u32_storage_buffer(valid_records as usize);
+        let sorted_indices = self.new_u32_storage_buffer(valid_records as usize);
+
+        self.radix_init_keys_and_indices(
+            input,
+            &sort_keys,
+            &sorted_indices,
+            valid_records,
+            words_per_record,
+            secondary_key_word,
+            secondary_key_transform,
+        );
+
+        let sort_storage = self.sorter.create_key_value_storage_buffer(valid_records);
+        self.sorter.cmd_sort_key_value(
+            valid_records,
+            &sort_keys,
+            0,
+            &sorted_indices,
+            0,
+            &sort_storage,
+            0,
+        );
+
+        self.radix_update_keys_from_indices(
+            input,
+            &sorted_indices,
+            &sort_keys,
+            valid_records,
+            words_per_record,
+            primary_key_word,
+            Self::RADIX_KEY_TRANSFORM_NONE,
+        );
+        self.sorter.cmd_sort_key_value(
+            valid_records,
+            &sort_keys,
+            0,
+            &sorted_indices,
+            0,
+            &sort_storage,
+            0,
+        );
+
+        self.radix_gather_records_by_indices(
+            input,
+            &sorted_indices,
+            &sorted_records,
+            valid_records,
+            words_per_record,
+        );
+
+        sorted_records
+    }
+
+    fn radix_init_keys_and_indices(
+        &self,
+        input_records: &GpuBuffer<u32>,
+        keys_out: &GpuBuffer<u32>,
+        indices_out: &GpuBuffer<u32>,
+        valid_points: u32,
+        words_per_record: u32,
+        key_word_index: u32,
+        key_transform: u32,
     ) {
-        let compute_pipeline = self.pipelines.prepare_peaks.clone();
+        let compute_pipeline = self.pipelines.radix_init_keys_indices.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
             vec![
-                WriteDescriptorSet::buffer(0, input.clone()),
-                WriteDescriptorSet::buffer(1, output.clone()),
+                WriteDescriptorSet::buffer(0, input_records.clone()),
+                WriteDescriptorSet::buffer(1, keys_out.clone()),
+                WriteDescriptorSet::buffer(2, indices_out.clone()),
             ],
         );
         self.dispatch_with_push_constants(
             compute_pipeline,
             descriptor_set,
-            SortPreparePushConstants {
-                valid_points: valid_peaks,
-                total_points: total_peaks,
+            RadixExtractPushConstants {
+                valid_points,
+                words_per_record,
+                key_word_index,
+                key_transform,
             },
             [
-                dispatch_groups_1d(total_peaks, Self::ONE_D_LOCAL_SIZE_X),
+                dispatch_groups_1d(valid_points, Self::ONE_D_LOCAL_SIZE_X),
                 1,
                 1,
             ],
         );
     }
 
-    fn bitonic_sort_peaks(&self, peaks: &GpuBuffer<u32>, total_peaks: u32) {
-        if total_peaks <= 1 {
-            return;
-        }
-
-        let compute_pipeline = self.pipelines.bitonic_sort_peaks.clone();
+    fn radix_update_keys_from_indices(
+        &self,
+        input_records: &GpuBuffer<u32>,
+        sorted_indices: &GpuBuffer<u32>,
+        keys_out: &GpuBuffer<u32>,
+        valid_points: u32,
+        words_per_record: u32,
+        key_word_index: u32,
+        key_transform: u32,
+    ) {
+        let compute_pipeline = self.pipelines.radix_keys_from_indices.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
-            vec![WriteDescriptorSet::buffer(0, peaks.clone())],
+            vec![
+                WriteDescriptorSet::buffer(0, input_records.clone()),
+                WriteDescriptorSet::buffer(1, sorted_indices.clone()),
+                WriteDescriptorSet::buffer(2, keys_out.clone()),
+            ],
         );
+        self.dispatch_with_push_constants(
+            compute_pipeline,
+            descriptor_set,
+            RadixExtractPushConstants {
+                valid_points,
+                words_per_record,
+                key_word_index,
+                key_transform,
+            },
+            [
+                dispatch_groups_1d(valid_points, Self::ONE_D_LOCAL_SIZE_X),
+                1,
+                1,
+            ],
+        );
+    }
 
-        let mut k = 2;
-        while k <= total_peaks {
-            let mut j = k / 2;
-            while j > 0 {
-                self.dispatch_with_push_constants(
-                    compute_pipeline.clone(),
-                    descriptor_set.clone(),
-                    BitonicSortPushConstants {
-                        total_points: total_peaks,
-                        j,
-                        k,
-                    },
-                    [
-                        dispatch_groups_1d(total_peaks, Self::ONE_D_LOCAL_SIZE_X),
-                        1,
-                        1,
-                    ],
-                );
-                j /= 2;
-            }
-            k *= 2;
-        }
+    fn radix_gather_records_by_indices(
+        &self,
+        input_records: &GpuBuffer<u32>,
+        sorted_indices: &GpuBuffer<u32>,
+        output_records: &GpuBuffer<u32>,
+        valid_points: u32,
+        words_per_record: u32,
+    ) {
+        let compute_pipeline = self.pipelines.radix_gather_by_indices.clone();
+        let descriptor_set = self.create_descriptor_set(
+            &compute_pipeline,
+            vec![
+                WriteDescriptorSet::buffer(0, input_records.clone()),
+                WriteDescriptorSet::buffer(1, sorted_indices.clone()),
+                WriteDescriptorSet::buffer(2, output_records.clone()),
+            ],
+        );
+        self.dispatch_with_push_constants(
+            compute_pipeline,
+            descriptor_set,
+            RadixGatherPushConstants {
+                valid_points,
+                words_per_record,
+            },
+            [
+                dispatch_groups_1d(valid_points, Self::ONE_D_LOCAL_SIZE_X),
+                1,
+                1,
+            ],
+        );
     }
 
     fn build_peak_extents(
