@@ -1,4 +1,4 @@
-use crate::gpu::{BufferMemory, ComputePipeline, DescriptorBuffer, GpuBuffer};
+use crate::gpu::{BufferMemory, CommandRecorder, ComputePipeline, DescriptorBuffer, GpuBuffer};
 use crate::sort::RadixSorter;
 use crate::{ComputeDevice, GPUImage, Size, compute_shader_path, include_u32};
 use bytemuck::{Pod, Zeroable};
@@ -134,7 +134,6 @@ struct DetectionPipelines {
     ccl_merge: Arc<ComputePipeline>,
     ccl_final_labeling: Arc<ComputePipeline>,
     blob_diff: Arc<ComputePipeline>,
-    count_nonzero_blob_diff_points: Arc<ComputePipeline>,
     filter_nonzero_blob_diff_points: Arc<ComputePipeline>,
     radix_init_keys_indices: Arc<ComputePipeline>,
     radix_keys_from_indices: Arc<ComputePipeline>,
@@ -144,8 +143,6 @@ struct DetectionPipelines {
     rewrite_selected_blob_points_with_theta: Arc<ComputePipeline>,
     build_line_fit_points: Arc<ComputePipeline>,
     fit_line_errors_and_peaks: Arc<ComputePipeline>,
-    count_valid_peaks: Arc<ComputePipeline>,
-    filter_valid_peaks: Arc<ComputePipeline>,
     build_peak_extents: Arc<ComputePipeline>,
     fit_quads: Arc<ComputePipeline>,
     prepare_decode_quads: Arc<ComputePipeline>,
@@ -191,12 +188,6 @@ impl DetectionPipelines {
                 device,
                 include_u32!(compute_shader_path!("blob-blob-diff")),
             ),
-            count_nonzero_blob_diff_points: Detector::create_compute_pipeline(
-                device,
-                include_u32!(compute_shader_path!(
-                    "select-count-nonzero-blob-diff-points"
-                )),
-            ),
             filter_nonzero_blob_diff_points: Detector::create_compute_pipeline(
                 device,
                 include_u32!(compute_shader_path!(
@@ -236,14 +227,6 @@ impl DetectionPipelines {
             fit_line_errors_and_peaks: Detector::create_compute_pipeline(
                 device,
                 include_u32!(compute_shader_path!("filter-fit-line-errors-and-peaks")),
-            ),
-            count_valid_peaks: Detector::create_compute_pipeline(
-                device,
-                include_u32!(compute_shader_path!("select-count-valid-peaks")),
-            ),
-            filter_valid_peaks: Detector::create_compute_pipeline(
-                device,
-                include_u32!(compute_shader_path!("select-filter-valid-peaks")),
             ),
             build_peak_extents: Detector::create_compute_pipeline(
                 device,
@@ -542,28 +525,30 @@ impl Detector {
 
         let decimated_image = match self.settings.decimate {
             Some(factor) => {
-                let new_img = self.decimate(&input_gpu_image, factor);
-                new_img
+                let decimated_size = crate::Size::new(
+                    input_gpu_image.size.width / factor as u32,
+                    input_gpu_image.size.height / factor as u32,
+                );
+                let decimated_image_buffer =
+                    self.new_u8_storage_buffer(decimated_size.total_pixels());
+                GPUImage::new(self.device.clone(), decimated_image_buffer, decimated_size)
             }
             None => input_gpu_image.clone(),
         };
 
-        let (minmax_image, minmax_size) = self.minmax(&decimated_image);
-        let filtered_minmax_image = self.filter_minmax(&minmax_image, minmax_size);
-        let thresholded_image = self.threshold(
-            &decimated_image,
-            &filtered_minmax_image,
-            minmax_size,
-            self.settings.min_white_black_diff,
+        let minmax_size = Size::new(decimated_image.size.width / 4, decimated_image.size.height / 4);
+        let minmax_image = self.new_u8_storage_buffer(minmax_size.total_pixels() * 2);
+        let filtered_minmax_image = self.new_u8_storage_buffer(minmax_size.total_pixels() * 2);
+        let thresholded_image_buffer =
+            self.new_u8_storage_buffer(decimated_image.size.total_pixels());
+        let thresholded_image = GPUImage::new(
+            self.device.clone(),
+            thresholded_image_buffer,
+            decimated_image.size,
         );
-        let labels = self.ccl_init(&thresholded_image);
-        self.ccl_compression(&labels, thresholded_image.size);
-        self.ccl_merge(&labels, thresholded_image.size);
-        self.ccl_compression(&labels, thresholded_image.size);
-
+        let labels = self.new_u32_storage_buffer(thresholded_image.size.total_pixels());
         let union_markers_size =
             self.new_zeroed_u32_storage_buffer(thresholded_image.size.total_pixels());
-        self.ccl_final_labeling(&labels, &union_markers_size, thresholded_image.size);
 
         let blob_diff_words_per_point = 6usize;
         let blob_diff_points_per_offset = (thresholded_image.size.width as usize - 2)
@@ -571,53 +556,183 @@ impl Detector {
         let blob_diff_total_points = (blob_diff_points_per_offset * 4) as u32;
         let blob_diff_out = self
             .new_u32_storage_buffer(blob_diff_total_points as usize * blob_diff_words_per_point);
-        self.blob_diff(
-            &thresholded_image,
-            &labels,
-            &union_markers_size,
-            &blob_diff_out,
-            self.settings.min_blob_size,
-        );
-
-        let blob_diff_count = self.new_zeroed_u32_counter_buffer();
-        self.count_nonzero_blob_diff_points(
-            &blob_diff_out,
-            &blob_diff_count,
-            blob_diff_total_points,
-        );
-        let blob_diff_compacted_size = self.read_counter(&blob_diff_count);
-
-        let blob_diff_compacted = self.new_u32_storage_buffer(
-            usize::max(1, blob_diff_compacted_size as usize) * blob_diff_words_per_point,
-        );
+        let blob_diff_compacted = self
+            .new_u32_storage_buffer(blob_diff_total_points as usize * blob_diff_words_per_point);
         let blob_diff_filter_count = self.new_zeroed_u32_counter_buffer();
-        self.filter_nonzero_blob_diff_points(
-            &blob_diff_out,
-            &blob_diff_compacted,
-            &blob_diff_filter_count,
-            blob_diff_total_points,
-        );
-        let blob_diff_filtered_size = self.read_counter(&blob_diff_filter_count);
 
+        // Phase 1: threshold/CCL/blob-diff and direct compaction into oversized output.
+        self.device.run_commands(|commands| {
+            if self.settings.decimate.is_some() {
+                let decimate_pipeline = &self.pipelines.decimate;
+                self.dispatch_with_push_constants_recorded(
+                    commands,
+                    decimate_pipeline,
+                    &[
+                        (0, input_gpu_image.image.descriptor()),
+                        (1, decimated_image.image.descriptor()),
+                    ],
+                    DecimatePushConstants {
+                        input_size: input_gpu_image.size,
+                        decimated_size: decimated_image.size,
+                    },
+                    [input_gpu_image.size.width, input_gpu_image.size.height, 1],
+                );
+                commands.barrier_shader_write_to_shader_read();
+            }
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.minmax,
+                &[
+                    (0, decimated_image.image.descriptor()),
+                    (1, minmax_image.descriptor()),
+                ],
+                MinmaxPushConstants {
+                    input_size: decimated_image.size,
+                    minmax_size,
+                },
+                [minmax_size.width, minmax_size.height, 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.filter_minmax,
+                &[(0, minmax_image.descriptor()), (1, filtered_minmax_image.descriptor())],
+                FilterMinmaxPushConstants {
+                    minmax_size,
+                    filtered_size: minmax_size,
+                },
+                [minmax_size.width, minmax_size.height, 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.threshold,
+                &[
+                    (0, decimated_image.image.descriptor()),
+                    (1, filtered_minmax_image.descriptor()),
+                    (2, thresholded_image.image.descriptor()),
+                ],
+                ThresholdPushConstants {
+                    decimated_size: decimated_image.size,
+                    filtered_size: minmax_size,
+                    thresholded_size: decimated_image.size,
+                    min_white_black_diff: self.settings.min_white_black_diff as u32,
+                },
+                [thresholded_image.size.width, thresholded_image.size.height, 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.ccl_init,
+                &[
+                    (0, thresholded_image.image.descriptor()),
+                    (1, labels.descriptor()),
+                ],
+                CclPushConstants {
+                    image_size: thresholded_image.size,
+                },
+                [thresholded_image.size.width / 2, thresholded_image.size.height / 2, 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.ccl_compression,
+                &[(0, labels.descriptor())],
+                CclPushConstants {
+                    image_size: thresholded_image.size,
+                },
+                [thresholded_image.size.width / 2, thresholded_image.size.height / 2, 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.ccl_merge,
+                &[(0, labels.descriptor())],
+                CclPushConstants {
+                    image_size: thresholded_image.size,
+                },
+                [thresholded_image.size.width / 2, thresholded_image.size.height / 2, 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.ccl_compression,
+                &[(0, labels.descriptor())],
+                CclPushConstants {
+                    image_size: thresholded_image.size,
+                },
+                [thresholded_image.size.width / 2, thresholded_image.size.height / 2, 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.ccl_final_labeling,
+                &[
+                    (0, labels.descriptor()),
+                    (1, union_markers_size.descriptor()),
+                ],
+                CclPushConstants {
+                    image_size: thresholded_image.size,
+                },
+                [thresholded_image.size.width / 2, thresholded_image.size.height / 2, 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.blob_diff,
+                &[
+                    (0, thresholded_image.image.descriptor()),
+                    (1, labels.descriptor()),
+                    (2, union_markers_size.descriptor()),
+                    (3, blob_diff_out.descriptor()),
+                ],
+                BlobDiffPushConstants {
+                    thresholded_size: thresholded_image.size,
+                    min_blob_size: self.settings.min_blob_size,
+                },
+                [thresholded_image.size.width, thresholded_image.size.height, 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.filter_nonzero_blob_diff_points,
+                &[
+                    (0, blob_diff_out.descriptor()),
+                    (1, blob_diff_compacted.descriptor()),
+                    (2, blob_diff_filter_count.descriptor()),
+                ],
+                TotalPointsPushConstants {
+                    total_points: blob_diff_total_points,
+                },
+                [
+                    dispatch_groups_1d(blob_diff_total_points, Self::ONE_D_LOCAL_SIZE_X),
+                    1,
+                    1,
+                ],
+            );
+        });
+
+        let blob_diff_filtered_size = self.read_counter(&blob_diff_filter_count);
         let blob_diff_sorted =
             self.radix_sort_blob_diff_points(&blob_diff_compacted, blob_diff_filtered_size);
 
         let blob_extent_words_per_extent = 11usize;
-        let blob_extent = self.new_u32_storage_buffer(
-            usize::max(1, blob_diff_filtered_size as usize) * blob_extent_words_per_extent,
-        );
+        let blob_extent_capacity = usize::max(1, blob_diff_filtered_size as usize);
+        let blob_extent =
+            self.new_u32_storage_buffer(blob_extent_capacity * blob_extent_words_per_extent);
+        let filtered_blob_extent =
+            self.new_u32_storage_buffer(blob_extent_capacity * blob_extent_words_per_extent);
         let blob_extent_count = self.new_zeroed_u32_counter_buffer();
-        self.build_blob_pair_extents(
-            &blob_diff_sorted,
-            &blob_extent,
-            &blob_extent_count,
-            blob_diff_filtered_size,
-        );
-        let blob_extent_count_value = self.read_counter(&blob_extent_count);
-
-        let filtered_blob_extent = self.new_u32_storage_buffer(
-            usize::max(1, blob_extent_count_value as usize) * blob_extent_words_per_extent,
-        );
         let selected_blob_extent_count = self.new_zeroed_u32_counter_buffer();
         let selected_blob_point_count = self.new_zeroed_u32_counter_buffer();
         let blob_pair_filter = self.settings.blob_pair_filter;
@@ -626,19 +741,55 @@ impl Detector {
             blob_pair_filter.max_cluster_pixels_perimeter_scale
                 * (thresholded_image.size.width + thresholded_image.size.height),
         );
-        self.filter_blob_pair_extents(
-            &blob_extent,
-            &filtered_blob_extent,
-            &selected_blob_extent_count,
-            &selected_blob_point_count,
-            blob_extent_count_value,
-            blob_pair_filter.tag_width,
-            blob_pair_filter.reversed_border,
-            blob_pair_filter.normal_border,
-            blob_pair_filter.min_cluster_pixels,
-            max_cluster_pixels,
-        );
-        let _selected_blob_extent_count_value = self.read_counter(&selected_blob_extent_count);
+
+        // Phase 2: extent construction and extent filtering.
+        self.device.run_commands(|commands| {
+            commands.fill_buffer_u32_range(&blob_extent, 0, blob_extent.byte_size(), 0);
+            commands.fill_buffer_u32_range(
+                &filtered_blob_extent,
+                0,
+                filtered_blob_extent.byte_size(),
+                0,
+            );
+            commands.barrier_transfer_write_to_compute_read();
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.build_blob_pair_extents,
+                &[
+                    (0, blob_diff_sorted.descriptor()),
+                    (1, blob_extent.descriptor()),
+                    (2, blob_extent_count.descriptor()),
+                ],
+                TotalPointsPushConstants {
+                    total_points: blob_diff_filtered_size,
+                },
+                [1, 1, 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.filter_blob_pair_extents,
+                &[
+                    (0, blob_extent.descriptor()),
+                    (1, filtered_blob_extent.descriptor()),
+                    (2, selected_blob_extent_count.descriptor()),
+                    (3, selected_blob_point_count.descriptor()),
+                ],
+                FilterBlobPairExtentsPushConstants {
+                    extent_count: blob_diff_filtered_size,
+                    tag_width: blob_pair_filter.tag_width,
+                    reversed_border: blob_pair_filter.reversed_border,
+                    normal_border: blob_pair_filter.normal_border,
+                    min_cluster_pixels: blob_pair_filter.min_cluster_pixels,
+                    max_cluster_pixels,
+                },
+                [1, 1, 1],
+            );
+        });
+
+        let blob_extent_count_value = self.read_counter(&blob_extent_count);
         let selected_blob_point_count_value = self.read_counter(&selected_blob_point_count);
 
         let selected_blob_point_words_per_point = 4usize;
@@ -665,14 +816,6 @@ impl Detector {
             usize::max(1, selected_blob_point_count_value as usize)
                 * line_fit_point_words_per_point,
         );
-        self.build_line_fit_points(
-            &selected_blob_sorted_points,
-            &decimated_image,
-            &line_fit_points,
-            selected_blob_point_count_value,
-            decimate_factor,
-        );
-
         let errs =
             self.new_u32_storage_buffer(usize::max(1, selected_blob_point_count_value as usize));
         let filtered_errs =
@@ -681,108 +824,178 @@ impl Detector {
         let peaks = self.new_u32_storage_buffer(
             usize::max(1, selected_blob_point_count_value as usize) * peak_words_per_peak,
         );
-        self.fit_line_errors_and_peaks(
-            &line_fit_points,
-            &filtered_blob_extent,
-            &errs,
-            &filtered_errs,
-            &peaks,
-            blob_extent_count_value,
-            selected_blob_point_count_value,
-        );
-
-        let peak_count = self.new_zeroed_u32_counter_buffer();
-        if selected_blob_point_count_value > 0 {
-            self.count_valid_peaks(&peaks, &peak_count, selected_blob_point_count_value);
-        }
-        let peak_count_value = self.read_counter(&peak_count);
-
-        let compacted_peaks = self
-            .new_u32_storage_buffer(usize::max(1, peak_count_value as usize) * peak_words_per_peak);
-        let compacted_peak_count = self.new_zeroed_u32_counter_buffer();
-        if selected_blob_point_count_value > 0 {
-            self.filter_valid_peaks(
-                &peaks,
-                &compacted_peaks,
-                &compacted_peak_count,
-                selected_blob_point_count_value,
-            );
-        }
-        let compacted_peak_count_value = self.read_counter(&compacted_peak_count);
-
-        let sorted_peaks = self.radix_sort_peaks(&compacted_peaks, compacted_peak_count_value);
-
         let peak_extent_words_per_extent = 3usize;
-        let peak_extents = self.new_u32_storage_buffer(
-            usize::max(1, compacted_peak_count_value as usize) * peak_extent_words_per_extent,
-        );
+        let peak_extent_capacity = usize::max(1, selected_blob_point_count_value as usize);
+        let peak_extents =
+            self.new_u32_storage_buffer(peak_extent_capacity * peak_extent_words_per_extent);
         let peak_extent_count = self.new_zeroed_u32_counter_buffer();
-        self.build_peak_extents(
-            &sorted_peaks,
-            &peak_extents,
-            &peak_extent_count,
-            compacted_peak_count_value,
-        );
-        let peak_extent_count_value = self.read_counter(&peak_extent_count);
 
         let fitted_quad_words_per_quad = 15usize;
-        let fitted_quads = self.new_u32_storage_buffer(
-            usize::max(1, peak_extent_count_value as usize) * fitted_quad_words_per_quad,
-        );
+        let max_quad_capacity = usize::max(1, selected_blob_point_count_value as usize);
+        let fitted_quads = self.new_u32_storage_buffer(max_quad_capacity * fitted_quad_words_per_quad);
         let fitted_quad_count = self.new_zeroed_u32_counter_buffer();
-        self.fit_quads(
-            &sorted_peaks,
-            &peak_extents,
-            &line_fit_points,
-            &filtered_blob_extent,
-            &fitted_quads,
-            &fitted_quad_count,
-            peak_extent_count_value,
-            blob_extent_count_value,
-            min_tag_width,
-            decimate_factor as f32,
-        );
+
+        let quad_param_words_per_quad = 12usize;
+        let quad_params = self.new_u32_storage_buffer(max_quad_capacity * quad_param_words_per_quad);
+        let bits_count_oversized = max_quad_capacity * 8usize * 8usize;
+        let bits = self.new_u32_storage_buffer(usize::max(1, bits_count_oversized));
+
+        // Phase 3: point rewrite/fit, peak grouping, quad fit, and decode prep/extract.
+        self.device.run_commands(|commands| {
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.build_line_fit_points,
+                &[
+                    (0, selected_blob_sorted_points.descriptor()),
+                    (1, decimated_image.image.descriptor()),
+                    (2, line_fit_points.descriptor()),
+                ],
+                BuildLineFitPointsPushConstants {
+                    decimated_size: decimated_image.size,
+                    point_count: selected_blob_point_count_value,
+                    decimate: decimate_factor,
+                },
+                [1, 1, 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.fit_line_errors_and_peaks,
+                &[
+                    (0, line_fit_points.descriptor()),
+                    (1, filtered_blob_extent.descriptor()),
+                    (2, errs.descriptor()),
+                    (3, filtered_errs.descriptor()),
+                    (4, peaks.descriptor()),
+                ],
+                FitLineErrorsAndPeaksPushConstants {
+                    extent_count: blob_extent_count_value,
+                    point_count: selected_blob_point_count_value,
+                },
+                [1, 1, 1],
+            );
+        });
+
+        let sorted_peaks = self.radix_sort_peaks(&peaks, selected_blob_point_count_value);
+
+        self.device.run_commands(|commands| {
+            commands.fill_buffer_u32_range(&peak_extents, 0, peak_extents.byte_size(), 0);
+            commands.fill_buffer_u32_range(&fitted_quads, 0, fitted_quads.byte_size(), 0);
+            commands.barrier_transfer_write_to_compute_read();
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.build_peak_extents,
+                &[
+                    (0, sorted_peaks.descriptor()),
+                    (1, peak_extents.descriptor()),
+                    (2, peak_extent_count.descriptor()),
+                ],
+                TotalPointsPushConstants {
+                    total_points: selected_blob_point_count_value,
+                },
+                [1, 1, 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.fit_quads,
+                &[
+                    (0, sorted_peaks.descriptor()),
+                    (1, peak_extents.descriptor()),
+                    (2, line_fit_points.descriptor()),
+                    (3, filtered_blob_extent.descriptor()),
+                    (4, fitted_quads.descriptor()),
+                    (5, fitted_quad_count.descriptor()),
+                ],
+                FitQuadsPushConstants {
+                    peak_extent_count: selected_blob_point_count_value,
+                    filtered_blob_extent_count: blob_extent_count_value,
+                    max_nmaxima: self.settings.quad_fit.max_nmaxima,
+                    max_line_fit_mse: self.settings.quad_fit.max_line_fit_mse,
+                    cos_critical_rad: self.settings.quad_fit.cos_critical_rad,
+                    min_tag_width,
+                    quad_decimate: decimate_factor as f32,
+                },
+                [
+                    dispatch_groups_1d(selected_blob_point_count_value, Self::ONE_D_LOCAL_SIZE_X),
+                    1,
+                    1,
+                ],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.prepare_decode_quads,
+                &[
+                    (0, input_gpu_image.image.descriptor()),
+                    (1, fitted_quads.descriptor()),
+                    (2, quad_params.descriptor()),
+                ],
+                PrepareDecodeQuadsPushConstants {
+                    image_size: input_gpu_image.size,
+                    quad_count: selected_blob_point_count_value,
+                    marker_size_with_borders: Self::MARKER_SIZE_WITH_BORDERS as u32,
+                    cell_size: self.settings.decode.cell_size,
+                    min_stddev_otsu: self.settings.decode.min_stddev_otsu,
+                },
+                [
+                    dispatch_groups_1d(selected_blob_point_count_value, Self::ONE_D_LOCAL_SIZE_X),
+                    1,
+                    1,
+                ],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded(
+                commands,
+                &self.pipelines.extract_candidate_bits,
+                &[
+                    (0, input_gpu_image.image.descriptor()),
+                    (1, quad_params.descriptor()),
+                    (2, bits.descriptor()),
+                ],
+                ExtractCandidateBitsPushConstants {
+                    image_size: input_gpu_image.size,
+                    quad_count: selected_blob_point_count_value,
+                    marker_size_with_borders: Self::MARKER_SIZE_WITH_BORDERS as u32,
+                    cell_size: self.settings.decode.cell_size,
+                    cell_margin_pixels: self.settings.decode.cell_margin_pixels,
+                    cell_span: self.settings.decode.cell_span,
+                },
+                [
+                    dispatch_groups_1d(
+                        selected_blob_point_count_value.saturating_mul(
+                            (Self::MARKER_SIZE_WITH_BORDERS * Self::MARKER_SIZE_WITH_BORDERS)
+                                as u32,
+                        ),
+                        Self::ONE_D_LOCAL_SIZE_X,
+                    ),
+                    1,
+                    1,
+                ],
+            );
+        });
+
         let fitted_quad_count_value = self.read_counter(&fitted_quad_count);
-        let mut detected_tags = Vec::new();
-
-        if fitted_quad_count_value > 0 {
-            let quad_param_words_per_quad = 12usize;
-            let quad_params = self.new_u32_storage_buffer(
-                usize::max(1, fitted_quad_count_value as usize) * quad_param_words_per_quad,
-            );
-            self.prepare_decode_quads(
-                &input_gpu_image,
-                &fitted_quads,
-                &quad_params,
-                fitted_quad_count_value,
-                Self::MARKER_SIZE_WITH_BORDERS as u32,
-                self.settings.decode.cell_size,
-                self.settings.decode.min_stddev_otsu,
-            );
-
-            let bits_count = fitted_quad_count_value as usize * 8usize * 8usize;
-            let bits = self.new_u32_storage_buffer(usize::max(1, bits_count));
-            self.extract_candidate_bits(
-                &input_gpu_image,
-                &quad_params,
-                &bits,
-                fitted_quad_count_value,
-                Self::MARKER_SIZE_WITH_BORDERS as u32,
-                self.settings.decode.cell_size,
-                self.settings.decode.cell_margin_pixels,
-                self.settings.decode.cell_span,
-            );
-
-            let fitted_quad_words = self.download_u32_buffer(
-                &fitted_quads,
-                fitted_quad_count_value as usize * fitted_quad_words_per_quad,
-            );
-            let bits_words = self.download_u32_buffer(&bits, bits_count);
-            detected_tags =
-                self.build_detected_tags(&fitted_quad_words, fitted_quad_count_value, &bits_words);
+        if fitted_quad_count_value == 0 {
+            return Ok(Vec::new());
         }
 
-        Ok(detected_tags)
+        let fitted_quad_words = self.download_u32_buffer(
+            &fitted_quads,
+            fitted_quad_count_value as usize * fitted_quad_words_per_quad,
+        );
+        let bits_words =
+            self.download_u32_buffer(&bits, fitted_quad_count_value as usize * 8usize * 8usize);
+        Ok(self.build_detected_tags(
+            &fitted_quad_words,
+            fitted_quad_count_value,
+            &bits_words,
+        ))
     }
 
     fn build_detected_tags(
@@ -1013,6 +1226,22 @@ impl Detector {
         );
     }
 
+    fn dispatch_with_push_constants_recorded<T: Pod + Copy>(
+        &self,
+        commands: &mut CommandRecorder<'_>,
+        compute_pipeline: &Arc<ComputePipeline>,
+        bindings: &[(u32, DescriptorBuffer)],
+        push_constants: T,
+        dispatch: [u32; 3],
+    ) {
+        commands.dispatch_with_push_constants(
+            compute_pipeline.as_ref(),
+            bindings,
+            &push_constants,
+            dispatch,
+        );
+    }
+
     fn new_u8_storage_buffer(&self, len: usize) -> GpuBuffer<u8> {
         self.device.create_buffer(
             len,
@@ -1070,305 +1299,6 @@ impl Detector {
         destination.read(len)
     }
 
-    fn decimate(&self, image: &GPUImage<u8>, factor: u8) -> GPUImage<u8> {
-        let compute_pipeline = self.pipelines.decimate.clone();
-
-        let decimated_size = crate::Size::new(
-            image.size.width / factor as u32,
-            image.size.height / factor as u32,
-        );
-        let decimated_image_buffer = self.new_u8_storage_buffer(decimated_size.total_pixels());
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, image.image.clone()),
-                WriteDescriptorSet::buffer(1, decimated_image_buffer.clone()),
-            ],
-        );
-
-        let push_constants = DecimatePushConstants {
-            input_size: image.size,
-            decimated_size,
-        };
-
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            push_constants,
-            [image.size.width, image.size.height, 1],
-        );
-
-        GPUImage::new(self.device.clone(), decimated_image_buffer, decimated_size)
-    }
-
-    fn minmax(&self, decimated_image: &GPUImage<u8>) -> (GpuBuffer<u8>, Size) {
-        let compute_pipeline = self.pipelines.minmax.clone();
-
-        let minmax_size = Size::new(
-            decimated_image.size.width / 4,
-            decimated_image.size.height / 4,
-        );
-        let minmax_image = self.new_u8_storage_buffer(minmax_size.total_pixels() * 2);
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, decimated_image.image.clone()),
-                WriteDescriptorSet::buffer(1, minmax_image.clone()),
-            ],
-        );
-
-        let push_constants = MinmaxPushConstants {
-            input_size: decimated_image.size,
-            minmax_size,
-        };
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            push_constants,
-            [minmax_size.width, minmax_size.height, 1],
-        );
-
-        (minmax_image, minmax_size)
-    }
-
-    fn filter_minmax(&self, minmax_image: &GpuBuffer<u8>, minmax_size: Size) -> GpuBuffer<u8> {
-        let compute_pipeline = self.pipelines.filter_minmax.clone();
-
-        let filtered_image = self.new_u8_storage_buffer(minmax_size.total_pixels() * 2);
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, minmax_image.clone()),
-                WriteDescriptorSet::buffer(1, filtered_image.clone()),
-            ],
-        );
-
-        let push_constants = FilterMinmaxPushConstants {
-            minmax_size,
-            filtered_size: minmax_size,
-        };
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            push_constants,
-            [minmax_size.width, minmax_size.height, 1],
-        );
-
-        filtered_image
-    }
-
-    fn threshold(
-        &self,
-        decimated_image: &GPUImage<u8>,
-        filtered_minmax_image: &GpuBuffer<u8>,
-        filtered_size: Size,
-        min_white_black_diff: u8,
-    ) -> GPUImage<u8> {
-        let compute_pipeline = self.pipelines.threshold.clone();
-
-        let thresholded_size = decimated_image.size;
-        let thresholded_image = self.new_u8_storage_buffer(thresholded_size.total_pixels());
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, decimated_image.image.clone()),
-                WriteDescriptorSet::buffer(1, filtered_minmax_image.clone()),
-                WriteDescriptorSet::buffer(2, thresholded_image.clone()),
-            ],
-        );
-
-        let push_constants = ThresholdPushConstants {
-            decimated_size: decimated_image.size,
-            filtered_size,
-            thresholded_size,
-            min_white_black_diff: min_white_black_diff as u32,
-        };
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            push_constants,
-            [thresholded_size.width, thresholded_size.height, 1],
-        );
-
-        GPUImage::new(self.device.clone(), thresholded_image, thresholded_size)
-    }
-
-    fn ccl_init(&self, thresholded_image: &GPUImage<u8>) -> GpuBuffer<u32> {
-        let compute_pipeline = self.pipelines.ccl_init.clone();
-
-        let labels = self.new_u32_storage_buffer(thresholded_image.size.total_pixels());
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, thresholded_image.image.clone()),
-                WriteDescriptorSet::buffer(1, labels.clone()),
-            ],
-        );
-
-        let push_constants = CclPushConstants {
-            image_size: thresholded_image.size,
-        };
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            push_constants,
-            [
-                thresholded_image.size.width / 2,
-                thresholded_image.size.height / 2,
-                1,
-            ],
-        );
-
-        labels
-    }
-
-    fn ccl_compression(&self, labels: &GpuBuffer<u32>, image_size: Size) {
-        let compute_pipeline = self.pipelines.ccl_compression.clone();
-
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![WriteDescriptorSet::buffer(0, labels.clone())],
-        );
-
-        let push_constants = CclPushConstants { image_size };
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            push_constants,
-            [image_size.width / 2, image_size.height / 2, 1],
-        );
-    }
-
-    fn ccl_merge(&self, labels: &GpuBuffer<u32>, image_size: Size) {
-        let compute_pipeline = self.pipelines.ccl_merge.clone();
-
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![WriteDescriptorSet::buffer(0, labels.clone())],
-        );
-
-        let push_constants = CclPushConstants { image_size };
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            push_constants,
-            [image_size.width / 2, image_size.height / 2, 1],
-        );
-    }
-
-    fn ccl_final_labeling(
-        &self,
-        labels: &GpuBuffer<u32>,
-        union_markers_size: &GpuBuffer<u32>,
-        image_size: Size,
-    ) {
-        let compute_pipeline = self.pipelines.ccl_final_labeling.clone();
-
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, labels.clone()),
-                WriteDescriptorSet::buffer(1, union_markers_size.clone()),
-            ],
-        );
-
-        let push_constants = CclPushConstants { image_size };
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            push_constants,
-            [image_size.width / 2, image_size.height / 2, 1],
-        );
-    }
-
-    fn blob_diff(
-        &self,
-        thresholded_image: &GPUImage<u8>,
-        labels: &GpuBuffer<u32>,
-        union_markers_size: &GpuBuffer<u32>,
-        result: &GpuBuffer<u32>,
-        min_blob_size: u32,
-    ) {
-        let compute_pipeline = self.pipelines.blob_diff.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, thresholded_image.image.clone()),
-                WriteDescriptorSet::buffer(1, labels.clone()),
-                WriteDescriptorSet::buffer(2, union_markers_size.clone()),
-                WriteDescriptorSet::buffer(3, result.clone()),
-            ],
-        );
-
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            BlobDiffPushConstants {
-                thresholded_size: thresholded_image.size,
-                min_blob_size,
-            },
-            [
-                thresholded_image.size.width,
-                thresholded_image.size.height,
-                1,
-            ],
-        );
-    }
-
-    fn count_nonzero_blob_diff_points(
-        &self,
-        input: &GpuBuffer<u32>,
-        count_out: &GpuBuffer<u32>,
-        total_points: u32,
-    ) {
-        let compute_pipeline = self.pipelines.count_nonzero_blob_diff_points.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, input.clone()),
-                WriteDescriptorSet::buffer(1, count_out.clone()),
-            ],
-        );
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            TotalPointsPushConstants { total_points },
-            [
-                dispatch_groups_1d(total_points, Self::ONE_D_LOCAL_SIZE_X),
-                1,
-                1,
-            ],
-        );
-    }
-
-    fn filter_nonzero_blob_diff_points(
-        &self,
-        input: &GpuBuffer<u32>,
-        output: &GpuBuffer<u32>,
-        output_count: &GpuBuffer<u32>,
-        total_points: u32,
-    ) {
-        let compute_pipeline = self.pipelines.filter_nonzero_blob_diff_points.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, input.clone()),
-                WriteDescriptorSet::buffer(1, output.clone()),
-                WriteDescriptorSet::buffer(2, output_count.clone()),
-            ],
-        );
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            TotalPointsPushConstants { total_points },
-            [
-                dispatch_groups_1d(total_points, Self::ONE_D_LOCAL_SIZE_X),
-                1,
-                1,
-            ],
-        );
-    }
-
     fn radix_sort_blob_diff_points(
         &self,
         input: &GpuBuffer<u32>,
@@ -1383,70 +1313,6 @@ impl Detector {
             0,
             Self::RADIX_KEY_TRANSFORM_NONE,
         )
-    }
-
-    fn build_blob_pair_extents(
-        &self,
-        sorted_points: &GpuBuffer<u32>,
-        extents_out: &GpuBuffer<u32>,
-        extent_count_out: &GpuBuffer<u32>,
-        valid_points: u32,
-    ) {
-        let compute_pipeline = self.pipelines.build_blob_pair_extents.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, sorted_points.clone()),
-                WriteDescriptorSet::buffer(1, extents_out.clone()),
-                WriteDescriptorSet::buffer(2, extent_count_out.clone()),
-            ],
-        );
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            TotalPointsPushConstants {
-                total_points: valid_points,
-            },
-            [1, 1, 1],
-        );
-    }
-
-    fn filter_blob_pair_extents(
-        &self,
-        extents_in: &GpuBuffer<u32>,
-        extents_out: &GpuBuffer<u32>,
-        selected_extent_count_out: &GpuBuffer<u32>,
-        selected_point_count_out: &GpuBuffer<u32>,
-        extent_count: u32,
-        tag_width: u32,
-        reversed_border: u32,
-        normal_border: u32,
-        min_cluster_pixels: u32,
-        max_cluster_pixels: u32,
-    ) {
-        let compute_pipeline = self.pipelines.filter_blob_pair_extents.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, extents_in.clone()),
-                WriteDescriptorSet::buffer(1, extents_out.clone()),
-                WriteDescriptorSet::buffer(2, selected_extent_count_out.clone()),
-                WriteDescriptorSet::buffer(3, selected_point_count_out.clone()),
-            ],
-        );
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            FilterBlobPairExtentsPushConstants {
-                extent_count,
-                tag_width,
-                reversed_border,
-                normal_border,
-                min_cluster_pixels,
-                max_cluster_pixels,
-            },
-            [1, 1, 1],
-        );
     }
 
     fn rewrite_selected_blob_points_with_theta(
@@ -1499,125 +1365,6 @@ impl Detector {
             1,
             Self::RADIX_KEY_TRANSFORM_NONE,
         )
-    }
-
-    fn build_line_fit_points(
-        &self,
-        sorted_selected_points: &GpuBuffer<u32>,
-        decimated_image: &GPUImage<u8>,
-        line_fit_points_out: &GpuBuffer<u32>,
-        point_count: u32,
-        decimate: u32,
-    ) {
-        let compute_pipeline = self.pipelines.build_line_fit_points.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, sorted_selected_points.clone()),
-                WriteDescriptorSet::buffer(1, decimated_image.image.clone()),
-                WriteDescriptorSet::buffer(2, line_fit_points_out.clone()),
-            ],
-        );
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            BuildLineFitPointsPushConstants {
-                decimated_size: decimated_image.size,
-                point_count,
-                decimate,
-            },
-            [1, 1, 1],
-        );
-    }
-
-    fn fit_line_errors_and_peaks(
-        &self,
-        line_fit_points: &GpuBuffer<u32>,
-        filtered_extents: &GpuBuffer<u32>,
-        errs_out: &GpuBuffer<u32>,
-        filtered_errs_out: &GpuBuffer<u32>,
-        peaks_out: &GpuBuffer<u32>,
-        extent_count: u32,
-        point_count: u32,
-    ) {
-        let compute_pipeline = self.pipelines.fit_line_errors_and_peaks.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, line_fit_points.clone()),
-                WriteDescriptorSet::buffer(1, filtered_extents.clone()),
-                WriteDescriptorSet::buffer(2, errs_out.clone()),
-                WriteDescriptorSet::buffer(3, filtered_errs_out.clone()),
-                WriteDescriptorSet::buffer(4, peaks_out.clone()),
-            ],
-        );
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            FitLineErrorsAndPeaksPushConstants {
-                extent_count,
-                point_count,
-            },
-            [1, 1, 1],
-        );
-    }
-
-    fn count_valid_peaks(
-        &self,
-        input: &GpuBuffer<u32>,
-        count_out: &GpuBuffer<u32>,
-        total_peaks: u32,
-    ) {
-        let compute_pipeline = self.pipelines.count_valid_peaks.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, input.clone()),
-                WriteDescriptorSet::buffer(1, count_out.clone()),
-            ],
-        );
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            TotalPointsPushConstants {
-                total_points: total_peaks,
-            },
-            [
-                dispatch_groups_1d(total_peaks, Self::ONE_D_LOCAL_SIZE_X),
-                1,
-                1,
-            ],
-        );
-    }
-
-    fn filter_valid_peaks(
-        &self,
-        input: &GpuBuffer<u32>,
-        output: &GpuBuffer<u32>,
-        output_count: &GpuBuffer<u32>,
-        total_peaks: u32,
-    ) {
-        let compute_pipeline = self.pipelines.filter_valid_peaks.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, input.clone()),
-                WriteDescriptorSet::buffer(1, output.clone()),
-                WriteDescriptorSet::buffer(2, output_count.clone()),
-            ],
-        );
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            TotalPointsPushConstants {
-                total_points: total_peaks,
-            },
-            [
-                dispatch_groups_1d(total_peaks, Self::ONE_D_LOCAL_SIZE_X),
-                1,
-                1,
-            ],
-        );
     }
 
     fn radix_sort_peaks(&self, input: &GpuBuffer<u32>, valid_peaks: u32) -> GpuBuffer<u32> {
@@ -1808,150 +1555,6 @@ impl Detector {
             },
             [
                 dispatch_groups_1d(valid_points, Self::ONE_D_LOCAL_SIZE_X),
-                1,
-                1,
-            ],
-        );
-    }
-
-    fn build_peak_extents(
-        &self,
-        sorted_peaks: &GpuBuffer<u32>,
-        peak_extents_out: &GpuBuffer<u32>,
-        peak_extent_count_out: &GpuBuffer<u32>,
-        valid_peaks: u32,
-    ) {
-        let compute_pipeline = self.pipelines.build_peak_extents.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, sorted_peaks.clone()),
-                WriteDescriptorSet::buffer(1, peak_extents_out.clone()),
-                WriteDescriptorSet::buffer(2, peak_extent_count_out.clone()),
-            ],
-        );
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            TotalPointsPushConstants {
-                total_points: valid_peaks,
-            },
-            [1, 1, 1],
-        );
-    }
-
-    fn fit_quads(
-        &self,
-        sorted_peaks: &GpuBuffer<u32>,
-        peak_extents: &GpuBuffer<u32>,
-        line_fit_points: &GpuBuffer<u32>,
-        filtered_blob_extents: &GpuBuffer<u32>,
-        fitted_quads_out: &GpuBuffer<u32>,
-        fitted_quad_count_out: &GpuBuffer<u32>,
-        peak_extent_count: u32,
-        filtered_blob_extent_count: u32,
-        min_tag_width: u32,
-        quad_decimate: f32,
-    ) {
-        let compute_pipeline = self.pipelines.fit_quads.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, sorted_peaks.clone()),
-                WriteDescriptorSet::buffer(1, peak_extents.clone()),
-                WriteDescriptorSet::buffer(2, line_fit_points.clone()),
-                WriteDescriptorSet::buffer(3, filtered_blob_extents.clone()),
-                WriteDescriptorSet::buffer(4, fitted_quads_out.clone()),
-                WriteDescriptorSet::buffer(5, fitted_quad_count_out.clone()),
-            ],
-        );
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            FitQuadsPushConstants {
-                peak_extent_count,
-                filtered_blob_extent_count,
-                max_nmaxima: self.settings.quad_fit.max_nmaxima,
-                max_line_fit_mse: self.settings.quad_fit.max_line_fit_mse,
-                cos_critical_rad: self.settings.quad_fit.cos_critical_rad,
-                min_tag_width,
-                quad_decimate,
-            },
-            [u32::max(1, peak_extent_count), 1, 1],
-        );
-    }
-
-    fn prepare_decode_quads(
-        &self,
-        image_gray: &GPUImage<u8>,
-        fitted_quads: &GpuBuffer<u32>,
-        quad_params_out: &GpuBuffer<u32>,
-        quad_count: u32,
-        marker_size_with_borders: u32,
-        cell_size: u32,
-        min_stddev_otsu: f32,
-    ) {
-        let compute_pipeline = self.pipelines.prepare_decode_quads.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, image_gray.image.clone()),
-                WriteDescriptorSet::buffer(1, fitted_quads.clone()),
-                WriteDescriptorSet::buffer(2, quad_params_out.clone()),
-            ],
-        );
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            PrepareDecodeQuadsPushConstants {
-                image_size: image_gray.size,
-                quad_count,
-                marker_size_with_borders,
-                cell_size,
-                min_stddev_otsu,
-            },
-            [
-                dispatch_groups_1d(quad_count, Self::ONE_D_LOCAL_SIZE_X),
-                1,
-                1,
-            ],
-        );
-    }
-
-    fn extract_candidate_bits(
-        &self,
-        image_gray: &GPUImage<u8>,
-        quad_params: &GpuBuffer<u32>,
-        bits_out: &GpuBuffer<u32>,
-        quad_count: u32,
-        marker_size_with_borders: u32,
-        cell_size: u32,
-        cell_margin_pixels: u32,
-        cell_span: u32,
-    ) {
-        let compute_pipeline = self.pipelines.extract_candidate_bits.clone();
-        let descriptor_set = self.create_descriptor_set(
-            &compute_pipeline,
-            vec![
-                WriteDescriptorSet::buffer(0, image_gray.image.clone()),
-                WriteDescriptorSet::buffer(1, quad_params.clone()),
-                WriteDescriptorSet::buffer(2, bits_out.clone()),
-            ],
-        );
-        let bits_count = quad_count * marker_size_with_borders * marker_size_with_borders;
-        self.dispatch_with_push_constants(
-            compute_pipeline,
-            descriptor_set,
-            ExtractCandidateBitsPushConstants {
-                image_size: image_gray.size,
-                quad_count,
-                marker_size_with_borders,
-                cell_size,
-                cell_margin_pixels,
-                cell_span,
-            },
-            [
-                dispatch_groups_1d(bits_count, Self::ONE_D_LOCAL_SIZE_X),
                 1,
                 1,
             ],
