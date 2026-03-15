@@ -6,10 +6,16 @@ edition = "2024"
 [dependencies]
 ash = "0.38.0"
 bytemuck = { version = "1.25.0", features = ["derive"] }
+eframe = "0.33.0"
 image = "0.25.9"
 num-traits = "0.2.19"
+rfd = "0.15.4"
 tracing = "0.1.44"
 vk-mem = "0.5.0"
+
+[[bin]]
+name = "slangtag-gui"
+path = "src/gui.rs"
 
 [[bin]]
 name = "slangtag"
