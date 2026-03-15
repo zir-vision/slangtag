@@ -373,6 +373,8 @@ impl RadixSorter {
         let element_count_size = Self::align(std::mem::size_of::<u32>() as vk::DeviceSize, align);
         let histogram_size = Self::histogram_size(max_element_count, align);
         let inout_size = Self::inout_size(max_element_count, align);
+        let element_bytes =
+            (max_element_count as vk::DeviceSize) * (std::mem::size_of::<u32>() as vk::DeviceSize);
 
         let element_count_offset = storage_offset;
         let histogram_offset = element_count_offset + element_count_size;
@@ -402,7 +404,7 @@ impl RadixSorter {
         Self::assert_range(
             keys_buffer.byte_size(),
             keys_offset,
-            inout_size,
+            element_bytes,
             "keys_buffer",
         );
 
@@ -410,7 +412,7 @@ impl RadixSorter {
             Self::assert_range(
                 values.byte_size(),
                 values_offset,
-                inout_size,
+                element_bytes,
                 "values_buffer",
             );
         }
@@ -458,13 +460,13 @@ impl RadixSorter {
             }
 
             for pass in 0..Self::PASSES {
-                let mut keys_in = keys_buffer.descriptor_range(keys_offset, inout_size);
+                let mut keys_in = keys_buffer.descriptor_range(keys_offset, element_bytes);
                 let mut keys_out = storage_buffer.descriptor_range(inout_offset, inout_size);
 
                 let mut values_in_out: Option<(DescriptorBuffer, DescriptorBuffer)> =
                     values_buffer.map(|(values, values_offset)| {
                         (
-                            values.descriptor_range(values_offset, inout_size),
+                            values.descriptor_range(values_offset, element_bytes),
                             storage_buffer.descriptor_range(value_inout_offset, inout_size),
                         )
                     });
