@@ -13,7 +13,7 @@ struct PushConstants
 ConstantBuffer<PushConstants> pc;
 
 [shader("compute")]
-[numthreads(1, 1, 1)]
+[numthreads(16, 16, 1)]
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     init_buffer(dispatch_thread_id.xy, image, pc.image_size, labels);

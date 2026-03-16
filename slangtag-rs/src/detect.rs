@@ -316,6 +316,12 @@ fn dispatch_groups_1d(total_invocations: u32, local_size_x: u32) -> u32 {
     }
 }
 
+fn dispatch_groups_2d(width: u32, height: u32, local_size_x: u32, local_size_y: u32) -> [u32; 2] {
+    let x = if width == 0 { 1 } else { width.div_ceil(local_size_x) };
+    let y = if height == 0 { 1 } else { height.div_ceil(local_size_y) };
+    [x, y]
+}
+
 struct TimedPass {
     name: String,
     start_query: u32,
@@ -591,6 +597,8 @@ fn crop_image_to_multiple(image: GrayImage, multiple: u32) -> Result<GrayImage, 
 
 impl Detector {
     const ONE_D_LOCAL_SIZE_X: u32 = 256;
+    const TWO_D_LOCAL_SIZE_X: u32 = 16;
+    const TWO_D_LOCAL_SIZE_Y: u32 = 16;
     const FITTED_QUAD_WORDS_PER_QUAD: usize = 15;
     const FITTED_QUAD_BLOB_INDEX_WORD: usize = 0;
     const FITTED_QUAD_REVERSED_BORDER_WORD: usize = 1;
@@ -642,7 +650,7 @@ impl Detector {
         let decimate_factor = self.settings.decimate.unwrap_or(1) as u32;
         let aligned_input = crop_image_to_multiple(image, 4 * decimate_factor)?;
         let input_gpu_image =
-            crate::GPUImage::from_image_buffer_fast(self.device.clone(), aligned_input);
+            crate::GPUImage::from_image_buffer(self.device.clone(), aligned_input);
 
         let decimated_image = match self.settings.decimate {
             Some(factor) => {
@@ -688,6 +696,12 @@ impl Detector {
 
             if self.settings.decimate.is_some() {
                 let decimate_pipeline = &self.pipelines.decimate;
+                let decimate_dispatch = dispatch_groups_2d(
+                    input_gpu_image.size.width,
+                    input_gpu_image.size.height,
+                    Self::TWO_D_LOCAL_SIZE_X,
+                    Self::TWO_D_LOCAL_SIZE_Y,
+                );
                 self.dispatch_with_push_constants_recorded_timed(
                     &mut pipeline_timings,
                     "threshold-decimate",
@@ -701,11 +715,17 @@ impl Detector {
                         input_size: input_gpu_image.size,
                         decimated_size: decimated_image.size,
                     },
-                    [input_gpu_image.size.width, input_gpu_image.size.height, 1],
+                    [decimate_dispatch[0], decimate_dispatch[1], 1],
                 );
                 commands.barrier_shader_write_to_shader_read();
             }
 
+            let minmax_dispatch = dispatch_groups_2d(
+                minmax_size.width,
+                minmax_size.height,
+                Self::TWO_D_LOCAL_SIZE_X,
+                Self::TWO_D_LOCAL_SIZE_Y,
+            );
             self.dispatch_with_push_constants_recorded_timed(
                 &mut pipeline_timings,
                 "threshold-minmax",
@@ -719,7 +739,7 @@ impl Detector {
                     input_size: decimated_image.size,
                     minmax_size,
                 },
-                [minmax_size.width, minmax_size.height, 1],
+                [minmax_dispatch[0], minmax_dispatch[1], 1],
             );
             commands.barrier_shader_write_to_shader_read();
 
@@ -733,10 +753,16 @@ impl Detector {
                     minmax_size,
                     filtered_size: minmax_size,
                 },
-                [minmax_size.width, minmax_size.height, 1],
+                [minmax_dispatch[0], minmax_dispatch[1], 1],
             );
             commands.barrier_shader_write_to_shader_read();
 
+            let threshold_dispatch = dispatch_groups_2d(
+                thresholded_image.size.width,
+                thresholded_image.size.height,
+                Self::TWO_D_LOCAL_SIZE_X,
+                Self::TWO_D_LOCAL_SIZE_Y,
+            );
             self.dispatch_with_push_constants_recorded_timed(
                 &mut pipeline_timings,
                 "threshold-threshold",
@@ -753,10 +779,16 @@ impl Detector {
                     thresholded_size: decimated_image.size,
                     min_white_black_diff: self.settings.min_white_black_diff as u32,
                 },
-                [thresholded_image.size.width, thresholded_image.size.height, 1],
+                [threshold_dispatch[0], threshold_dispatch[1], 1],
             );
             commands.barrier_shader_write_to_shader_read();
 
+            let ccl_dispatch = dispatch_groups_2d(
+                thresholded_image.size.width / 2,
+                thresholded_image.size.height / 2,
+                Self::TWO_D_LOCAL_SIZE_X,
+                Self::TWO_D_LOCAL_SIZE_Y,
+            );
             self.dispatch_with_push_constants_recorded_timed(
                 &mut pipeline_timings,
                 "ccl-init",
@@ -769,7 +801,7 @@ impl Detector {
                 CclPushConstants {
                     image_size: thresholded_image.size,
                 },
-                [thresholded_image.size.width / 2, thresholded_image.size.height / 2, 1],
+                [ccl_dispatch[0], ccl_dispatch[1], 1],
             );
             commands.barrier_shader_write_to_shader_read();
 
@@ -782,7 +814,7 @@ impl Detector {
                 CclPushConstants {
                     image_size: thresholded_image.size,
                 },
-                [thresholded_image.size.width / 2, thresholded_image.size.height / 2, 1],
+                [ccl_dispatch[0], ccl_dispatch[1], 1],
             );
             commands.barrier_shader_write_to_shader_read();
 
@@ -795,7 +827,7 @@ impl Detector {
                 CclPushConstants {
                     image_size: thresholded_image.size,
                 },
-                [thresholded_image.size.width / 2, thresholded_image.size.height / 2, 1],
+                [ccl_dispatch[0], ccl_dispatch[1], 1],
             );
             commands.barrier_shader_write_to_shader_read();
 
@@ -808,7 +840,7 @@ impl Detector {
                 CclPushConstants {
                     image_size: thresholded_image.size,
                 },
-                [thresholded_image.size.width / 2, thresholded_image.size.height / 2, 1],
+                [ccl_dispatch[0], ccl_dispatch[1], 1],
             );
             commands.barrier_shader_write_to_shader_read();
 
@@ -824,7 +856,7 @@ impl Detector {
                 CclPushConstants {
                     image_size: thresholded_image.size,
                 },
-                [thresholded_image.size.width / 2, thresholded_image.size.height / 2, 1],
+                [ccl_dispatch[0], ccl_dispatch[1], 1],
             );
             commands.barrier_shader_write_to_shader_read();
 
@@ -843,7 +875,7 @@ impl Detector {
                     thresholded_size: thresholded_image.size,
                     min_blob_size: self.settings.min_blob_size,
                 },
-                [thresholded_image.size.width, thresholded_image.size.height, 1],
+                [threshold_dispatch[0], threshold_dispatch[1], 1],
             );
             commands.barrier_shader_write_to_shader_read();
 

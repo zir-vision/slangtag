@@ -14,7 +14,7 @@ struct PushConstants
 ConstantBuffer<PushConstants> pc;
 
 [shader("compute")]
-[numthreads(1, 1, 1)]
+[numthreads(16, 16, 1)]
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     filter_minmax_buffer(dispatch_thread_id.xy, minmax_image, pc.minmax_size, filtered_image, pc.filtered_size);

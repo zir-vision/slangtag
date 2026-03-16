@@ -14,7 +14,7 @@ struct PushConstants
 ConstantBuffer<PushConstants> pc;
 
 [shader("compute")]
-[numthreads(1, 1, 1)]
+[numthreads(16, 16, 1)]
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     decimate_buffer(dispatch_thread_id.xy, input_image, pc.input_size, decimated_image, pc.decimated_size);

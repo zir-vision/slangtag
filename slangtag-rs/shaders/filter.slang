@@ -64,11 +64,13 @@ static const uint32_t kFittedQuadCornerIndex1Word = 12u;
 static const uint32_t kFittedQuadCornerIndex2Word = 13u;
 static const uint32_t kFittedQuadCornerIndex3Word = 14u;
 
+[ForceInline]
 uint32_t read_blob_diff_point_word(StructuredBuffer<uint32_t> points, uint32_t point_index, uint32_t word_index)
 {
     return points[point_index * kBlobDiffWordsPerPoint + word_index];
 }
 
+[ForceInline]
 uint32_t read_extent_word<T : IArray<uint32_t>>(T extents, uint32_t extent_index, uint32_t word_index)
 {
     return extents[extent_index * kBlobExtentWordsPerExtent + word_index];
@@ -101,46 +103,55 @@ void dxy_to_gradient(uint32_t dxy, out int gx, out int gy)
     gy = 1;
 }
 
+[ForceInline]
 void write_extent_word(RWStructuredBuffer<uint32_t> extents, uint32_t extent_index, uint32_t word_index, uint32_t value)
 {
     extents[extent_index * kBlobExtentWordsPerExtent + word_index] = value;
 }
 
+[ForceInline]
 void write_selected_blob_point_word(RWStructuredBuffer<uint32_t> points, uint32_t point_index, uint32_t word_index, uint32_t value)
 {
     points[point_index * kSelectedBlobPointWordsPerPoint + word_index] = value;
 }
 
+[ForceInline]
 uint32_t read_selected_blob_point_word(StructuredBuffer<uint32_t> points, uint32_t point_index, uint32_t word_index)
 {
     return points[point_index * kSelectedBlobPointWordsPerPoint + word_index];
 }
 
+[ForceInline]
 void write_line_fit_word(RWStructuredBuffer<uint32_t> points, uint32_t point_index, uint32_t word_index, uint32_t value)
 {
     points[point_index * kLineFitPointWordsPerPoint + word_index] = value;
 }
 
+[ForceInline]
 uint32_t read_line_fit_word(StructuredBuffer<uint32_t> points, uint32_t point_index, uint32_t word_index)
 {
     return points[point_index * kLineFitPointWordsPerPoint + word_index];
 }
 
+[ForceInline]
 void write_peak_word(RWStructuredBuffer<uint32_t> peaks, uint32_t peak_index, uint32_t word_index, uint32_t value)
 {
     peaks[peak_index * kPeakWordsPerPeak + word_index] = value;
 }
 
+[ForceInline]
 uint32_t read_peak_word(StructuredBuffer<uint32_t> peaks, uint32_t peak_index, uint32_t word_index)
 {
     return peaks[peak_index * kPeakWordsPerPeak + word_index];
 }
 
+[ForceInline]
 void write_peak_extent_word(RWStructuredBuffer<uint32_t> peak_extents, uint32_t extent_index, uint32_t word_index, uint32_t value)
 {
     peak_extents[extent_index * kPeakExtentWordsPerExtent + word_index] = value;
 }
 
+[ForceInline]
 void write_fitted_quad_word(RWStructuredBuffer<uint32_t> fitted_quads, uint32_t quad_index, uint32_t word_index, uint32_t value)
 {
     fitted_quads[quad_index * kFittedQuadWordsPerQuad + word_index] = value;

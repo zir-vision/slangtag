@@ -12,7 +12,7 @@ struct PushConstants
 ConstantBuffer<PushConstants> pc;
 
 [shader("compute")]
-[numthreads(1, 1, 1)]
+[numthreads(16, 16, 1)]
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     uint2 dim = uint2(pc.image_size.width, pc.image_size.height);
