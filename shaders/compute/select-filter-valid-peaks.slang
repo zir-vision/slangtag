@@ -15,5 +15,19 @@ ConstantBuffer<PushConstants> pc;
 [numthreads(256, 1, 1)]
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
-    filter_valid_peaks(dispatch_thread_id.x, input, output, output_count, pc.total_peaks);
+    uint tid = dispatch_thread_id.x;
+    if (tid >= pc.total_peaks)
+        return;
+    if (!peak_is_valid(input, tid))
+        return;
+
+    uint32_t output_index;
+    InterlockedAdd(output_count[0], 1u, output_index);
+    uint32_t input_word_index = tid * kPeakWordsPerPeak;
+    uint32_t output_word_index = output_index * kPeakWordsPerPeak;
+    [ForceUnroll]
+    for (uint32_t i = 0u; i < kPeakWordsPerPeak; ++i)
+    {
+        output[output_word_index + i] = input[input_word_index + i];
+    }
 }

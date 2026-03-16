@@ -14,5 +14,11 @@ ConstantBuffer<PushConstants> pc;
 [numthreads(256, 1, 1)]
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
-    count_valid_peaks(dispatch_thread_id.x, input, count_out, pc.total_peaks);
+    uint tid = dispatch_thread_id.x;
+    if (tid >= pc.total_peaks)
+        return;
+    if (!peak_is_valid(input, tid))
+        return;
+    uint32_t old_count;
+    InterlockedAdd(count_out[0], 1u, old_count);
 }

@@ -15,5 +15,11 @@ ConstantBuffer<PushConstants> pc;
 [numthreads(256, 1, 1)]
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
-    count_nonzero_blob_diff_points(dispatch_thread_id.x, input, count_out, pc.total_points);
+    uint tid = dispatch_thread_id.x;
+    if (tid >= pc.total_points)
+        return;
+    if (!blob_diff_point_is_nonzero(input, tid))
+        return;
+    uint32_t old_count;
+    InterlockedAdd(count_out[0], 1u, old_count);
 }

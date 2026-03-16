@@ -1,5 +1,4 @@
 import "./image_buffer.slang";
-import "../threshold.slang";
 
 StructuredBuffer<uint8_t> decimated_image;
 StructuredBuffer<uint8_t2> filtered_image;
@@ -20,13 +19,26 @@ ConstantBuffer<PushConstants> pc;
 [numthreads(16, 16, 1)]
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
-    threshold_buffer(
-        dispatch_thread_id.xy,
-        decimated_image,
-        pc.decimated_size,
-        filtered_image,
-        pc.filtered_size,
-        thresholded_image,
-        pc.thresholded_size,
-        pc.min_white_black_diff);
+    uint2 pixel = dispatch_thread_id.xy;
+    if (!image_in_bounds(pc.decimated_size, pixel))
+        return;
+
+    uint2 minmax_pixel = pixel / 4u;
+    if (!image_in_bounds(pc.filtered_size, minmax_pixel))
+        return;
+
+    uint8_t2 minmax = image_rg8_read(filtered_image, pc.filtered_size, minmax_pixel);
+    uint8_t result = 0u;
+
+    if (minmax.y - minmax.x < pc.min_white_black_diff)
+    {
+        result = 127u;
+    }
+    else
+    {
+        uint threshold_value = uint(minmax.x) + (uint(minmax.y) - uint(minmax.x)) / 2u;
+        result = image_u8_read(decimated_image, pc.decimated_size, pixel) > threshold_value ? 255u : 0u;
+    }
+
+    image_u8_write(thresholded_image, pc.thresholded_size, pixel, result);
 }
