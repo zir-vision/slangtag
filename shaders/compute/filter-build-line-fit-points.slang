@@ -48,11 +48,12 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
         uint32_t x = read_selected_blob_point_word(sorted_selected_points, i, kSelectedPointXWord);
         uint32_t y = read_selected_blob_point_word(sorted_selected_points, i, kSelectedPointYWord);
 
-        int delta = int(pc.decimate) - 1;
-        int ix2 = int(x) * int(pc.decimate) + delta;
-        int iy2 = int(y) * int(pc.decimate) + delta;
-        int ix = ix2 / int(pc.decimate);
-        int iy = iy2 / int(pc.decimate);
+        // Keep line-fit moments in fixed x2 coordinates (2*x+1) regardless of decimation.
+        // Decimation-to-fullres scaling is handled later in fit-quads.
+        int ix2 = int(x) * 2 + 1;
+        int iy2 = int(y) * 2 + 1;
+        int ix = ix2 / 2;
+        int iy = iy2 / 2;
 
         int W = 1;
         if (ix > 0 && uint32_t(ix + 1) < pc.decimated_size.width && iy > 0 && uint32_t(iy + 1) < pc.decimated_size.height)
