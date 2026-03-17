@@ -118,6 +118,18 @@ pub struct DetectedTag {
     pub payload_bits: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct GpuTimingSpan {
+    pub name: String,
+    pub elapsed_ms: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GpuTimingReport {
+    pub spans: Vec<GpuTimingSpan>,
+    pub total_ms: f64,
+}
+
 pub struct Detector {
     device: ComputeDevice,
     settings: DetectionSettings,
@@ -219,7 +231,9 @@ impl DetectionPipelines {
             ),
             rebuild_filtered_extent_starts: Detector::create_compute_pipeline(
                 device,
-                include_u32!(compute_shader_path!("filter-rebuild-filtered-extent-starts")),
+                include_u32!(compute_shader_path!(
+                    "filter-rebuild-filtered-extent-starts"
+                )),
             ),
             build_line_fit_points: Detector::create_compute_pipeline(
                 device,
@@ -322,8 +336,16 @@ fn dispatch_groups_1d(total_invocations: u32, local_size_x: u32) -> u32 {
 }
 
 fn dispatch_groups_2d(width: u32, height: u32, local_size_x: u32, local_size_y: u32) -> [u32; 2] {
-    let x = if width == 0 { 1 } else { width.div_ceil(local_size_x) };
-    let y = if height == 0 { 1 } else { height.div_ceil(local_size_y) };
+    let x = if width == 0 {
+        1
+    } else {
+        width.div_ceil(local_size_x)
+    };
+    let y = if height == 0 {
+        1
+    } else {
+        height.div_ceil(local_size_y)
+    };
     [x, y]
 }
 
@@ -385,12 +407,7 @@ impl PipelineTimings {
             &self.query_pool,
             start_query,
         );
-        commands.dispatch_with_push_constants(
-            compute_pipeline,
-            bindings,
-            push_constants,
-            dispatch,
-        );
+        commands.dispatch_with_push_constants(compute_pipeline, bindings, push_constants, dispatch);
         commands.write_timestamp(
             vk::PipelineStageFlags::COMPUTE_SHADER,
             &self.query_pool,
@@ -405,36 +422,23 @@ impl PipelineTimings {
 
     fn reserve_radix_sort_queries(&mut self, name_prefix: &str) -> u32 {
         let base_query = self.allocate_queries(RadixSorter::TIMESTAMP_QUERY_COUNT);
-        for pass in 0..4 {
-            let start = base_query + 1 + 3 * pass;
-            self.spans.push(TimedPass {
-                name: format!("{name_prefix}::upsweep[p{pass}]"),
-                start_query: start,
-                end_query: start + 1,
-            });
-            self.spans.push(TimedPass {
-                name: format!("{name_prefix}::spine[p{pass}]"),
-                start_query: start + 1,
-                end_query: start + 2,
-            });
-            self.spans.push(TimedPass {
-                name: format!("{name_prefix}::downsweep[p{pass}]"),
-                start_query: start + 2,
-                end_query: start + 3,
-            });
-        }
+        self.spans.push(TimedPass {
+            name: name_prefix.to_owned(),
+            start_query: base_query,
+            end_query: base_query + (RadixSorter::TIMESTAMP_QUERY_COUNT - 1),
+        });
         base_query
     }
 
-    fn print_summary(&self, device: &ComputeDevice) {
+    fn summary(&self, device: &ComputeDevice) -> GpuTimingReport {
         if self.next_query == 0 {
-            return;
+            return GpuTimingReport::default();
         }
 
         let timestamps = device.get_query_pool_results_u64(&self.query_pool, 0, self.next_query);
         let timestamp_period_ns = f64::from(device.timestamp_period_ns());
 
-        println!("GPU shader timings (detect pipeline):");
+        let mut spans = Vec::with_capacity(self.spans.len());
         let mut total_ms = 0.0f64;
         for span in &self.spans {
             let start = timestamps[span.start_query as usize];
@@ -444,9 +448,12 @@ impl PipelineTimings {
             }
             let elapsed_ms = ((end - start) as f64) * timestamp_period_ns / 1_000_000.0;
             total_ms += elapsed_ms;
-            println!("  {:<52} {:>9.3} ms", span.name, elapsed_ms);
+            spans.push(GpuTimingSpan {
+                name: span.name.clone(),
+                elapsed_ms,
+            });
         }
-        println!("  {:<52} {:>9.3} ms", "total timed shader execution", total_ms);
+        GpuTimingReport { spans, total_ms }
     }
 }
 
@@ -643,6 +650,13 @@ impl Detector {
         &self,
         image: ImageBuffer<image::Luma<u8>, Vec<u8>>,
     ) -> Result<Vec<DetectedTag>, ()> {
+        self.detect_gray_with_timing(image).map(|(tags, _)| tags)
+    }
+
+    pub fn detect_gray_with_timing(
+        &self,
+        image: ImageBuffer<image::Luma<u8>, Vec<u8>>,
+    ) -> Result<(Vec<DetectedTag>, GpuTimingReport), ()> {
         if let Some(factor) = self.settings.decimate
             && !is_power_of_two(factor)
         {
@@ -677,7 +691,10 @@ impl Detector {
             None => input_gpu_image.clone(),
         };
 
-        let minmax_size = Size::new(decimated_image.size.width / 4, decimated_image.size.height / 4);
+        let minmax_size = Size::new(
+            decimated_image.size.width / 4,
+            decimated_image.size.height / 4,
+        );
         let minmax_image = self.new_u8_storage_buffer(minmax_size.total_pixels() * 2);
         let filtered_minmax_image = self.new_u8_storage_buffer(minmax_size.total_pixels() * 2);
         let thresholded_image_buffer =
@@ -761,7 +778,10 @@ impl Detector {
                 "threshold-filter-minmax",
                 commands,
                 &self.pipelines.filter_minmax,
-                &[(0, minmax_image.descriptor()), (1, filtered_minmax_image.descriptor())],
+                &[
+                    (0, minmax_image.descriptor()),
+                    (1, filtered_minmax_image.descriptor()),
+                ],
                 FilterMinmaxPushConstants {
                     minmax_size,
                     filtered_size: minmax_size,
@@ -1033,11 +1053,13 @@ impl Detector {
 
         let fitted_quad_words_per_quad = 15usize;
         let max_quad_capacity = usize::max(1, selected_blob_point_count_value as usize);
-        let fitted_quads = self.new_u32_storage_buffer(max_quad_capacity * fitted_quad_words_per_quad);
+        let fitted_quads =
+            self.new_u32_storage_buffer(max_quad_capacity * fitted_quad_words_per_quad);
         let fitted_quad_count = self.new_zeroed_u32_counter_buffer();
 
         let quad_param_words_per_quad = 12usize;
-        let quad_params = self.new_u32_storage_buffer(max_quad_capacity * quad_param_words_per_quad);
+        let quad_params =
+            self.new_u32_storage_buffer(max_quad_capacity * quad_param_words_per_quad);
         let bits_count_oversized = max_quad_capacity * 8usize * 8usize;
         let bits = self.new_u32_storage_buffer(usize::max(1, bits_count_oversized));
 
@@ -1143,8 +1165,11 @@ impl Detector {
             );
         });
 
-        let sorted_peaks =
-            self.radix_sort_peaks(&peaks, selected_blob_point_count_value, &mut pipeline_timings);
+        let sorted_peaks = self.radix_sort_peaks(
+            &peaks,
+            selected_blob_point_count_value,
+            &mut pipeline_timings,
+        );
 
         self.device.run_commands(|commands| {
             commands.fill_buffer_u32_range(&peak_extents, 0, peak_extents.byte_size(), 0);
@@ -1173,8 +1198,8 @@ impl Detector {
 
         let peak_extent_count_value = self.read_counter(&peak_extent_count);
         if peak_extent_count_value == 0 {
-            pipeline_timings.print_summary(&self.device);
-            return Ok(Vec::new());
+            let timing_report = pipeline_timings.summary(&self.device);
+            return Ok((Vec::new(), timing_report));
         }
 
         self.device.run_commands(|commands| {
@@ -1213,8 +1238,8 @@ impl Detector {
 
         let fitted_quad_count_value = self.read_counter(&fitted_quad_count);
         if fitted_quad_count_value == 0 {
-            pipeline_timings.print_summary(&self.device);
-            return Ok(Vec::new());
+            let timing_report = pipeline_timings.summary(&self.device);
+            return Ok((Vec::new(), timing_report));
         }
 
         self.device.run_commands(|commands| {
@@ -1281,13 +1306,10 @@ impl Detector {
         );
         let bits_words =
             self.download_u32_buffer(&bits, fitted_quad_count_value as usize * 8usize * 8usize);
-        let tags = self.build_detected_tags(
-            &fitted_quad_words,
-            fitted_quad_count_value,
-            &bits_words,
-        );
-        pipeline_timings.print_summary(&self.device);
-        Ok(tags)
+        let tags =
+            self.build_detected_tags(&fitted_quad_words, fitted_quad_count_value, &bits_words);
+        let timing_report = pipeline_timings.summary(&self.device);
+        Ok((tags, timing_report))
     }
 
     fn build_detected_tags(
@@ -1709,7 +1731,11 @@ impl Detector {
                 extent_count,
                 point_count,
             },
-            [dispatch_groups_1d(point_count, Self::ONE_D_LOCAL_SIZE_X), 1, 1],
+            [
+                dispatch_groups_1d(point_count, Self::ONE_D_LOCAL_SIZE_X),
+                1,
+                1,
+            ],
         );
     }
 
@@ -1774,9 +1800,8 @@ impl Detector {
         );
 
         let sort_storage = self.sorter.create_key_value_storage_buffer(valid_records);
-        let secondary_sort_query = timings.reserve_radix_sort_queries(&format!(
-            "{timing_prefix}::secondary-key-sort"
-        ));
+        let secondary_sort_query =
+            timings.reserve_radix_sort_queries(&format!("{timing_prefix}::secondary-key-sort"));
         self.sorter.cmd_sort_key_value_with_query_pool(
             valid_records,
             &sort_keys,
@@ -1820,9 +1845,7 @@ impl Detector {
             words_per_record,
             timings,
             &format!("{timing_prefix}::gather"),
-        )
-
-        ;
+        );
 
         sorted_records
     }
@@ -1942,7 +1965,6 @@ impl Detector {
             ],
         );
     }
-
 }
 
 #[cfg(test)]
@@ -1987,7 +2009,9 @@ mod tests {
     }
 
     fn fixture_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("input").join("test.jpg")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("input")
+            .join("test.jpg")
     }
 
     fn tags_signature(tags: &[DetectedTag]) -> Vec<(Option<u32>, bool, Vec<u8>, [i32; 8])> {

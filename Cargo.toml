@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 ash = "0.38.0"
 bytemuck = { version = "1.25.0", features = ["derive"] }
+colored = "3.1.1"
 eframe = "0.33.0"
 image = "0.25.9"
 num-traits = "0.2.19"

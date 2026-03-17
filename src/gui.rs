@@ -91,10 +91,7 @@ impl Default for ViewerSettings {
             normal_border: defaults.blob_pair_filter.normal_border,
             min_cluster_pixels: defaults.blob_pair_filter.min_cluster_pixels,
             max_cluster_pixels_enabled: defaults.blob_pair_filter.max_cluster_pixels.is_some(),
-            max_cluster_pixels: defaults
-                .blob_pair_filter
-                .max_cluster_pixels
-                .unwrap_or(0),
+            max_cluster_pixels: defaults.blob_pair_filter.max_cluster_pixels.unwrap_or(0),
             max_cluster_pixels_perimeter_scale: defaults
                 .blob_pair_filter
                 .max_cluster_pixels_perimeter_scale,
@@ -273,7 +270,9 @@ impl ViewerApp {
             )
             .changed();
         changed |= ui
-            .add(egui::Slider::new(&mut self.settings.min_blob_size, 1..=1000).text("min_blob_size"))
+            .add(
+                egui::Slider::new(&mut self.settings.min_blob_size, 1..=1000).text("min_blob_size"),
+            )
             .changed();
 
         ui.separator();
@@ -285,7 +284,10 @@ impl ViewerApp {
             .add(egui::Slider::new(&mut self.settings.tag_width, 1..=8).text("tag_width"))
             .changed();
         changed |= ui
-            .add(egui::Slider::new(&mut self.settings.reversed_border, 0..=4).text("reversed_border"))
+            .add(
+                egui::Slider::new(&mut self.settings.reversed_border, 0..=4)
+                    .text("reversed_border"),
+            )
             .changed();
         changed |= ui
             .add(egui::Slider::new(&mut self.settings.normal_border, 0..=4).text("normal_border"))
@@ -312,8 +314,11 @@ impl ViewerApp {
         }
         changed |= ui
             .add(
-                egui::Slider::new(&mut self.settings.max_cluster_pixels_perimeter_scale, 1..=32)
-                    .text("max_cluster_pixels_perimeter_scale"),
+                egui::Slider::new(
+                    &mut self.settings.max_cluster_pixels_perimeter_scale,
+                    1..=32,
+                )
+                .text("max_cluster_pixels_perimeter_scale"),
             )
             .changed();
 
