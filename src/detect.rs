@@ -141,6 +141,7 @@ struct DetectionPipelines {
     radix_gather_by_indices: Arc<ComputePipeline>,
     build_blob_pair_extents: Arc<ComputePipeline>,
     rewrite_selected_blob_points_with_theta: Arc<ComputePipeline>,
+    rebuild_filtered_extent_starts: Arc<ComputePipeline>,
     build_line_fit_points: Arc<ComputePipeline>,
     fit_line_errors_and_peaks: Arc<ComputePipeline>,
     build_peak_extents: Arc<ComputePipeline>,
@@ -215,6 +216,10 @@ impl DetectionPipelines {
                 include_u32!(compute_shader_path!(
                     "filter-rewrite-selected-blob-points-with-theta"
                 )),
+            ),
+            rebuild_filtered_extent_starts: Detector::create_compute_pipeline(
+                device,
+                include_u32!(compute_shader_path!("filter-rebuild-filtered-extent-starts")),
             ),
             build_line_fit_points: Detector::create_compute_pipeline(
                 device,
@@ -530,6 +535,13 @@ struct RewriteSelectedBlobPointsPushConstants {
 
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone)]
+struct RebuildFilteredExtentStartsPushConstants {
+    extent_count: u32,
+    point_count: u32,
+}
+
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone)]
 struct BuildLineFitPointsPushConstants {
     decimated_size: Size,
     extent_count: u32,
@@ -676,6 +688,7 @@ impl Detector {
             decimated_image.size,
         );
         let labels = self.new_u32_storage_buffer(thresholded_image.size.total_pixels());
+        let final_labels = self.new_u32_storage_buffer(thresholded_image.size.total_pixels());
         let union_markers_size =
             self.new_zeroed_u32_storage_buffer(thresholded_image.size.total_pixels());
 
@@ -851,7 +864,8 @@ impl Detector {
                 &self.pipelines.ccl_final_labeling,
                 &[
                     (0, labels.descriptor()),
-                    (1, union_markers_size.descriptor()),
+                    (1, final_labels.descriptor()),
+                    (2, union_markers_size.descriptor()),
                 ],
                 CclPushConstants {
                     image_size: thresholded_image.size,
@@ -867,7 +881,7 @@ impl Detector {
                 &self.pipelines.blob_diff,
                 &[
                     (0, thresholded_image.image.descriptor()),
-                    (1, labels.descriptor()),
+                    (1, final_labels.descriptor()),
                     (2, union_markers_size.descriptor()),
                     (3, blob_diff_out.descriptor()),
                 ],
@@ -987,6 +1001,13 @@ impl Detector {
 
         let selected_blob_sorted_points = self.radix_sort_selected_blob_points(
             &selected_blob_points,
+            selected_blob_point_count_value,
+            &mut pipeline_timings,
+        );
+        self.rebuild_filtered_extent_starts_from_sorted_points(
+            &filtered_blob_extent,
+            &selected_blob_sorted_points,
+            blob_extent_count_value,
             selected_blob_point_count_value,
             &mut pipeline_timings,
         );
@@ -1659,6 +1680,39 @@ impl Detector {
         )
     }
 
+    fn rebuild_filtered_extent_starts_from_sorted_points(
+        &self,
+        filtered_extents: &GpuBuffer<u32>,
+        sorted_selected_points: &GpuBuffer<u32>,
+        extent_count: u32,
+        point_count: u32,
+        timings: &mut PipelineTimings,
+    ) {
+        if extent_count == 0 || point_count == 0 {
+            return;
+        }
+
+        let compute_pipeline = self.pipelines.rebuild_filtered_extent_starts.clone();
+        let descriptor_set = self.create_descriptor_set(
+            &compute_pipeline,
+            vec![
+                WriteDescriptorSet::buffer(0, sorted_selected_points.clone()),
+                WriteDescriptorSet::buffer(1, filtered_extents.clone()),
+            ],
+        );
+        self.dispatch_with_push_constants_timed(
+            timings,
+            "filter-rebuild-filtered-extent-starts",
+            compute_pipeline,
+            descriptor_set,
+            RebuildFilteredExtentStartsPushConstants {
+                extent_count,
+                point_count,
+            },
+            [dispatch_groups_1d(point_count, Self::ONE_D_LOCAL_SIZE_X), 1, 1],
+        );
+    }
+
     fn radix_sort_peaks(
         &self,
         input: &GpuBuffer<u32>,
@@ -1766,7 +1820,9 @@ impl Detector {
             words_per_record,
             timings,
             &format!("{timing_prefix}::gather"),
-        );
+        )
+
+        ;
 
         sorted_records
     }
@@ -1886,11 +1942,14 @@ impl Detector {
             ],
         );
     }
+
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AprilTagSettings, Detector};
+    use super::{AprilTagSettings, DetectedTag, DetectionSettings, Detector};
+    use crate::ComputeDevice;
+    use std::path::PathBuf;
 
     #[test]
     fn identifies_apriltag_36h11_code_and_rotation() {
@@ -1911,5 +1970,71 @@ mod tests {
         let rotated_start = [corners[1], corners[2], corners[3], corners[0]];
         let corrected = Detector::roll_corners(rotated_start, 1);
         assert_eq!(corrected, corners);
+    }
+
+    fn maybe_detector() -> Option<Detector> {
+        std::panic::catch_unwind(|| {
+            let device = ComputeDevice::new_default();
+            Detector::new(
+                device,
+                DetectionSettings {
+                    decimate: Some(2),
+                    ..DetectionSettings::default()
+                },
+            )
+        })
+        .ok()
+    }
+
+    fn fixture_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("input").join("test.jpg")
+    }
+
+    fn tags_signature(tags: &[DetectedTag]) -> Vec<(Option<u32>, bool, Vec<u8>, [i32; 8])> {
+        let mut signature = Vec::with_capacity(tags.len());
+        for tag in tags {
+            let mut corners = [0i32; 8];
+            for corner_index in 0..4 {
+                corners[corner_index * 2] = (tag.corners[corner_index][0] * 1000.0).round() as i32;
+                corners[corner_index * 2 + 1] =
+                    (tag.corners[corner_index][1] * 1000.0).round() as i32;
+            }
+            signature.push((
+                tag.id,
+                tag.reversed_border,
+                tag.payload_bits.clone(),
+                corners,
+            ));
+        }
+        signature.sort_unstable();
+        signature
+    }
+
+    #[test]
+    fn detection_is_deterministic_for_fixture_image() {
+        let Some(detector) = maybe_detector() else {
+            return;
+        };
+
+        let image_path = fixture_path();
+        if !image_path.exists() {
+            return;
+        }
+
+        let image = image::open(image_path).expect("failed to open fixture image");
+        let gray = image.to_luma8();
+
+        let baseline = detector
+            .detect_gray(gray.clone())
+            .expect("detection failed for baseline run");
+        let baseline_signature = tags_signature(&baseline);
+
+        for _ in 0..4 {
+            let tags = detector
+                .detect_gray(gray.clone())
+                .expect("detection failed on repeated run");
+            let signature = tags_signature(&tags);
+            assert_eq!(signature, baseline_signature);
+        }
     }
 }

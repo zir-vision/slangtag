@@ -2,6 +2,7 @@ import "./image_buffer.slang";
 import "../ccl.slang";
 
 RWStructuredBuffer<uint32_t> labels;
+RWStructuredBuffer<uint32_t> final_labels;
 RWStructuredBuffer<uint32_t> union_markers_size_device;
 
 struct PushConstants
@@ -24,10 +25,10 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 
     uint32_t foreground_labels_index = tid.y * dim.x + tid.x;
     uint32_t background_labels_index = (tid.y + 1) * dim.x + tid.x;
-    uint32_t foreground_label = labels[foreground_labels_index];
+    uint32_t foreground_label = find(labels, labels[foreground_labels_index]);
     uint32_t foreground_info_packed = labels[foreground_labels_index + 1];
-    uint32_t background_left_label = labels[background_labels_index];
-    uint32_t background_right_label = labels[background_labels_index + 1];
+    uint32_t background_left_label = find(labels, labels[background_labels_index]);
+    uint32_t background_right_label = find(labels, labels[background_labels_index + 1]);
     uint8_t foreground_info = uint8_t(foreground_info_packed & 0xFF);
     uint8_t background_left_info = uint8_t((foreground_info_packed >> 8) & 0xFF);
     uint8_t background_right_info = uint8_t((foreground_info_packed >> 16) & 0xFF);
@@ -44,10 +45,10 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
         b_label = foreground_labels_index + 1;
         c_label = background_labels_index;
         d_label = background_labels_index + 1;
-        labels[foreground_labels_index] = a_label;
-        labels[foreground_labels_index + 1] = b_label;
-        labels[background_labels_index] = c_label;
-        labels[background_labels_index + 1] = d_label;
+        final_labels[foreground_labels_index] = a_label;
+        final_labels[foreground_labels_index + 1] = b_label;
+        final_labels[background_labels_index] = c_label;
+        final_labels[background_labels_index + 1] = d_label;
         return;
     }
     else
@@ -60,10 +61,10 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
                   (has_bit(background_left_info, Info::c) ? background_left_label : 0u);
         d_label = (has_bit(foreground_info, Info::d) ? foreground_label : 0u) +
                   (has_bit(background_right_info, Info::d) ? background_right_label : 0u);
-        labels[foreground_labels_index] = a_label;
-        labels[foreground_labels_index + 1] = b_label;
-        labels[background_labels_index] = c_label;
-        labels[background_labels_index + 1] = d_label;
+        final_labels[foreground_labels_index] = a_label;
+        final_labels[foreground_labels_index + 1] = b_label;
+        final_labels[background_labels_index] = c_label;
+        final_labels[background_labels_index + 1] = d_label;
     }
 
     if ((foreground_info & 0xf) != 0u)
