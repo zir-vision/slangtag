@@ -181,7 +181,7 @@ impl<'a> CommandRecorder<'a> {
 
     pub fn write_timestamp(
         &mut self,
-        stage: vk::PipelineStageFlags,
+        stage: vk::PipelineStageFlags2,
         query_pool: &GpuQueryPool,
         query: u32,
     ) {
@@ -191,7 +191,7 @@ impl<'a> CommandRecorder<'a> {
         );
         query_pool.assert_range(query, 1);
         unsafe {
-            self.inner.device.cmd_write_timestamp(
+            self.inner.device.cmd_write_timestamp2(
                 self.command_buffer,
                 stage,
                 query_pool.query_pool,
@@ -500,16 +500,10 @@ impl ComputeDevice {
             subgroup_features.subgroup_size_control == vk::TRUE,
             "Vulkan device does not support subgroup size control"
         );
-        let mut subgroup_features_enabled =
-            vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
-                .subgroup_size_control(true)
-                .compute_full_subgroups(true);
 
         let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_features(&requested_features);
-
-        device_create_info = device_create_info.push_next(&mut subgroup_features_enabled);
 
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
             .shader_int8(true)
@@ -517,6 +511,11 @@ impl ComputeDevice {
             .uniform_and_storage_buffer8_bit_access(true);
 
         device_create_info = device_create_info.push_next(&mut features12);
+
+        let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
+            .synchronization2(true).subgroup_size_control(true).compute_full_subgroups(true);
+
+        device_create_info = device_create_info.push_next(&mut features13);
 
         let device = unsafe {
             instance

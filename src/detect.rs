@@ -403,13 +403,13 @@ impl PipelineTimings {
         let start_query = self.allocate_queries(1);
         let end_query = self.allocate_queries(1);
         commands.write_timestamp(
-            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
             &self.query_pool,
             start_query,
         );
         commands.dispatch_with_push_constants(compute_pipeline, bindings, push_constants, dispatch);
         commands.write_timestamp(
-            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
             &self.query_pool,
             end_query,
         );

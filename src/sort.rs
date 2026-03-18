@@ -420,7 +420,7 @@ impl RadixSorter {
         self.device.run_commands(|commands| {
             if let Some((query_pool, query)) = query_pool {
                 commands.reset_query_pool(query_pool, query, Self::TIMESTAMP_QUERY_COUNT);
-                commands.write_timestamp(vk::PipelineStageFlags::ALL_COMMANDS, query_pool, query + 0);
+                commands.write_timestamp(vk::PipelineStageFlags2::ALL_COMMANDS, query_pool, query + 0);
             }
 
             if let Some(element_count) = direct_element_count {
@@ -456,7 +456,7 @@ impl RadixSorter {
             commands.barrier_transfer_write_to_compute_read();
 
             if let Some((query_pool, query)) = query_pool {
-                commands.write_timestamp(vk::PipelineStageFlags::TRANSFER, query_pool, query + 1);
+                commands.write_timestamp(vk::PipelineStageFlags2::TRANSFER, query_pool, query + 1);
             }
 
             for pass in 0..Self::PASSES {
@@ -512,7 +512,7 @@ impl RadixSorter {
                 );
                 if let Some((query_pool, query)) = query_pool {
                     commands.write_timestamp(
-                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags2::COMPUTE_SHADER,
                         query_pool,
                         query + 2 + 3 * pass + 0,
                     );
@@ -527,7 +527,7 @@ impl RadixSorter {
                 );
                 if let Some((query_pool, query)) = query_pool {
                     commands.write_timestamp(
-                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags2::COMPUTE_SHADER,
                         query_pool,
                         query + 2 + 3 * pass + 1,
                     );
@@ -547,7 +547,7 @@ impl RadixSorter {
                 );
                 if let Some((query_pool, query)) = query_pool {
                     commands.write_timestamp(
-                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags2::COMPUTE_SHADER,
                         query_pool,
                         query + 2 + 3 * pass + 2,
                     );
@@ -559,7 +559,7 @@ impl RadixSorter {
             }
 
             if let Some((query_pool, query)) = query_pool {
-                commands.write_timestamp(vk::PipelineStageFlags::ALL_COMMANDS, query_pool, query + 14);
+                commands.write_timestamp(vk::PipelineStageFlags2::ALL_COMMANDS, query_pool, query + 14);
             }
         });
     }
