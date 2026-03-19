@@ -3203,9 +3203,7 @@ dependencies = [
  "colored",
  "eframe",
  "image",
- "num-traits",
  "rfd",
- "tracing",
  "vk-mem",
 ]
 

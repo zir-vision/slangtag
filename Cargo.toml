@@ -6,21 +6,13 @@ edition = "2024"
 [dependencies]
 ash = "0.38.0"
 bytemuck = { version = "1.25.0", features = ["derive"] }
-colored = "3.1.1"
-eframe = "0.33.0"
 image = "0.25.9"
-num-traits = "0.2.19"
-rfd = "0.15.4"
-tracing = "0.1.44"
 vk-mem = "0.5.0"
 
-[[bin]]
-name = "slangtag-gui"
-path = "src/gui.rs"
-
-[[bin]]
-name = "slangtag"
-path = "src/bin.rs"
+[dev-dependencies]
+eframe = "0.33.0"
+colored = "3.1.1"
+rfd = "0.15.4"
 
 [profile.release]
 debug = true
