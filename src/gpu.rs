@@ -786,27 +786,6 @@ impl CachedCommandBuffer {
         }
     }
 
-    pub(crate) fn update_storage_buffer_binding(
-        &self,
-        descriptor_set: vk::DescriptorSet,
-        binding: u32,
-        buffer: DescriptorBuffer,
-    ) {
-        let info = vk::DescriptorBufferInfo::default()
-            .buffer(buffer.buffer)
-            .offset(buffer.offset)
-            .range(buffer.range);
-        let write = vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
-            .dst_binding(binding)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(std::slice::from_ref(&info));
-        unsafe {
-            self.inner
-                .device
-                .update_descriptor_sets(std::slice::from_ref(&write), &[]);
-        }
-    }
 }
 
 impl ComputeDevice {
