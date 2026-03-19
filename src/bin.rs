@@ -64,7 +64,8 @@ fn main() {
         true,
     );
 
-    let det = Detector::new_with_size(dev, settings, input_size);
+    let det =
+        Detector::new(dev, settings, input_size).expect("failed to initialize fixed-size detector");
 
     let mut total_wall_ms = 0.0f64;
     let mut total_gpu_ms = 0.0f64;
@@ -75,12 +76,13 @@ fn main() {
 
     for _ in 0..runs {
         let start = Instant::now();
-        let (tags, timing_report) = det
-            .detect_gpu_buffer_with_timing(input_gpu_buffer.descriptor(), input_size)
+        let output = det
+            .detect_descriptor(input_gpu_buffer.descriptor(), input_size)
             .expect("Detection failed");
+        let timing_report = output.timing;
         total_wall_ms += start.elapsed().as_secs_f64() * 1_000.0;
         total_gpu_ms += timing_report.total_ms;
-        tag_count = tags.len();
+        tag_count = output.tags.len();
 
         for span in timing_report.spans {
             let index = if let Some(existing_index) = ordered_span_names

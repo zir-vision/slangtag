@@ -2,13 +2,12 @@ use ash::vk;
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use image::GrayImage;
 use slangtag::{
-    ComputeDevice,
+    ComputeDevice, Size,
     detect::{
         AprilTagSettings, BlobPairFilterSettings, DecodeSettings, DetectedTag, DetectionSettings,
         Detector, QuadFitSettings,
     },
     gpu::GpuBuffer,
-    Size,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -169,7 +168,7 @@ struct UploadedInput {
 struct ViewerApp {
     device: ComputeDevice,
     settings: ViewerSettings,
-    detector: Detector,
+    detector: Option<Detector>,
     loaded_image: Option<LoadedImage>,
     detections: Vec<DetectedTag>,
     last_runtime: Option<Duration>,
@@ -181,11 +180,10 @@ impl ViewerApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let device = ComputeDevice::new_default();
         let settings = ViewerSettings::default();
-        let detector = Detector::new(device.clone(), settings.to_detection_settings());
         Self {
             device,
             settings,
-            detector,
+            detector: None,
             loaded_image: None,
             detections: Vec::new(),
             last_runtime: None,
@@ -197,16 +195,14 @@ impl ViewerApp {
     fn rebuild_detector(&mut self) {
         let detection_settings = self.settings.to_detection_settings();
         if let Some(image) = self.loaded_image.as_ref() {
-            if let Some(size) =
-                normalized_size_for_decimate(image.width, image.height, detection_settings.decimate)
-            {
-                self.detector =
-                    Detector::new_with_size(self.device.clone(), detection_settings, size);
-            } else {
-                self.detector = Detector::new(self.device.clone(), detection_settings);
-            }
+            self.detector = normalized_size_for_decimate(
+                image.width,
+                image.height,
+                detection_settings.decimate,
+            )
+            .and_then(|size| Detector::new(self.device.clone(), detection_settings, size).ok());
         } else {
-            self.detector = Detector::new(self.device.clone(), detection_settings);
+            self.detector = None;
         }
     }
 
@@ -247,8 +243,7 @@ impl ViewerApp {
         };
         if self.ensure_uploaded_input().is_err() {
             self.last_runtime = None;
-            self.status =
-                "Detection failed. One or more parameter values are invalid.".to_owned();
+            self.status = "Detection failed. One or more parameter values are invalid.".to_owned();
             self.detections.clear();
             return;
         }
@@ -266,16 +261,19 @@ impl ViewerApp {
         };
 
         let start = std::time::Instant::now();
-        match self
-            .detector
-            .detect_gpu_buffer(uploaded_input.buffer.descriptor(), uploaded_input.size)
-        {
-            Ok(tags) => {
+        let Some(detector) = self.detector.as_ref() else {
+            self.last_runtime = None;
+            self.status = "Detection failed. Invalid image size or settings.".to_owned();
+            self.detections.clear();
+            return;
+        };
+        match detector.detect_descriptor(uploaded_input.buffer.descriptor(), uploaded_input.size) {
+            Ok(output) => {
                 self.last_runtime = Some(start.elapsed());
-                self.status = format!("Detected {} tags", tags.len());
-                self.detections = tags;
+                self.status = format!("Detected {} tags", output.tags.len());
+                self.detections = output.tags;
             }
-            Err(()) => {
+            Err(_) => {
                 self.last_runtime = None;
                 self.status =
                     "Detection failed. One or more parameter values are invalid.".to_owned();
@@ -298,7 +296,8 @@ impl ViewerApp {
             return Ok(());
         }
 
-        let aligned_gray = crop_image_to_multiple(image.gray.clone(), 4 * decimate.unwrap_or(1) as u32)?;
+        let aligned_gray =
+            crop_image_to_multiple(image.gray.clone(), 4 * decimate.unwrap_or(1) as u32)?;
         let uploaded_size = Size::new(aligned_gray.width(), aligned_gray.height());
         let uploaded_buffer = self.device.upload_buffer(
             aligned_gray.as_raw(),

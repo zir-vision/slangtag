@@ -701,7 +701,9 @@ impl Drop for CachedCommandBuffer {
             self.inner
                 .device
                 .free_command_buffers(self.command_pool, &[self.command_buffer]);
-            self.inner.device.destroy_command_pool(self.command_pool, None);
+            self.inner
+                .device
+                .destroy_command_pool(self.command_pool, None);
         }
     }
 }
@@ -785,7 +787,6 @@ impl CachedCommandBuffer {
                 .expect("failed to wait for cached command fence");
         }
     }
-
 }
 
 impl ComputeDevice {

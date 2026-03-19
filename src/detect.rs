@@ -6,8 +6,10 @@ use crate::sort::RadixSorter;
 use crate::{ComputeDevice, Size, compute_shader_path, include_u32};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use image::{DynamicImage, GrayImage, ImageBuffer};
+use image::{DynamicImage, GrayImage};
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 use std::sync::{Arc, LazyLock, Mutex};
 
 include!("apriltag36h11_codes.rs");
@@ -45,80 +47,170 @@ static APRILTAG_36H11_EXACT_LOOKUP: LazyLock<HashMap<u64, (u32, u8)>> = LazyLock
     by_code
 });
 
+/// Controls AprilTag detection behavior.
+///
+/// Use [`DetectionSettings::default`] for a balanced preset, or one of the
+/// convenience constructors to bias speed/quality.
 pub struct DetectionSettings {
+    /// Optional downsample factor (`None` means no downsampling, equivalent to `1`).
+    ///
+    /// When set, this must be a power of two (for example `1`, `2`, `4`, `8`).
     pub decimate: Option<u8>,
+    /// Minimum white-black intensity difference in thresholding (`0..=255`).
     pub min_white_black_diff: u8,
+    /// Minimum connected-component size in pixels.
     pub min_blob_size: u32,
+    /// Candidate blob-pair filtering parameters.
     pub blob_pair_filter: BlobPairFilterSettings,
+    /// Quad fitting parameters.
     pub quad_fit: QuadFitSettings,
+    /// Bit sampling and decode parameters.
     pub decode: DecodeSettings,
+    /// AprilTag id decode/error-correction parameters.
     pub apriltag: AprilTagSettings,
 }
 
 #[derive(Clone, Copy)]
+/// Filtering thresholds for candidate blob pairs before quad fitting.
 pub struct BlobPairFilterSettings {
+    /// Minimum side length (pixels) for accepted tags.
     pub min_tag_width: u32,
+    /// Expected inner tag width in border-cell units.
     pub tag_width: u32,
+    /// Border width for inverted markers in border-cell units.
     pub reversed_border: u32,
+    /// Border width for normal markers in border-cell units.
     pub normal_border: u32,
+    /// Minimum cluster size in pixels.
     pub min_cluster_pixels: u32,
+    /// Optional absolute maximum cluster size in pixels.
     pub max_cluster_pixels: Option<u32>,
+    /// Perimeter-based cluster cap scale (must be non-zero).
     pub max_cluster_pixels_perimeter_scale: u32,
 }
 
 #[derive(Clone, Copy)]
+/// Numerical thresholds for quad line fitting.
 pub struct QuadFitSettings {
+    /// Maximum number of local maxima considered per extent.
     pub max_nmaxima: u32,
+    /// Maximum mean-squared line fit error.
     pub max_line_fit_mse: f32,
+    /// Corner cosine threshold in radians domain.
     pub cos_critical_rad: f32,
 }
 
 #[derive(Clone, Copy)]
+/// Controls per-cell bit extraction and decode behavior.
 pub struct DecodeSettings {
+    /// Decode cell side length in pixels (must be non-zero).
     pub cell_size: u32,
+    /// Minimum Otsu standard deviation for valid sampling.
     pub min_stddev_otsu: f32,
+    /// Extra margin in pixels sampled around each decode cell.
     pub cell_margin_pixels: u32,
+    /// Sampling span in pixels (must be non-zero).
     pub cell_span: u32,
+    /// If true, also attempt decoding inverted black/white polarity.
     pub detect_inverted_marker: bool,
+    /// Allowed erroneous border bit ratio (`0.0..=1.0` is typical).
     pub max_erroneous_border_bits_rate: f32,
 }
 
 #[derive(Clone, Copy)]
+/// AprilTag family decode/correction limits.
 pub struct AprilTagSettings {
+    /// Error-correction rate used to derive correction budget.
     pub error_correction_rate: f32,
+    /// Hard cap on corrected bits (`0` means derived from rate only).
     pub max_correction_bits: u32,
 }
 
 #[derive(Debug, Clone)]
+/// A single detected tag candidate with decoded payload (if recognized).
 pub struct DetectedTag {
+    /// Index of the fitted quad in intermediate GPU output.
     pub quad_index: u32,
+    /// Decoded tag id (if AprilTag decode succeeded).
     pub id: Option<u32>,
+    /// Source blob index used to generate this candidate.
     pub blob_index: u32,
+    /// Whether this candidate used inverted border polarity.
     pub reversed_border: bool,
+    /// Detection score produced by quad fitting.
     pub score: f32,
+    /// Quad corners in image pixel space, clockwise order.
     pub corners: [[f32; 2]; 4],
+    /// Full marker bits including border cells.
     pub bits_with_border: Vec<u8>,
+    /// Payload bits only (border removed).
     pub payload_bits: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
+/// Timing span for one GPU stage.
 pub struct GpuTimingSpan {
+    /// Stage name.
     pub name: String,
+    /// Stage elapsed time in milliseconds.
     pub elapsed_ms: f64,
 }
 
 #[derive(Debug, Clone, Default)]
+/// Aggregated GPU timings for a detection invocation.
 pub struct GpuTimingReport {
+    /// Per-stage timing spans in execution order.
     pub spans: Vec<GpuTimingSpan>,
+    /// Sum of all timed stage durations in milliseconds.
     pub total_ms: f64,
 }
 
+/// Detection output containing decoded tags and GPU stage timings.
+#[derive(Debug, Clone, Default)]
+pub struct DetectionOutput {
+    /// Detected tags for this invocation.
+    pub tags: Vec<DetectedTag>,
+    /// GPU execution timings for this invocation.
+    pub timing: GpuTimingReport,
+}
+
+/// Typed detection failures returned by [`Detector`] APIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetectError {
+    /// Configuration is internally inconsistent or invalid.
+    InvalidSettings,
+    /// Input image size becomes zero after required alignment.
+    InvalidInputSize,
+    /// Input size does not match a detector created with fixed-size caching.
+    FixedSizeMismatch,
+    /// Failed to build or initialize the cached GPU execution state.
+    CacheBuildFailed,
+    /// Internal detector cache mutex is poisoned.
+    CacheLockPoisoned,
+}
+
+impl fmt::Display for DetectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let msg = match self {
+            Self::InvalidSettings => "invalid detection settings",
+            Self::InvalidInputSize => "input size is invalid after decimate alignment",
+            Self::FixedSizeMismatch => "input size does not match fixed-size detector",
+            Self::CacheBuildFailed => "failed to build detector cache",
+            Self::CacheLockPoisoned => "detector cache lock is poisoned",
+        };
+        f.write_str(msg)
+    }
+}
+
+impl Error for DetectError {}
+
+/// GPU AprilTag detector and decode pipeline.
 pub struct Detector {
     device: ComputeDevice,
     settings: DetectionSettings,
     pipelines: DetectionPipelines,
     sorter: RadixSorter,
-    fixed_size: Option<Size>,
+    fixed_size: Size,
     cached_execution: Mutex<Option<CachedDetectorExecution>>,
 }
 
@@ -317,6 +409,30 @@ impl Default for DetectionSettings {
     }
 }
 
+impl DetectionSettings {
+    /// Speed-oriented preset that increases downsampling and decode tolerance.
+    pub fn fast() -> Self {
+        let mut settings = Self {
+            decimate: Some(4),
+            ..Self::default()
+        };
+        settings.quad_fit.max_nmaxima = 8;
+        settings.quad_fit.max_line_fit_mse = 14.0;
+        settings
+    }
+
+    /// Quality-oriented preset that reduces downsampling and tightens fitting.
+    pub fn high_quality() -> Self {
+        let mut settings = Self {
+            decimate: Some(1),
+            ..Self::default()
+        };
+        settings.quad_fit.max_line_fit_mse = 8.0;
+        settings.decode.min_stddev_otsu = 4.0;
+        settings
+    }
+}
+
 impl Default for BlobPairFilterSettings {
     fn default() -> Self {
         Self {
@@ -459,7 +575,6 @@ impl PipelineTimings {
             end_query,
         });
     }
-
 
     fn dispatch_indirect_with_push_constants<T: Pod + Copy>(
         &mut self,
@@ -760,52 +875,40 @@ impl Detector {
     const CONTROL_WORD_COUNT: usize = 80;
     const CONTROL_COUNTER_WORD_COUNT: usize = 6;
 
-    pub fn new(device: ComputeDevice, settings: DetectionSettings) -> Self {
+    /// Creates a fixed-size detector with explicit settings and pre-built GPU cache.
+    ///
+    /// The provided `size` is aligned internally to `4 * decimate`; all detection
+    /// inputs must resolve to the same aligned size.
+    ///
+    /// Returns:
+    /// - [`DetectError::InvalidInputSize`] when aligned size is zero.
+    /// - [`DetectError::InvalidSettings`] for invalid settings.
+    /// - [`DetectError::CacheBuildFailed`] if cache initialization fails.
+    pub fn new(
+        device: ComputeDevice,
+        settings: DetectionSettings,
+        size: Size,
+    ) -> Result<Self, DetectError> {
         let pipelines = DetectionPipelines::new(&device);
         let sorter = RadixSorter::new(device.clone());
-        Self {
+        let mut detector = Self {
             device,
             settings,
             pipelines,
             sorter,
-            fixed_size: None,
+            fixed_size: Size::new(0, 0),
             cached_execution: Mutex::new(None),
-        }
-    }
-
-    pub fn new_with_size(device: ComputeDevice, settings: DetectionSettings, size: Size) -> Self {
-        let mut detector = Self::new(device, settings);
+        };
+        detector.validate_settings()?;
         let normalized_size = detector
             .normalize_input_size(size)
-            .expect("input size is too small after decimate alignment");
-        detector.fixed_size = Some(normalized_size);
-        detector
+            .ok_or(DetectError::InvalidInputSize)?;
+        detector.fixed_size = normalized_size;
+        let cached = detector
             .build_cached_execution(normalized_size)
-            .map(|cached| {
-                detector.cached_execution = Mutex::new(Some(cached));
-            })
-            .expect("failed to build cached detector execution");
-        detector
-    }
-
-    fn ensure_cached_execution<'a>(
-        &'a self,
-        size: Size,
-        guard: &'a mut Option<CachedDetectorExecution>,
-    ) -> Result<&'a mut CachedDetectorExecution, ()> {
-        let normalized_size = self.normalize_input_size(size).ok_or(())?;
-        if let Some(expected_size) = self.fixed_size
-            && (expected_size.width != normalized_size.width
-                || expected_size.height != normalized_size.height)
-        {
-            return Err(());
-        }
-
-        if guard.is_none() {
-            *guard = Some(self.build_cached_execution(normalized_size)?);
-        }
-
-        guard.as_mut().ok_or(())
+            .map_err(|_| DetectError::CacheBuildFailed)?;
+        detector.cached_execution = Mutex::new(Some(cached));
+        Ok(detector)
     }
 
     fn normalize_input_size(&self, size: Size) -> Option<Size> {
@@ -820,7 +923,7 @@ impl Detector {
         &self,
         cached: &mut CachedDetectorExecution,
         input: DescriptorBuffer,
-    ) -> Result<(Vec<DetectedTag>, GpuTimingReport), ()> {
+    ) -> DetectionOutput {
         self.device.copy_descriptor_buffer_to_buffer(
             input,
             &cached._buffers.input_placeholder,
@@ -829,11 +932,16 @@ impl Detector {
         cached.command_buffer.submit_and_wait();
 
         let timing_report = cached.timings.summary(&self.device);
-        let counters = cached.readback_counters.read(Self::CONTROL_COUNTER_WORD_COUNT);
+        let counters = cached
+            .readback_counters
+            .read(Self::CONTROL_COUNTER_WORD_COUNT);
         let fitted_quad_count_value = counters[Self::CONTROL_FITTED_QUAD_COUNT_WORD as usize]
             .min(cached.max_quad_capacity_u32);
         if fitted_quad_count_value == 0 {
-            return Ok((Vec::new(), timing_report));
+            return DetectionOutput {
+                tags: Vec::new(),
+                timing: timing_report,
+            };
         }
 
         let fitted_quad_words = cached
@@ -844,10 +952,13 @@ impl Detector {
             .read(fitted_quad_count_value as usize * Self::MARKER_SIZE_WITH_BORDERS.pow(2));
         let tags =
             self.build_detected_tags(&fitted_quad_words, fitted_quad_count_value, &bits_words);
-        Ok((tags, timing_report))
+        DetectionOutput {
+            tags,
+            timing: timing_report,
+        }
     }
 
-    fn build_cached_execution(&self, size: Size) -> Result<CachedDetectorExecution, ()> {
+    fn build_cached_execution(&self, size: Size) -> Result<CachedDetectorExecution, DetectError> {
         self.validate_settings()?;
 
         let input_placeholder = self.new_u8_storage_buffer(size.total_pixels().max(1));
@@ -1293,8 +1404,8 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            let primary_blob_query = timings
-                .reserve_radix_sort_queries("radix-sort-blob-diff-points::primary-key-sort");
+            let primary_blob_query =
+                timings.reserve_radix_sort_queries("radix-sort-blob-diff-points::primary-key-sort");
             self.sorter.record_sort_key_value_indirect_with_query_pool(
                 commands,
                 blob_diff_total_points.max(1),
@@ -1890,90 +2001,71 @@ impl Detector {
         })
     }
 
-    pub fn detect(&self, image: DynamicImage) -> Result<Vec<DetectedTag>, ()> {
+    /// Runs detection on a dynamic image by converting it to grayscale first.
+    ///
+    /// Returns the same errors as [`Detector::detect_gray`].
+    pub fn detect_image(&self, image: DynamicImage) -> Result<DetectionOutput, DetectError> {
         let gray_image = image.to_luma8();
         self.detect_gray(gray_image)
     }
 
-    pub fn detect_gray(
-        &self,
-        image: ImageBuffer<image::Luma<u8>, Vec<u8>>,
-    ) -> Result<Vec<DetectedTag>, ()> {
-        self.detect_gray_with_timing(image).map(|(tags, _)| tags)
-    }
-
-    pub fn detect_gpu_buffer(
-        &self,
-        input: DescriptorBuffer,
-        size: Size,
-    ) -> Result<Vec<DetectedTag>, ()> {
-        self.detect_gpu_buffer_with_timing(input, size)
-            .map(|(tags, _)| tags)
-    }
-
-    pub fn detect_gpu_buffer_with_timing(
-        &self,
-        input: DescriptorBuffer,
-        size: Size,
-    ) -> Result<(Vec<DetectedTag>, GpuTimingReport), ()> {
-        self.validate_settings()?;
-        self.detect_gpu_buffer_with_timing_single_submit(input, size)
-    }
-
-    pub fn detect_vk_buffer(
-        &self,
-        buffer: vk::Buffer,
-        offset: vk::DeviceSize,
-        range: vk::DeviceSize,
-        size: Size,
-    ) -> Result<Vec<DetectedTag>, ()> {
-        self.detect_gpu_buffer(DescriptorBuffer::new(buffer, offset, range), size)
-    }
-
-    pub fn detect_vk_buffer_with_timing(
-        &self,
-        buffer: vk::Buffer,
-        offset: vk::DeviceSize,
-        range: vk::DeviceSize,
-        size: Size,
-    ) -> Result<(Vec<DetectedTag>, GpuTimingReport), ()> {
-        self.detect_gpu_buffer_with_timing(DescriptorBuffer::new(buffer, offset, range), size)
-    }
-
-    fn detect_gpu_buffer_with_timing_single_submit(
-        &self,
-        input: DescriptorBuffer,
-        size: Size,
-    ) -> Result<(Vec<DetectedTag>, GpuTimingReport), ()> {
-        let mut guard = self
-            .cached_execution
-            .lock()
-            .expect("failed to lock cached detector execution");
-        let cached = self.ensure_cached_execution(size, &mut guard)?;
-        self.run_cached_execution(cached, input)
-    }
-
-    pub fn detect_gray_with_timing(
-        &self,
-        image: ImageBuffer<image::Luma<u8>, Vec<u8>>,
-    ) -> Result<(Vec<DetectedTag>, GpuTimingReport), ()> {
+    /// Runs detection on a grayscale image.
+    ///
+    /// The image is aligned to `4 * decimate` pixels internally. If alignment would
+    /// produce a zero-sized image, returns [`DetectError::InvalidInputSize`].
+    ///
+    /// Returns:
+    /// - [`DetectError::InvalidSettings`] for invalid detector settings.
+    /// - [`DetectError::InvalidInputSize`] if aligned input is empty.
+    /// - [`DetectError::FixedSizeMismatch`] for fixed-size detectors with mismatched input.
+    /// - [`DetectError::CacheLockPoisoned`] if cache lock is poisoned.
+    pub fn detect_gray(&self, image: GrayImage) -> Result<DetectionOutput, DetectError> {
         self.validate_settings()?;
 
         let decimate_factor = self.settings.decimate.unwrap_or(1) as u32;
-        let aligned_input = crop_image_to_multiple(image, 4 * decimate_factor)?;
+        let aligned_input = crop_image_to_multiple(image, 4 * decimate_factor)
+            .map_err(|_| DetectError::InvalidInputSize)?;
         let input_gpu_image =
             crate::GPUImage::from_image_buffer(self.device.clone(), aligned_input);
-        self.detect_gpu_buffer_with_timing_single_submit(
-            input_gpu_image.image.descriptor(),
-            input_gpu_image.size,
-        )
+        self.detect_descriptor(input_gpu_image.image.descriptor(), input_gpu_image.size)
     }
 
-    fn validate_settings(&self) -> Result<(), ()> {
+    /// Runs detection on a GPU descriptor buffer containing a grayscale image.
+    ///
+    /// Use this for repeated runs on pre-uploaded data to avoid CPU->GPU transfer.
+    ///
+    /// Returns:
+    /// - [`DetectError::InvalidSettings`] for invalid detector settings.
+    /// - [`DetectError::InvalidInputSize`] if aligned input is empty.
+    /// - [`DetectError::FixedSizeMismatch`] for fixed-size detectors with mismatched input.
+    /// - [`DetectError::CacheLockPoisoned`] if cache lock is poisoned.
+    pub fn detect_descriptor(
+        &self,
+        input: DescriptorBuffer,
+        size: Size,
+    ) -> Result<DetectionOutput, DetectError> {
+        self.validate_settings()?;
+        let normalized_size = self
+            .normalize_input_size(size)
+            .ok_or(DetectError::InvalidInputSize)?;
+        if normalized_size.width != self.fixed_size.width
+            || normalized_size.height != self.fixed_size.height
+        {
+            return Err(DetectError::FixedSizeMismatch);
+        }
+        let mut guard = self
+            .cached_execution
+            .lock()
+            .map_err(|_| DetectError::CacheLockPoisoned)?;
+        let cached = guard.as_mut().ok_or(DetectError::CacheBuildFailed)?;
+        Ok(self.run_cached_execution(cached, input))
+    }
+
+    fn validate_settings(&self) -> Result<(), DetectError> {
         if let Some(factor) = self.settings.decimate
             && !is_power_of_two(factor)
         {
-            return Err(());
+            return Err(DetectError::InvalidSettings);
         }
 
         if self.settings.decode.cell_size == 0
@@ -1984,7 +2076,7 @@ impl Detector {
                 .max_cluster_pixels_perimeter_scale
                 == 0
         {
-            return Err(());
+            return Err(DetectError::InvalidSettings);
         }
 
         Ok(())
@@ -2289,13 +2381,12 @@ impl Detector {
         self.device.fill_buffer_u32(&buf, 0);
         buf
     }
-
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AprilTagSettings, DetectedTag, DetectionSettings, Detector};
-    use crate::ComputeDevice;
+    use super::{AprilTagSettings, DetectError, DetectedTag, DetectionSettings, Detector};
+    use crate::{ComputeDevice, Size};
     use std::path::PathBuf;
 
     #[test]
@@ -2328,7 +2419,9 @@ mod tests {
                     decimate: Some(2),
                     ..DetectionSettings::default()
                 },
+                Size::new(16, 16),
             )
+            .expect("failed to build detector")
         })
         .ok()
     }
@@ -2373,17 +2466,102 @@ mod tests {
         let image = image::open(image_path).expect("failed to open fixture image");
         let gray = image.to_luma8();
 
+        let detector = Detector::new(
+            detector.device.clone(),
+            DetectionSettings {
+                decimate: Some(2),
+                ..DetectionSettings::default()
+            },
+            Size::new(gray.width(), gray.height()),
+        )
+        .expect("failed to build sized detector");
+
         let baseline = detector
             .detect_gray(gray.clone())
             .expect("detection failed for baseline run");
-        let baseline_signature = tags_signature(&baseline);
+        let baseline_signature = tags_signature(&baseline.tags);
+        assert!(baseline.timing.total_ms >= 0.0);
 
         for _ in 0..4 {
-            let tags = detector
+            let output = detector
                 .detect_gray(gray.clone())
                 .expect("detection failed on repeated run");
-            let signature = tags_signature(&tags);
+            let signature = tags_signature(&output.tags);
             assert_eq!(signature, baseline_signature);
         }
+    }
+
+    #[test]
+    fn detect_returns_invalid_settings_for_non_power_of_two_decimate() {
+        let Some(err) = std::panic::catch_unwind(|| {
+            let device = ComputeDevice::new_default();
+            match Detector::new(
+                device,
+                DetectionSettings {
+                    decimate: Some(3),
+                    ..DetectionSettings::default()
+                },
+                Size::new(16, 16),
+            ) {
+                Ok(_) => panic!("invalid decimate should fail constructor"),
+                Err(err) => err,
+            }
+        })
+        .ok() else {
+            return;
+        };
+        assert_eq!(err, DetectError::InvalidSettings);
+    }
+
+    #[test]
+    fn detect_returns_invalid_input_size_for_tiny_image() {
+        let Some(detector) = maybe_detector() else {
+            return;
+        };
+        let image = image::GrayImage::from_pixel(1, 1, image::Luma([0]));
+        let err = detector
+            .detect_gray(image)
+            .expect_err("tiny image should fail alignment");
+        assert_eq!(err, DetectError::InvalidInputSize);
+    }
+
+    #[test]
+    fn fixed_size_detector_rejects_mismatched_descriptor_size() {
+        let Some((detector, device)) = std::panic::catch_unwind(|| {
+            let device = ComputeDevice::new_default();
+            let detector = Detector::new(
+                device.clone(),
+                DetectionSettings::default(),
+                Size::new(64, 64),
+            )
+            .expect("failed to build fixed-size detector");
+            (detector, device)
+        })
+        .ok() else {
+            return;
+        };
+
+        let buffer = device.upload_buffer(
+            &[0u8; 64 * 64],
+            ash::vk::BufferUsageFlags::STORAGE_BUFFER | ash::vk::BufferUsageFlags::TRANSFER_SRC,
+            true,
+        );
+        let err = detector
+            .detect_descriptor(buffer.descriptor(), Size::new(32, 32))
+            .expect_err("mismatched descriptor size should fail");
+        assert_eq!(err, DetectError::FixedSizeMismatch);
+    }
+
+    #[test]
+    fn canonical_api_returns_timing_output() {
+        let Some(detector) = maybe_detector() else {
+            return;
+        };
+        let image =
+            image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(16, 16, image::Luma([0])));
+        let output = detector
+            .detect_image(image)
+            .expect("canonical detect_image API should succeed");
+        let _timing_total = output.timing.total_ms;
     }
 }
