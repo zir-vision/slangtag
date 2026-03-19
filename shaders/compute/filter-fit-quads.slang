@@ -1,4 +1,5 @@
 import "../filter.slang";
+import "./detect-control.slang";
 
 StructuredBuffer<uint32_t> sorted_peaks;
 StructuredBuffer<uint32_t> peak_extents;
@@ -6,6 +7,7 @@ StructuredBuffer<uint32_t> line_fit_points;
 StructuredBuffer<uint32_t> filtered_blob_extents;
 RWStructuredBuffer<uint32_t> fitted_quads_out;
 RWStructuredBuffer<uint32_t> fitted_quad_count_out;
+StructuredBuffer<uint32_t> control;
 
 struct PushConstants
 {
@@ -230,8 +232,8 @@ float triangle_area(float2 a, float2 b, float2 c)
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     uint32_t tid = dispatch_thread_id.x;
-    uint32_t peak_extent_count = pc.peak_extent_count;
-    uint32_t filtered_blob_extent_count = pc.filtered_blob_extent_count;
+    uint32_t peak_extent_count = control[kControlPeakExtentCountWord];
+    uint32_t filtered_blob_extent_count = control[kControlBlobExtentCountWord];
     uint32_t max_nmaxima = pc.max_nmaxima;
     float max_line_fit_mse = pc.max_line_fit_mse;
     float cos_critical_rad = pc.cos_critical_rad;

@@ -1,10 +1,12 @@
 import "../filter.slang";
+import "./detect-control.slang";
 
 StructuredBuffer<uint32_t> sorted_points;
 StructuredBuffer<uint32_t> extents_in;
 StructuredBuffer<uint32_t> point_extent_indices;
 StructuredBuffer<uint32_t> filtered_extents;
 RWStructuredBuffer<uint32_t> selected_points_out;
+StructuredBuffer<uint32_t> control;
 struct PushConstants
 {
     uint32_t extent_count;
@@ -33,8 +35,8 @@ uint32_t point_theta_from_extent(StructuredBuffer<uint32_t> extents,
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     uint32_t tid = dispatch_thread_id.x;
-    uint32_t extent_count = pc.extent_count;
-    uint32_t valid_points = pc.valid_points;
+    uint32_t extent_count = control[kControlBlobExtentCountWord];
+    uint32_t valid_points = control[kControlBlobDiffFilteredCountWord];
     if (tid >= valid_points)
         return;
 

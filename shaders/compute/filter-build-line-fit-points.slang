@@ -1,10 +1,12 @@
 import "./image_buffer.slang";
 import "../filter.slang";
+import "./detect-control.slang";
 
 StructuredBuffer<uint32_t> sorted_selected_points;
 StructuredBuffer<uint8_t> decimated_image;
 StructuredBuffer<uint32_t> filtered_extents;
 RWStructuredBuffer<uint32_t> line_fit_points_out;
+StructuredBuffer<uint32_t> control;
 
 struct PushConstants
 {
@@ -22,7 +24,9 @@ ConstantBuffer<PushConstants> pc;
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     uint tid = dispatch_thread_id.x;
-    if (tid >= pc.extent_count)
+    uint32_t extent_count = control[kControlBlobExtentCountWord];
+    uint32_t point_count = control[kControlSelectedBlobPointCountWord];
+    if (tid >= extent_count)
         return;
 
     uint32_t blob_index = tid;
@@ -41,7 +45,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
     for (uint32_t local_index = 0u; local_index < count; ++local_index)
     {
         uint32_t i = start + local_index;
-        if (i >= pc.point_count)
+        if (i >= point_count)
             return;
 
         uint32_t point_blob_index = read_selected_blob_point_word(sorted_selected_points, i, kSelectedPointBlobIndexWord);

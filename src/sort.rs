@@ -1,4 +1,6 @@
-use crate::gpu::{BufferMemory, ComputePipeline, DescriptorBuffer, GpuBuffer, GpuQueryPool};
+use crate::gpu::{
+    BufferMemory, CommandRecorder, ComputePipeline, DescriptorBuffer, GpuBuffer, GpuQueryPool,
+};
 use crate::{ComputeDevice, compute_shader_path, include_u32};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
@@ -188,6 +190,35 @@ impl RadixSorter {
         );
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn record_sort_with_query_pool(
+        &self,
+        commands: &mut CommandRecorder<'_>,
+        element_count: u32,
+        keys_buffer: &GpuBuffer<u32>,
+        keys_offset: vk::DeviceSize,
+        storage_buffer: &GpuBuffer<u32>,
+        storage_offset: vk::DeviceSize,
+        query_pool: Option<(&GpuQueryPool, u32)>,
+    ) {
+        if element_count <= 1 {
+            return;
+        }
+
+        self.gpu_sort_recorded(
+            commands,
+            element_count,
+            Some(element_count),
+            None,
+            keys_buffer,
+            keys_offset,
+            None,
+            storage_buffer,
+            storage_offset,
+            query_pool,
+        );
+    }
+
     pub fn cmd_sort_indirect(
         &self,
         max_element_count: u32,
@@ -238,6 +269,37 @@ impl RadixSorter {
         );
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn record_sort_indirect_with_query_pool(
+        &self,
+        commands: &mut CommandRecorder<'_>,
+        max_element_count: u32,
+        indirect_buffer: &GpuBuffer<u32>,
+        indirect_offset: vk::DeviceSize,
+        keys_buffer: &GpuBuffer<u32>,
+        keys_offset: vk::DeviceSize,
+        storage_buffer: &GpuBuffer<u32>,
+        storage_offset: vk::DeviceSize,
+        query_pool: Option<(&GpuQueryPool, u32)>,
+    ) {
+        if max_element_count <= 1 {
+            return;
+        }
+
+        self.gpu_sort_recorded(
+            commands,
+            max_element_count,
+            None,
+            Some((indirect_buffer, indirect_offset)),
+            keys_buffer,
+            keys_offset,
+            None,
+            storage_buffer,
+            storage_offset,
+            query_pool,
+        );
+    }
+
     pub fn cmd_sort_key_value(
         &self,
         element_count: u32,
@@ -276,6 +338,37 @@ impl RadixSorter {
         }
 
         self.gpu_sort(
+            element_count,
+            Some(element_count),
+            None,
+            keys_buffer,
+            keys_offset,
+            Some((values_buffer, values_offset)),
+            storage_buffer,
+            storage_offset,
+            query_pool,
+        );
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_sort_key_value_with_query_pool(
+        &self,
+        commands: &mut CommandRecorder<'_>,
+        element_count: u32,
+        keys_buffer: &GpuBuffer<u32>,
+        keys_offset: vk::DeviceSize,
+        values_buffer: &GpuBuffer<u32>,
+        values_offset: vk::DeviceSize,
+        storage_buffer: &GpuBuffer<u32>,
+        storage_offset: vk::DeviceSize,
+        query_pool: Option<(&GpuQueryPool, u32)>,
+    ) {
+        if element_count <= 1 {
+            return;
+        }
+
+        self.gpu_sort_recorded(
+            commands,
             element_count,
             Some(element_count),
             None,
@@ -344,8 +437,69 @@ impl RadixSorter {
         );
     }
 
+    pub(crate) fn record_sort_key_value_indirect_with_query_pool(
+        &self,
+        commands: &mut CommandRecorder<'_>,
+        max_element_count: u32,
+        indirect_buffer: &GpuBuffer<u32>,
+        indirect_offset: vk::DeviceSize,
+        keys_buffer: &GpuBuffer<u32>,
+        keys_offset: vk::DeviceSize,
+        values_buffer: &GpuBuffer<u32>,
+        values_offset: vk::DeviceSize,
+        storage_buffer: &GpuBuffer<u32>,
+        storage_offset: vk::DeviceSize,
+        query_pool: Option<(&GpuQueryPool, u32)>,
+    ) {
+        if max_element_count <= 1 {
+            return;
+        }
+
+        self.gpu_sort_recorded(
+            commands,
+            max_element_count,
+            None,
+            Some((indirect_buffer, indirect_offset)),
+            keys_buffer,
+            keys_offset,
+            Some((values_buffer, values_offset)),
+            storage_buffer,
+            storage_offset,
+            query_pool,
+        );
+    }
+
     fn gpu_sort(
         &self,
+        max_element_count: u32,
+        direct_element_count: Option<u32>,
+        indirect_count: Option<(&GpuBuffer<u32>, vk::DeviceSize)>,
+        keys_buffer: &GpuBuffer<u32>,
+        keys_offset: vk::DeviceSize,
+        values_buffer: Option<(&GpuBuffer<u32>, vk::DeviceSize)>,
+        storage_buffer: &GpuBuffer<u32>,
+        storage_offset: vk::DeviceSize,
+        query_pool: Option<(&GpuQueryPool, u32)>,
+    ) {
+        self.device.run_commands(|commands| {
+            self.gpu_sort_recorded(
+                commands,
+                max_element_count,
+                direct_element_count,
+                indirect_count,
+                keys_buffer,
+                keys_offset,
+                values_buffer,
+                storage_buffer,
+                storage_offset,
+                query_pool,
+            );
+        });
+    }
+
+    fn gpu_sort_recorded(
+        &self,
+        commands: &mut CommandRecorder<'_>,
         max_element_count: u32,
         direct_element_count: Option<u32>,
         indirect_count: Option<(&GpuBuffer<u32>, vk::DeviceSize)>,
@@ -417,151 +571,153 @@ impl RadixSorter {
             );
         }
 
-        self.device.run_commands(|commands| {
+        if let Some((query_pool, query)) = query_pool {
+            commands.reset_query_pool(query_pool, query, Self::TIMESTAMP_QUERY_COUNT);
+            commands.write_timestamp(vk::PipelineStageFlags2::ALL_COMMANDS, query_pool, query + 0);
+        }
+
+        if let Some(element_count) = direct_element_count {
+            assert!(
+                element_count <= max_element_count,
+                "element_count ({element_count}) exceeds max_element_count ({max_element_count})"
+            );
+            commands.update_buffer_u32(storage_buffer, element_count_offset, element_count);
+        }
+
+        if let Some((indirect_buffer, indirect_offset)) = indirect_count {
+            Self::assert_alignment(
+                indirect_offset,
+                std::mem::size_of::<u32>() as vk::DeviceSize,
+                "indirect_offset",
+            );
+            Self::assert_range(
+                indirect_buffer.byte_size(),
+                indirect_offset,
+                std::mem::size_of::<u32>() as vk::DeviceSize,
+                "indirect_buffer",
+            );
+            commands.copy_buffer_region(
+                indirect_buffer,
+                indirect_offset,
+                storage_buffer,
+                element_count_offset,
+                std::mem::size_of::<u32>() as vk::DeviceSize,
+            );
+        }
+
+        commands.fill_buffer_u32_range(storage_buffer, histogram_offset, global_histogram_size, 0);
+        commands.barrier_transfer_write_to_compute_read();
+
+        if let Some((query_pool, query)) = query_pool {
+            commands.write_timestamp(vk::PipelineStageFlags2::TRANSFER, query_pool, query + 1);
+        }
+
+        for pass in 0..Self::PASSES {
+            let mut keys_in = keys_buffer.descriptor_range(keys_offset, element_bytes);
+            let mut keys_out = storage_buffer.descriptor_range(inout_offset, inout_size);
+
+            let mut values_in_out: Option<(DescriptorBuffer, DescriptorBuffer)> = values_buffer
+                .map(|(values, values_offset)| {
+                    (
+                        values.descriptor_range(values_offset, element_bytes),
+                        storage_buffer.descriptor_range(value_inout_offset, inout_size),
+                    )
+                });
+
+            if pass % 2 == 1 {
+                std::mem::swap(&mut keys_in, &mut keys_out);
+                if let Some((values_in, values_out)) = values_in_out.as_mut() {
+                    std::mem::swap(values_in, values_out);
+                }
+            }
+
+            let mut descriptor_bindings = vec![
+                (
+                    Self::BINDING_ELEMENT_COUNTS,
+                    storage_buffer.descriptor_range(
+                        element_count_offset,
+                        std::mem::size_of::<u32>() as vk::DeviceSize,
+                    ),
+                ),
+                (
+                    Self::BINDING_GLOBAL_HISTOGRAM,
+                    storage_buffer.descriptor_range(histogram_offset, global_histogram_size),
+                ),
+                (
+                    Self::BINDING_PARTITION_HISTOGRAM,
+                    storage_buffer
+                        .descriptor_range(partition_histogram_offset, partition_histogram_size),
+                ),
+                (Self::BINDING_KEYS_IN, keys_in),
+                (Self::BINDING_KEYS_OUT, keys_out),
+            ];
+
+            if let Some((values_in, values_out)) = values_in_out {
+                descriptor_bindings.push((Self::BINDING_VALUES_IN, values_in));
+                descriptor_bindings.push((Self::BINDING_VALUES_OUT, values_out));
+            }
+
+            commands.dispatch_with_push_constants(
+                self.pipelines.upsweep.as_ref(),
+                &descriptor_bindings,
+                &PassPushConstants { pass },
+                [partition_count, 1, 1],
+            );
             if let Some((query_pool, query)) = query_pool {
-                commands.reset_query_pool(query_pool, query, Self::TIMESTAMP_QUERY_COUNT);
-                commands.write_timestamp(vk::PipelineStageFlags2::ALL_COMMANDS, query_pool, query + 0);
-            }
-
-            if let Some(element_count) = direct_element_count {
-                assert!(
-                    element_count <= max_element_count,
-                    "element_count ({element_count}) exceeds max_element_count ({max_element_count})"
-                );
-                commands.update_buffer_u32(storage_buffer, element_count_offset, element_count);
-            }
-
-            if let Some((indirect_buffer, indirect_offset)) = indirect_count {
-                Self::assert_alignment(
-                    indirect_offset,
-                    std::mem::size_of::<u32>() as vk::DeviceSize,
-                    "indirect_offset",
-                );
-                Self::assert_range(
-                    indirect_buffer.byte_size(),
-                    indirect_offset,
-                    std::mem::size_of::<u32>() as vk::DeviceSize,
-                    "indirect_buffer",
-                );
-                commands.copy_buffer_region(
-                    indirect_buffer,
-                    indirect_offset,
-                    storage_buffer,
-                    element_count_offset,
-                    std::mem::size_of::<u32>() as vk::DeviceSize,
+                commands.write_timestamp(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    query_pool,
+                    query + 2 + 3 * pass + 0,
                 );
             }
+            commands.barrier_shader_write_to_shader_read();
 
-            commands.fill_buffer_u32_range(storage_buffer, histogram_offset, global_histogram_size, 0);
-            commands.barrier_transfer_write_to_compute_read();
-
+            commands.dispatch_with_push_constants(
+                self.pipelines.spine.as_ref(),
+                &descriptor_bindings,
+                &PassPushConstants { pass },
+                [Self::RADIX, 1, 1],
+            );
             if let Some((query_pool, query)) = query_pool {
-                commands.write_timestamp(vk::PipelineStageFlags2::TRANSFER, query_pool, query + 1);
+                commands.write_timestamp(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    query_pool,
+                    query + 2 + 3 * pass + 1,
+                );
+            }
+            commands.barrier_shader_write_to_shader_read();
+
+            let downsweep_pipeline = if values_buffer.is_some() {
+                self.pipelines.downsweep_key_value.as_ref()
+            } else {
+                self.pipelines.downsweep.as_ref()
+            };
+            commands.dispatch_with_push_constants(
+                downsweep_pipeline,
+                &descriptor_bindings,
+                &PassPushConstants { pass },
+                [partition_count, 1, 1],
+            );
+            if let Some((query_pool, query)) = query_pool {
+                commands.write_timestamp(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    query_pool,
+                    query + 2 + 3 * pass + 2,
+                );
             }
 
-            for pass in 0..Self::PASSES {
-                let mut keys_in = keys_buffer.descriptor_range(keys_offset, element_bytes);
-                let mut keys_out = storage_buffer.descriptor_range(inout_offset, inout_size);
-
-                let mut values_in_out: Option<(DescriptorBuffer, DescriptorBuffer)> =
-                    values_buffer.map(|(values, values_offset)| {
-                        (
-                            values.descriptor_range(values_offset, element_bytes),
-                            storage_buffer.descriptor_range(value_inout_offset, inout_size),
-                        )
-                    });
-
-                if pass % 2 == 1 {
-                    std::mem::swap(&mut keys_in, &mut keys_out);
-                    if let Some((values_in, values_out)) = values_in_out.as_mut() {
-                        std::mem::swap(values_in, values_out);
-                    }
-                }
-
-                let mut descriptor_bindings = vec![
-                    (
-                        Self::BINDING_ELEMENT_COUNTS,
-                        storage_buffer.descriptor_range(
-                            element_count_offset,
-                            std::mem::size_of::<u32>() as vk::DeviceSize,
-                        ),
-                    ),
-                    (
-                        Self::BINDING_GLOBAL_HISTOGRAM,
-                        storage_buffer.descriptor_range(histogram_offset, global_histogram_size),
-                    ),
-                    (
-                        Self::BINDING_PARTITION_HISTOGRAM,
-                        storage_buffer
-                            .descriptor_range(partition_histogram_offset, partition_histogram_size),
-                    ),
-                    (Self::BINDING_KEYS_IN, keys_in),
-                    (Self::BINDING_KEYS_OUT, keys_out),
-                ];
-
-                if let Some((values_in, values_out)) = values_in_out {
-                    descriptor_bindings.push((Self::BINDING_VALUES_IN, values_in));
-                    descriptor_bindings.push((Self::BINDING_VALUES_OUT, values_out));
-                }
-
-                commands.dispatch_with_push_constants(
-                    self.pipelines.upsweep.as_ref(),
-                    &descriptor_bindings,
-                    &PassPushConstants { pass },
-                    [partition_count, 1, 1],
-                );
-                if let Some((query_pool, query)) = query_pool {
-                    commands.write_timestamp(
-                        vk::PipelineStageFlags2::COMPUTE_SHADER,
-                        query_pool,
-                        query + 2 + 3 * pass + 0,
-                    );
-                }
+            if pass < (Self::PASSES - 1) {
                 commands.barrier_shader_write_to_shader_read();
-
-                commands.dispatch_with_push_constants(
-                    self.pipelines.spine.as_ref(),
-                    &descriptor_bindings,
-                    &PassPushConstants { pass },
-                    [Self::RADIX, 1, 1],
-                );
-                if let Some((query_pool, query)) = query_pool {
-                    commands.write_timestamp(
-                        vk::PipelineStageFlags2::COMPUTE_SHADER,
-                        query_pool,
-                        query + 2 + 3 * pass + 1,
-                    );
-                }
-                commands.barrier_shader_write_to_shader_read();
-
-                let downsweep_pipeline = if values_buffer.is_some() {
-                    self.pipelines.downsweep_key_value.as_ref()
-                } else {
-                    self.pipelines.downsweep.as_ref()
-                };
-                commands.dispatch_with_push_constants(
-                    downsweep_pipeline,
-                    &descriptor_bindings,
-                    &PassPushConstants { pass },
-                    [partition_count, 1, 1],
-                );
-                if let Some((query_pool, query)) = query_pool {
-                    commands.write_timestamp(
-                        vk::PipelineStageFlags2::COMPUTE_SHADER,
-                        query_pool,
-                        query + 2 + 3 * pass + 2,
-                    );
-                }
-
-                if pass < (Self::PASSES - 1) {
-                    commands.barrier_shader_write_to_shader_read();
-                }
             }
+        }
 
-            if let Some((query_pool, query)) = query_pool {
-                commands.write_timestamp(vk::PipelineStageFlags2::ALL_COMMANDS, query_pool, query + 14);
-            }
-        });
+        if let Some((query_pool, query)) = query_pool {
+            commands.write_timestamp(
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                query_pool,
+                query + 14,
+            );
+        }
     }
 
     fn required_alignment(&self) -> vk::DeviceSize {

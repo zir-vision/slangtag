@@ -1,7 +1,9 @@
 import "../filter.slang";
+import "./detect-control.slang";
 
 StructuredBuffer<uint32_t> sorted_selected_points;
 RWStructuredBuffer<uint32_t> filtered_extents;
+StructuredBuffer<uint32_t> control;
 
 struct PushConstants
 {
@@ -17,12 +19,14 @@ ConstantBuffer<PushConstants> pc;
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     uint32_t tid = dispatch_thread_id.x;
-    if (tid >= pc.point_count)
+    uint32_t point_count = control[kControlSelectedBlobPointCountWord];
+    uint32_t extent_count = control[kControlBlobExtentCountWord];
+    if (tid >= point_count)
         return;
 
     uint32_t blob_index =
         read_selected_blob_point_word(sorted_selected_points, tid, kSelectedPointBlobIndexWord);
-    if (blob_index >= pc.extent_count)
+    if (blob_index >= extent_count)
         return;
 
     if (tid > 0u)

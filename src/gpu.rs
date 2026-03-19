@@ -308,6 +308,24 @@ impl<'a> CommandRecorder<'a> {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn barrier_transfer_write_to_indirect_read(&mut self) {
+        let memory_barrier = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ)];
+        unsafe {
+            self.inner.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::DRAW_INDIRECT,
+                vk::DependencyFlags::empty(),
+                &memory_barrier,
+                &[],
+                &[],
+            );
+        }
+    }
+
     pub fn barrier_shader_write_to_shader_read(&mut self) {
         let memory_barrier = [vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -317,6 +335,40 @@ impl<'a> CommandRecorder<'a> {
                 self.command_buffer,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &memory_barrier,
+                &[],
+                &[],
+            );
+        }
+    }
+
+    pub fn barrier_shader_write_to_indirect_read(&mut self) {
+        let memory_barrier = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ)];
+        unsafe {
+            self.inner.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::DRAW_INDIRECT,
+                vk::DependencyFlags::empty(),
+                &memory_barrier,
+                &[],
+                &[],
+            );
+        }
+    }
+
+    pub fn barrier_shader_write_to_transfer_read(&mut self) {
+        let memory_barrier = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+        unsafe {
+            self.inner.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &memory_barrier,
                 &[],
@@ -404,6 +456,186 @@ impl<'a> CommandRecorder<'a> {
             self.inner
                 .device
                 .cmd_dispatch(self.command_buffer, groups[0], groups[1], groups[2]);
+        }
+    }
+
+    pub fn dispatch_indirect_with_push_constants<T: Pod + Copy>(
+        &mut self,
+        pipeline: &ComputePipeline,
+        bindings: &[(u32, DescriptorBuffer)],
+        push_constants: &T,
+        indirect_buffer: &GpuBuffer<u32>,
+        indirect_offset: vk::DeviceSize,
+    ) {
+        let push_bytes = bytemuck::bytes_of(push_constants);
+        assert!(
+            (push_bytes.len() as u32) <= MAX_PUSH_CONSTANT_BYTES,
+            "push constants are too large ({} bytes > {} bytes)",
+            push_bytes.len(),
+            MAX_PUSH_CONSTANT_BYTES
+        );
+        assert!(
+            indirect_offset % (std::mem::size_of::<u32>() as vk::DeviceSize) == 0,
+            "indirect_offset ({indirect_offset}) must be aligned to 4 bytes"
+        );
+        assert!(
+            indirect_offset.saturating_add((3 * std::mem::size_of::<u32>()) as vk::DeviceSize)
+                <= indirect_buffer.raw.bytes,
+            "indirect range exceeds buffer: offset={} size={} buffer_size={}",
+            indirect_offset,
+            3 * std::mem::size_of::<u32>(),
+            indirect_buffer.raw.bytes
+        );
+
+        let descriptor_set = {
+            let _pool_lock = self
+                .inner
+                .descriptor_pool_lock
+                .lock()
+                .expect("failed to lock descriptor pool");
+            let set_layouts = [self.inner.descriptor_set_layout];
+            let allocate_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.inner.descriptor_pool)
+                .set_layouts(&set_layouts);
+            unsafe {
+                self.inner
+                    .device
+                    .allocate_descriptor_sets(&allocate_info)
+                    .expect("failed to allocate descriptor set")[0]
+            }
+        };
+        self.descriptor_sets.push(descriptor_set);
+
+        let buffer_infos: Vec<_> = bindings
+            .iter()
+            .map(|(_, binding)| {
+                vk::DescriptorBufferInfo::default()
+                    .buffer(binding.buffer)
+                    .offset(binding.offset)
+                    .range(binding.range)
+            })
+            .collect();
+        let writes: Vec<_> = bindings
+            .iter()
+            .zip(buffer_infos.iter())
+            .map(|((binding_index, _), info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(*binding_index)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(info))
+            })
+            .collect();
+        unsafe {
+            self.inner.device.update_descriptor_sets(&writes, &[]);
+            self.inner.device.cmd_bind_pipeline(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                pipeline.pipeline,
+            );
+            self.inner.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.inner.pipeline_layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            self.inner.device.cmd_push_constants(
+                self.command_buffer,
+                self.inner.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                push_bytes,
+            );
+            self.inner.device.cmd_dispatch_indirect(
+                self.command_buffer,
+                indirect_buffer.raw.buffer,
+                indirect_offset,
+            );
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn dispatch_indirect(
+        &mut self,
+        pipeline: &ComputePipeline,
+        bindings: &[(u32, DescriptorBuffer)],
+        indirect_buffer: &GpuBuffer<u32>,
+        indirect_offset: vk::DeviceSize,
+    ) {
+        assert!(
+            indirect_offset % (std::mem::size_of::<u32>() as vk::DeviceSize) == 0,
+            "indirect_offset ({indirect_offset}) must be aligned to 4 bytes"
+        );
+        assert!(
+            indirect_offset.saturating_add((3 * std::mem::size_of::<u32>()) as vk::DeviceSize)
+                <= indirect_buffer.raw.bytes,
+            "indirect range exceeds buffer: offset={} size={} buffer_size={}",
+            indirect_offset,
+            3 * std::mem::size_of::<u32>(),
+            indirect_buffer.raw.bytes
+        );
+
+        let descriptor_set = {
+            let _pool_lock = self
+                .inner
+                .descriptor_pool_lock
+                .lock()
+                .expect("failed to lock descriptor pool");
+            let set_layouts = [self.inner.descriptor_set_layout];
+            let allocate_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.inner.descriptor_pool)
+                .set_layouts(&set_layouts);
+            unsafe {
+                self.inner
+                    .device
+                    .allocate_descriptor_sets(&allocate_info)
+                    .expect("failed to allocate descriptor set")[0]
+            }
+        };
+        self.descriptor_sets.push(descriptor_set);
+
+        let buffer_infos: Vec<_> = bindings
+            .iter()
+            .map(|(_, binding)| {
+                vk::DescriptorBufferInfo::default()
+                    .buffer(binding.buffer)
+                    .offset(binding.offset)
+                    .range(binding.range)
+            })
+            .collect();
+        let writes: Vec<_> = bindings
+            .iter()
+            .zip(buffer_infos.iter())
+            .map(|((binding_index, _), info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(*binding_index)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(info))
+            })
+            .collect();
+        unsafe {
+            self.inner.device.update_descriptor_sets(&writes, &[]);
+            self.inner.device.cmd_bind_pipeline(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                pipeline.pipeline,
+            );
+            self.inner.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.inner.pipeline_layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            self.inner.device.cmd_dispatch_indirect(
+                self.command_buffer,
+                indirect_buffer.raw.buffer,
+                indirect_offset,
+            );
         }
     }
 }
@@ -513,7 +745,9 @@ impl ComputeDevice {
         device_create_info = device_create_info.push_next(&mut features12);
 
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
-            .synchronization2(true).subgroup_size_control(true).compute_full_subgroups(true);
+            .synchronization2(true)
+            .subgroup_size_control(true)
+            .compute_full_subgroups(true);
 
         device_create_info = device_create_info.push_next(&mut features13);
 

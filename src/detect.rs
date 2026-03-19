@@ -158,6 +158,7 @@ struct DetectionPipelines {
     fit_line_errors_and_peaks: Arc<ComputePipeline>,
     build_peak_extents: Arc<ComputePipeline>,
     fit_quads: Arc<ComputePipeline>,
+    build_indirect_dispatch_args: Arc<ComputePipeline>,
     prepare_decode_quads: Arc<ComputePipeline>,
     extract_candidate_bits: Arc<ComputePipeline>,
 }
@@ -250,6 +251,10 @@ impl DetectionPipelines {
             fit_quads: Detector::create_compute_pipeline(
                 device,
                 include_u32!(compute_shader_path!("filter-fit-quads")),
+            ),
+            build_indirect_dispatch_args: Detector::create_compute_pipeline(
+                device,
+                include_u32!(compute_shader_path!("detect-build-indirect-dispatch-args")),
             ),
             prepare_decode_quads: Detector::create_compute_pipeline(
                 device,
@@ -408,6 +413,42 @@ impl PipelineTimings {
             start_query,
         );
         commands.dispatch_with_push_constants(compute_pipeline, bindings, push_constants, dispatch);
+        commands.write_timestamp(
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            &self.query_pool,
+            end_query,
+        );
+        self.spans.push(TimedPass {
+            name: name.to_owned(),
+            start_query,
+            end_query,
+        });
+    }
+
+    fn dispatch_indirect_with_push_constants<T: Pod + Copy>(
+        &mut self,
+        commands: &mut CommandRecorder<'_>,
+        name: &str,
+        compute_pipeline: &ComputePipeline,
+        bindings: &[(u32, DescriptorBuffer)],
+        push_constants: &T,
+        indirect_buffer: &GpuBuffer<u32>,
+        indirect_offset: vk::DeviceSize,
+    ) {
+        let start_query = self.allocate_queries(1);
+        let end_query = self.allocate_queries(1);
+        commands.write_timestamp(
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            &self.query_pool,
+            start_query,
+        );
+        commands.dispatch_indirect_with_push_constants(
+            compute_pipeline,
+            bindings,
+            push_constants,
+            indirect_buffer,
+            indirect_offset,
+        );
         commands.write_timestamp(
             vk::PipelineStageFlags2::COMPUTE_SHADER,
             &self.query_pool,
@@ -597,6 +638,13 @@ struct ExtractCandidateBitsPushConstants {
     cell_span: u32,
 }
 
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone)]
+struct BuildIndirectDispatchArgsPushConstants {
+    one_d_local_size_x: u32,
+    marker_size_with_borders: u32,
+}
+
 fn crop_image_to_multiple(image: GrayImage, multiple: u32) -> Result<GrayImage, ()> {
     let width = image.width();
     let height = image.height();
@@ -629,6 +677,35 @@ impl Detector {
         Self::MARKER_SIZE_WITH_BORDERS - (2 * Self::MARKER_BORDER_BITS);
     const RADIX_KEY_TRANSFORM_NONE: u32 = 0;
     const RADIX_KEY_TRANSFORM_F32_ASC: u32 = 1;
+    const CONTROL_BLOB_DIFF_FILTERED_COUNT_WORD: u32 = 0;
+    const CONTROL_BLOB_EXTENT_COUNT_WORD: u32 = 1;
+    const CONTROL_SELECTED_BLOB_EXTENT_COUNT_WORD: u32 = 2;
+    const CONTROL_SELECTED_BLOB_POINT_COUNT_WORD: u32 = 3;
+    const CONTROL_PEAK_EXTENT_COUNT_WORD: u32 = 4;
+    const CONTROL_FITTED_QUAD_COUNT_WORD: u32 = 5;
+
+    const CONTROL_DISPATCH_BUILD_BLOB_PAIR_EXTENTS_WORD: u32 = 16;
+    const CONTROL_DISPATCH_RADIX_BLOB_INIT_WORD: u32 = 19;
+    const CONTROL_DISPATCH_RADIX_BLOB_UPDATE_WORD: u32 = 22;
+    const CONTROL_DISPATCH_RADIX_BLOB_GATHER_WORD: u32 = 25;
+    const CONTROL_DISPATCH_REWRITE_SELECTED_BLOB_POINTS_WORD: u32 = 28;
+    const CONTROL_DISPATCH_RADIX_SELECTED_INIT_WORD: u32 = 31;
+    const CONTROL_DISPATCH_RADIX_SELECTED_UPDATE_WORD: u32 = 34;
+    const CONTROL_DISPATCH_RADIX_SELECTED_GATHER_WORD: u32 = 37;
+    const CONTROL_DISPATCH_REBUILD_FILTERED_EXTENT_STARTS_WORD: u32 = 40;
+    const CONTROL_DISPATCH_BUILD_LINE_FIT_POINTS_WORD: u32 = 43;
+    const CONTROL_DISPATCH_FIT_LINE_PASS0_WORD: u32 = 46;
+    const CONTROL_DISPATCH_FIT_LINE_PASS1_WORD: u32 = 49;
+    const CONTROL_DISPATCH_FIT_LINE_PASS2_WORD: u32 = 52;
+    const CONTROL_DISPATCH_RADIX_PEAKS_INIT_WORD: u32 = 55;
+    const CONTROL_DISPATCH_RADIX_PEAKS_UPDATE_WORD: u32 = 58;
+    const CONTROL_DISPATCH_RADIX_PEAKS_GATHER_WORD: u32 = 61;
+    const CONTROL_DISPATCH_BUILD_PEAK_EXTENTS_WORD: u32 = 64;
+    const CONTROL_DISPATCH_FIT_QUADS_WORD: u32 = 67;
+    const CONTROL_DISPATCH_PREPARE_DECODE_QUADS_WORD: u32 = 70;
+    const CONTROL_DISPATCH_EXTRACT_CANDIDATE_BITS_WORD: u32 = 73;
+    const CONTROL_WORD_COUNT: usize = 80;
+    const CONTROL_COUNTER_WORD_COUNT: usize = 6;
 
     pub fn new(device: ComputeDevice, settings: DetectionSettings) -> Self {
         let pipelines = DetectionPipelines::new(&device);
@@ -653,6 +730,1022 @@ impl Detector {
         self.detect_gray_with_timing(image).map(|(tags, _)| tags)
     }
 
+    fn detect_gray_with_timing_single_submit(
+        &self,
+        image: &ImageBuffer<image::Luma<u8>, Vec<u8>>,
+    ) -> Result<(Vec<DetectedTag>, GpuTimingReport), ()> {
+        let decimate_factor = self.settings.decimate.unwrap_or(1) as u32;
+        let aligned_input = crop_image_to_multiple(image.clone(), 4 * decimate_factor)?;
+        let input_gpu_image =
+            crate::GPUImage::from_image_buffer(self.device.clone(), aligned_input);
+
+        let decimated_image = match self.settings.decimate {
+            Some(factor) => {
+                let decimated_size = crate::Size::new(
+                    input_gpu_image.size.width / factor as u32,
+                    input_gpu_image.size.height / factor as u32,
+                );
+                let decimated_image_buffer =
+                    self.new_u8_storage_buffer(decimated_size.total_pixels());
+                GPUImage::new(self.device.clone(), decimated_image_buffer, decimated_size)
+            }
+            None => input_gpu_image.clone(),
+        };
+
+        let minmax_size = Size::new(
+            decimated_image.size.width / 4,
+            decimated_image.size.height / 4,
+        );
+        let minmax_image = self.new_u8_storage_buffer(minmax_size.total_pixels() * 2);
+        let filtered_minmax_image = self.new_u8_storage_buffer(minmax_size.total_pixels() * 2);
+        let thresholded_image_buffer =
+            self.new_u8_storage_buffer(decimated_image.size.total_pixels());
+        let thresholded_image = GPUImage::new(
+            self.device.clone(),
+            thresholded_image_buffer,
+            decimated_image.size,
+        );
+        let labels = self.new_u32_storage_buffer(thresholded_image.size.total_pixels());
+        let final_labels = self.new_u32_storage_buffer(thresholded_image.size.total_pixels());
+        let union_markers_size =
+            self.new_zeroed_u32_storage_buffer(thresholded_image.size.total_pixels());
+
+        let blob_diff_words_per_point = 6usize;
+        let blob_diff_points_per_offset = (thresholded_image.size.width as usize - 2)
+            * (thresholded_image.size.height as usize - 2);
+        let blob_diff_total_points = (blob_diff_points_per_offset * 4) as u32;
+        let blob_diff_total_points_capacity = usize::max(1, blob_diff_total_points as usize);
+        let blob_diff_out = self
+            .new_u32_storage_buffer(blob_diff_total_points_capacity * blob_diff_words_per_point);
+        let blob_diff_compacted = self
+            .new_u32_storage_buffer(blob_diff_total_points_capacity * blob_diff_words_per_point);
+        let blob_diff_sorted = self
+            .new_u32_storage_buffer(blob_diff_total_points_capacity * blob_diff_words_per_point);
+
+        let blob_extent_words_per_extent = 11usize;
+        let blob_extent_capacity = blob_diff_total_points_capacity;
+        let blob_extent =
+            self.new_u32_storage_buffer(blob_extent_capacity * blob_extent_words_per_extent);
+        let filtered_blob_extent =
+            self.new_u32_storage_buffer(blob_extent_capacity * blob_extent_words_per_extent);
+        let point_extent_indices = self.new_u32_storage_buffer(blob_diff_total_points_capacity);
+
+        let selected_blob_point_words_per_point = 4usize;
+        let selected_blob_point_capacity_u32 = blob_diff_total_points.max(1);
+        let selected_blob_point_capacity = usize::max(1, selected_blob_point_capacity_u32 as usize);
+        let selected_blob_points = self.new_u32_storage_buffer(
+            selected_blob_point_capacity * selected_blob_point_words_per_point,
+        );
+        let selected_blob_sorted_points = self.new_u32_storage_buffer(
+            selected_blob_point_capacity * selected_blob_point_words_per_point,
+        );
+
+        let line_fit_point_words_per_point = 10usize;
+        let line_fit_points = self
+            .new_u32_storage_buffer(selected_blob_point_capacity * line_fit_point_words_per_point);
+        let errs = self.new_u32_storage_buffer(selected_blob_point_capacity);
+        let filtered_errs = self.new_u32_storage_buffer(selected_blob_point_capacity);
+        let peak_words_per_peak = 3usize;
+        let peaks = self.new_u32_storage_buffer(selected_blob_point_capacity * peak_words_per_peak);
+        let sorted_peaks =
+            self.new_u32_storage_buffer(selected_blob_point_capacity * peak_words_per_peak);
+        let peak_extent_words_per_extent = 3usize;
+        let peak_extents = self
+            .new_u32_storage_buffer(selected_blob_point_capacity * peak_extent_words_per_extent);
+
+        let fitted_quad_words_per_quad = 15usize;
+        let max_quad_capacity_u32 = selected_blob_point_capacity_u32;
+        let max_quad_capacity = selected_blob_point_capacity;
+        let fitted_quads =
+            self.new_u32_storage_buffer(max_quad_capacity * fitted_quad_words_per_quad);
+        let quad_param_words_per_quad = 12usize;
+        let quad_params =
+            self.new_u32_storage_buffer(max_quad_capacity * quad_param_words_per_quad);
+        let bits_count_oversized = max_quad_capacity * 8usize * 8usize;
+        let bits = self.new_u32_storage_buffer(bits_count_oversized);
+
+        let control = self.new_u32_control_buffer(Self::CONTROL_WORD_COUNT);
+        let control_blob_diff_filtered_desc =
+            Self::control_counter_descriptor(&control, Self::CONTROL_BLOB_DIFF_FILTERED_COUNT_WORD);
+        let control_blob_extent_desc =
+            Self::control_counter_descriptor(&control, Self::CONTROL_BLOB_EXTENT_COUNT_WORD);
+        let control_selected_blob_extent_desc = Self::control_counter_descriptor(
+            &control,
+            Self::CONTROL_SELECTED_BLOB_EXTENT_COUNT_WORD,
+        );
+        let control_selected_blob_point_desc = Self::control_counter_descriptor(
+            &control,
+            Self::CONTROL_SELECTED_BLOB_POINT_COUNT_WORD,
+        );
+        let control_peak_extent_desc =
+            Self::control_counter_descriptor(&control, Self::CONTROL_PEAK_EXTENT_COUNT_WORD);
+        let control_fitted_quad_desc =
+            Self::control_counter_descriptor(&control, Self::CONTROL_FITTED_QUAD_COUNT_WORD);
+
+        let blob_sort_keys = self.new_u32_storage_buffer(blob_diff_total_points_capacity);
+        let blob_sorted_indices = self.new_u32_storage_buffer(blob_diff_total_points_capacity);
+        let blob_sort_storage = self
+            .sorter
+            .create_key_value_storage_buffer(blob_diff_total_points.max(1));
+
+        let selected_sort_keys = self.new_u32_storage_buffer(selected_blob_point_capacity);
+        let selected_sorted_indices = self.new_u32_storage_buffer(selected_blob_point_capacity);
+        let selected_sort_storage = self
+            .sorter
+            .create_key_value_storage_buffer(selected_blob_point_capacity_u32);
+
+        let peak_sort_keys = self.new_u32_storage_buffer(selected_blob_point_capacity);
+        let peak_sorted_indices = self.new_u32_storage_buffer(selected_blob_point_capacity);
+        let peak_sort_storage = self
+            .sorter
+            .create_key_value_storage_buffer(selected_blob_point_capacity_u32);
+
+        let readback_counters = self.device.create_buffer(
+            Self::CONTROL_COUNTER_WORD_COUNT,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemory::HostRandomAccess,
+        );
+        let readback_fitted_quads = self.device.create_buffer(
+            max_quad_capacity * fitted_quad_words_per_quad,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemory::HostRandomAccess,
+        );
+        let readback_bits = self.device.create_buffer(
+            bits_count_oversized,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemory::HostRandomAccess,
+        );
+
+        let blob_pair_filter = self.settings.blob_pair_filter;
+        let min_tag_width = blob_pair_filter.min_tag_width;
+        let max_cluster_pixels = blob_pair_filter.max_cluster_pixels.unwrap_or(
+            blob_pair_filter.max_cluster_pixels_perimeter_scale
+                * (thresholded_image.size.width + thresholded_image.size.height),
+        );
+
+        let mut pipeline_timings = PipelineTimings::new(&self.device, 1024);
+        self.device.run_commands(|commands| {
+            pipeline_timings.reset(commands);
+
+            commands.fill_buffer_u32_range(&control, 0, control.byte_size(), 0);
+            commands.fill_buffer_u32_range(&blob_extent, 0, blob_extent.byte_size(), 0);
+            commands.fill_buffer_u32_range(
+                &filtered_blob_extent,
+                0,
+                filtered_blob_extent.byte_size(),
+                0,
+            );
+            commands.fill_buffer_u32_range(&peak_extents, 0, peak_extents.byte_size(), 0);
+            commands.fill_buffer_u32_range(&fitted_quads, 0, fitted_quads.byte_size(), 0);
+            commands.barrier_transfer_write_to_compute_read();
+
+            if self.settings.decimate.is_some() {
+                let decimate_dispatch = dispatch_groups_2d(
+                    input_gpu_image.size.width,
+                    input_gpu_image.size.height,
+                    Self::TWO_D_LOCAL_SIZE_X,
+                    Self::TWO_D_LOCAL_SIZE_Y,
+                );
+                self.dispatch_with_push_constants_recorded_timed(
+                    &mut pipeline_timings,
+                    "threshold-decimate",
+                    commands,
+                    &self.pipelines.decimate,
+                    &[
+                        (0, input_gpu_image.image.descriptor()),
+                        (1, decimated_image.image.descriptor()),
+                    ],
+                    DecimatePushConstants {
+                        input_size: input_gpu_image.size,
+                        decimated_size: decimated_image.size,
+                    },
+                    [decimate_dispatch[0], decimate_dispatch[1], 1],
+                );
+                commands.barrier_shader_write_to_shader_read();
+            }
+
+            let minmax_dispatch = dispatch_groups_2d(
+                minmax_size.width,
+                minmax_size.height,
+                Self::TWO_D_LOCAL_SIZE_X,
+                Self::TWO_D_LOCAL_SIZE_Y,
+            );
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "threshold-minmax",
+                commands,
+                &self.pipelines.minmax,
+                &[
+                    (0, decimated_image.image.descriptor()),
+                    (1, minmax_image.descriptor()),
+                ],
+                MinmaxPushConstants {
+                    input_size: decimated_image.size,
+                    minmax_size,
+                },
+                [minmax_dispatch[0], minmax_dispatch[1], 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "threshold-filter-minmax",
+                commands,
+                &self.pipelines.filter_minmax,
+                &[
+                    (0, minmax_image.descriptor()),
+                    (1, filtered_minmax_image.descriptor()),
+                ],
+                FilterMinmaxPushConstants {
+                    minmax_size,
+                    filtered_size: minmax_size,
+                },
+                [minmax_dispatch[0], minmax_dispatch[1], 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            let threshold_dispatch = dispatch_groups_2d(
+                thresholded_image.size.width,
+                thresholded_image.size.height,
+                Self::TWO_D_LOCAL_SIZE_X,
+                Self::TWO_D_LOCAL_SIZE_Y,
+            );
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "threshold-threshold",
+                commands,
+                &self.pipelines.threshold,
+                &[
+                    (0, decimated_image.image.descriptor()),
+                    (1, filtered_minmax_image.descriptor()),
+                    (2, thresholded_image.image.descriptor()),
+                ],
+                ThresholdPushConstants {
+                    decimated_size: decimated_image.size,
+                    filtered_size: minmax_size,
+                    thresholded_size: decimated_image.size,
+                    min_white_black_diff: self.settings.min_white_black_diff as u32,
+                },
+                [threshold_dispatch[0], threshold_dispatch[1], 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            let ccl_dispatch = dispatch_groups_2d(
+                thresholded_image.size.width / 2,
+                thresholded_image.size.height / 2,
+                Self::TWO_D_LOCAL_SIZE_X,
+                Self::TWO_D_LOCAL_SIZE_Y,
+            );
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "ccl-init",
+                commands,
+                &self.pipelines.ccl_init,
+                &[
+                    (0, thresholded_image.image.descriptor()),
+                    (1, labels.descriptor()),
+                ],
+                CclPushConstants {
+                    image_size: thresholded_image.size,
+                },
+                [ccl_dispatch[0], ccl_dispatch[1], 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "ccl-compression[first]",
+                commands,
+                &self.pipelines.ccl_compression,
+                &[(0, labels.descriptor())],
+                CclPushConstants {
+                    image_size: thresholded_image.size,
+                },
+                [ccl_dispatch[0], ccl_dispatch[1], 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "ccl-merge",
+                commands,
+                &self.pipelines.ccl_merge,
+                &[(0, labels.descriptor())],
+                CclPushConstants {
+                    image_size: thresholded_image.size,
+                },
+                [ccl_dispatch[0], ccl_dispatch[1], 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "ccl-compression[second]",
+                commands,
+                &self.pipelines.ccl_compression,
+                &[(0, labels.descriptor())],
+                CclPushConstants {
+                    image_size: thresholded_image.size,
+                },
+                [ccl_dispatch[0], ccl_dispatch[1], 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "ccl-final-labeling",
+                commands,
+                &self.pipelines.ccl_final_labeling,
+                &[
+                    (0, labels.descriptor()),
+                    (1, final_labels.descriptor()),
+                    (2, union_markers_size.descriptor()),
+                ],
+                CclPushConstants {
+                    image_size: thresholded_image.size,
+                },
+                [ccl_dispatch[0], ccl_dispatch[1], 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "blob-blob-diff",
+                commands,
+                &self.pipelines.blob_diff,
+                &[
+                    (0, thresholded_image.image.descriptor()),
+                    (1, final_labels.descriptor()),
+                    (2, union_markers_size.descriptor()),
+                    (3, blob_diff_out.descriptor()),
+                ],
+                BlobDiffPushConstants {
+                    thresholded_size: thresholded_image.size,
+                    min_blob_size: self.settings.min_blob_size,
+                },
+                [threshold_dispatch[0], threshold_dispatch[1], 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "select-filter-nonzero-blob-diff-points",
+                commands,
+                &self.pipelines.filter_nonzero_blob_diff_points,
+                &[
+                    (0, blob_diff_out.descriptor()),
+                    (1, blob_diff_compacted.descriptor()),
+                    (2, control_blob_diff_filtered_desc),
+                ],
+                TotalPointsPushConstants {
+                    total_points: blob_diff_total_points,
+                },
+                [
+                    dispatch_groups_1d(blob_diff_total_points, Self::ONE_D_LOCAL_SIZE_X),
+                    1,
+                    1,
+                ],
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "detect-build-indirect-dispatch-args[initial]",
+                commands,
+                &self.pipelines.build_indirect_dispatch_args,
+                &[(0, control.descriptor()), (1, control.descriptor())],
+                BuildIndirectDispatchArgsPushConstants {
+                    one_d_local_size_x: Self::ONE_D_LOCAL_SIZE_X,
+                    marker_size_with_borders: Self::MARKER_SIZE_WITH_BORDERS as u32,
+                },
+                [1, 1, 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+            commands.barrier_shader_write_to_indirect_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "radix-sort-blob-diff-points::sort-key-init",
+                commands,
+                &self.pipelines.radix_init_keys_indices,
+                &[
+                    (0, blob_diff_compacted.descriptor()),
+                    (1, blob_sort_keys.descriptor()),
+                    (2, blob_sorted_indices.descriptor()),
+                ],
+                RadixExtractPushConstants {
+                    valid_points: blob_diff_total_points,
+                    words_per_record: 6,
+                    key_word_index: 1,
+                    key_transform: Self::RADIX_KEY_TRANSFORM_NONE,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_BLOB_INIT_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            let secondary_blob_query = pipeline_timings
+                .reserve_radix_sort_queries("radix-sort-blob-diff-points::secondary-key-sort");
+            self.sorter.record_sort_key_value_indirect_with_query_pool(
+                commands,
+                blob_diff_total_points.max(1),
+                &control,
+                Self::control_word_offset(Self::CONTROL_BLOB_DIFF_FILTERED_COUNT_WORD),
+                &blob_sort_keys,
+                0,
+                &blob_sorted_indices,
+                0,
+                &blob_sort_storage,
+                0,
+                Some((&pipeline_timings.query_pool, secondary_blob_query)),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "radix-sort-blob-diff-points::sort-key-update",
+                commands,
+                &self.pipelines.radix_keys_from_indices,
+                &[
+                    (0, blob_diff_compacted.descriptor()),
+                    (1, blob_sorted_indices.descriptor()),
+                    (2, blob_sort_keys.descriptor()),
+                ],
+                RadixExtractPushConstants {
+                    valid_points: blob_diff_total_points,
+                    words_per_record: 6,
+                    key_word_index: 0,
+                    key_transform: Self::RADIX_KEY_TRANSFORM_NONE,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_BLOB_UPDATE_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            let primary_blob_query = pipeline_timings
+                .reserve_radix_sort_queries("radix-sort-blob-diff-points::primary-key-sort");
+            self.sorter.record_sort_key_value_indirect_with_query_pool(
+                commands,
+                blob_diff_total_points.max(1),
+                &control,
+                Self::control_word_offset(Self::CONTROL_BLOB_DIFF_FILTERED_COUNT_WORD),
+                &blob_sort_keys,
+                0,
+                &blob_sorted_indices,
+                0,
+                &blob_sort_storage,
+                0,
+                Some((&pipeline_timings.query_pool, primary_blob_query)),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "radix-sort-blob-diff-points::gather",
+                commands,
+                &self.pipelines.radix_gather_by_indices,
+                &[
+                    (0, blob_diff_compacted.descriptor()),
+                    (1, blob_sorted_indices.descriptor()),
+                    (2, blob_diff_sorted.descriptor()),
+                ],
+                RadixGatherPushConstants {
+                    valid_points: blob_diff_total_points,
+                    words_per_record: 6,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_BLOB_GATHER_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-build-blob-pair-extents",
+                commands,
+                &self.pipelines.build_blob_pair_extents,
+                &[
+                    (0, blob_diff_sorted.descriptor()),
+                    (1, blob_extent.descriptor()),
+                    (2, control_blob_extent_desc),
+                    (3, filtered_blob_extent.descriptor()),
+                    (4, control_selected_blob_extent_desc),
+                    (5, control_selected_blob_point_desc),
+                    (6, point_extent_indices.descriptor()),
+                    (7, control.descriptor()),
+                ],
+                BuildBlobPairExtentsPushConstants {
+                    valid_points: blob_diff_total_points,
+                    tag_width: blob_pair_filter.tag_width,
+                    reversed_border: blob_pair_filter.reversed_border,
+                    normal_border: blob_pair_filter.normal_border,
+                    min_cluster_pixels: blob_pair_filter.min_cluster_pixels,
+                    max_cluster_pixels,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_BUILD_BLOB_PAIR_EXTENTS_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "detect-build-indirect-dispatch-args[post-extents]",
+                commands,
+                &self.pipelines.build_indirect_dispatch_args,
+                &[(0, control.descriptor()), (1, control.descriptor())],
+                BuildIndirectDispatchArgsPushConstants {
+                    one_d_local_size_x: Self::ONE_D_LOCAL_SIZE_X,
+                    marker_size_with_borders: Self::MARKER_SIZE_WITH_BORDERS as u32,
+                },
+                [1, 1, 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+            commands.barrier_shader_write_to_indirect_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-rewrite-selected-blob-points-with-theta",
+                commands,
+                &self.pipelines.rewrite_selected_blob_points_with_theta,
+                &[
+                    (0, blob_diff_sorted.descriptor()),
+                    (1, blob_extent.descriptor()),
+                    (2, point_extent_indices.descriptor()),
+                    (3, filtered_blob_extent.descriptor()),
+                    (4, selected_blob_points.descriptor()),
+                    (5, control.descriptor()),
+                ],
+                RewriteSelectedBlobPointsPushConstants {
+                    extent_count: blob_diff_total_points,
+                    valid_points: blob_diff_total_points,
+                },
+                &control,
+                Self::control_dispatch_offset(
+                    Self::CONTROL_DISPATCH_REWRITE_SELECTED_BLOB_POINTS_WORD,
+                ),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "radix-sort-selected-blob-points::sort-key-init",
+                commands,
+                &self.pipelines.radix_init_keys_indices,
+                &[
+                    (0, selected_blob_points.descriptor()),
+                    (1, selected_sort_keys.descriptor()),
+                    (2, selected_sorted_indices.descriptor()),
+                ],
+                RadixExtractPushConstants {
+                    valid_points: selected_blob_point_capacity_u32,
+                    words_per_record: 4,
+                    key_word_index: 1,
+                    key_transform: Self::RADIX_KEY_TRANSFORM_NONE,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_SELECTED_INIT_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            let secondary_selected_query = pipeline_timings
+                .reserve_radix_sort_queries("radix-sort-selected-blob-points::secondary-key-sort");
+            self.sorter.record_sort_key_value_indirect_with_query_pool(
+                commands,
+                selected_blob_point_capacity_u32,
+                &control,
+                Self::control_word_offset(Self::CONTROL_SELECTED_BLOB_POINT_COUNT_WORD),
+                &selected_sort_keys,
+                0,
+                &selected_sorted_indices,
+                0,
+                &selected_sort_storage,
+                0,
+                Some((&pipeline_timings.query_pool, secondary_selected_query)),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "radix-sort-selected-blob-points::sort-key-update",
+                commands,
+                &self.pipelines.radix_keys_from_indices,
+                &[
+                    (0, selected_blob_points.descriptor()),
+                    (1, selected_sorted_indices.descriptor()),
+                    (2, selected_sort_keys.descriptor()),
+                ],
+                RadixExtractPushConstants {
+                    valid_points: selected_blob_point_capacity_u32,
+                    words_per_record: 4,
+                    key_word_index: 0,
+                    key_transform: Self::RADIX_KEY_TRANSFORM_NONE,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_SELECTED_UPDATE_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            let primary_selected_query = pipeline_timings
+                .reserve_radix_sort_queries("radix-sort-selected-blob-points::primary-key-sort");
+            self.sorter.record_sort_key_value_indirect_with_query_pool(
+                commands,
+                selected_blob_point_capacity_u32,
+                &control,
+                Self::control_word_offset(Self::CONTROL_SELECTED_BLOB_POINT_COUNT_WORD),
+                &selected_sort_keys,
+                0,
+                &selected_sorted_indices,
+                0,
+                &selected_sort_storage,
+                0,
+                Some((&pipeline_timings.query_pool, primary_selected_query)),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "radix-sort-selected-blob-points::gather",
+                commands,
+                &self.pipelines.radix_gather_by_indices,
+                &[
+                    (0, selected_blob_points.descriptor()),
+                    (1, selected_sorted_indices.descriptor()),
+                    (2, selected_blob_sorted_points.descriptor()),
+                ],
+                RadixGatherPushConstants {
+                    valid_points: selected_blob_point_capacity_u32,
+                    words_per_record: 4,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_SELECTED_GATHER_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-rebuild-filtered-extent-starts",
+                commands,
+                &self.pipelines.rebuild_filtered_extent_starts,
+                &[
+                    (0, selected_blob_sorted_points.descriptor()),
+                    (1, filtered_blob_extent.descriptor()),
+                    (2, control.descriptor()),
+                ],
+                RebuildFilteredExtentStartsPushConstants {
+                    extent_count: blob_diff_total_points,
+                    point_count: selected_blob_point_capacity_u32,
+                },
+                &control,
+                Self::control_dispatch_offset(
+                    Self::CONTROL_DISPATCH_REBUILD_FILTERED_EXTENT_STARTS_WORD,
+                ),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-build-line-fit-points",
+                commands,
+                &self.pipelines.build_line_fit_points,
+                &[
+                    (0, selected_blob_sorted_points.descriptor()),
+                    (1, decimated_image.image.descriptor()),
+                    (2, filtered_blob_extent.descriptor()),
+                    (3, line_fit_points.descriptor()),
+                    (4, control.descriptor()),
+                ],
+                BuildLineFitPointsPushConstants {
+                    decimated_size: decimated_image.size,
+                    extent_count: blob_diff_total_points,
+                    point_count: selected_blob_point_capacity_u32,
+                    decimate: decimate_factor,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_BUILD_LINE_FIT_POINTS_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-fit-line-errors-and-peaks",
+                commands,
+                &self.pipelines.fit_line_errors_and_peaks,
+                &[
+                    (0, line_fit_points.descriptor()),
+                    (1, filtered_blob_extent.descriptor()),
+                    (2, errs.descriptor()),
+                    (3, filtered_errs.descriptor()),
+                    (4, peaks.descriptor()),
+                    (5, control.descriptor()),
+                ],
+                FitLineErrorsAndPeaksPushConstants {
+                    extent_count: blob_diff_total_points,
+                    point_count: selected_blob_point_capacity_u32,
+                    pass: 0,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_FIT_LINE_PASS0_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-fit-line-errors-and-peaks[filter]",
+                commands,
+                &self.pipelines.fit_line_errors_and_peaks,
+                &[
+                    (0, line_fit_points.descriptor()),
+                    (1, filtered_blob_extent.descriptor()),
+                    (2, errs.descriptor()),
+                    (3, filtered_errs.descriptor()),
+                    (4, peaks.descriptor()),
+                    (5, control.descriptor()),
+                ],
+                FitLineErrorsAndPeaksPushConstants {
+                    extent_count: blob_diff_total_points,
+                    point_count: selected_blob_point_capacity_u32,
+                    pass: 1,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_FIT_LINE_PASS1_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-fit-line-errors-and-peaks[peaks]",
+                commands,
+                &self.pipelines.fit_line_errors_and_peaks,
+                &[
+                    (0, line_fit_points.descriptor()),
+                    (1, filtered_blob_extent.descriptor()),
+                    (2, errs.descriptor()),
+                    (3, filtered_errs.descriptor()),
+                    (4, peaks.descriptor()),
+                    (5, control.descriptor()),
+                ],
+                FitLineErrorsAndPeaksPushConstants {
+                    extent_count: blob_diff_total_points,
+                    point_count: selected_blob_point_capacity_u32,
+                    pass: 2,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_FIT_LINE_PASS2_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "radix-sort-peaks::sort-key-init",
+                commands,
+                &self.pipelines.radix_init_keys_indices,
+                &[
+                    (0, peaks.descriptor()),
+                    (1, peak_sort_keys.descriptor()),
+                    (2, peak_sorted_indices.descriptor()),
+                ],
+                RadixExtractPushConstants {
+                    valid_points: selected_blob_point_capacity_u32,
+                    words_per_record: 3,
+                    key_word_index: 1,
+                    key_transform: Self::RADIX_KEY_TRANSFORM_F32_ASC,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_PEAKS_INIT_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            let secondary_peak_query =
+                pipeline_timings.reserve_radix_sort_queries("radix-sort-peaks::secondary-key-sort");
+            self.sorter.record_sort_key_value_indirect_with_query_pool(
+                commands,
+                selected_blob_point_capacity_u32,
+                &control,
+                Self::control_word_offset(Self::CONTROL_SELECTED_BLOB_POINT_COUNT_WORD),
+                &peak_sort_keys,
+                0,
+                &peak_sorted_indices,
+                0,
+                &peak_sort_storage,
+                0,
+                Some((&pipeline_timings.query_pool, secondary_peak_query)),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "radix-sort-peaks::sort-key-update",
+                commands,
+                &self.pipelines.radix_keys_from_indices,
+                &[
+                    (0, peaks.descriptor()),
+                    (1, peak_sorted_indices.descriptor()),
+                    (2, peak_sort_keys.descriptor()),
+                ],
+                RadixExtractPushConstants {
+                    valid_points: selected_blob_point_capacity_u32,
+                    words_per_record: 3,
+                    key_word_index: 0,
+                    key_transform: Self::RADIX_KEY_TRANSFORM_NONE,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_PEAKS_UPDATE_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            let primary_peak_query =
+                pipeline_timings.reserve_radix_sort_queries("radix-sort-peaks::primary-key-sort");
+            self.sorter.record_sort_key_value_indirect_with_query_pool(
+                commands,
+                selected_blob_point_capacity_u32,
+                &control,
+                Self::control_word_offset(Self::CONTROL_SELECTED_BLOB_POINT_COUNT_WORD),
+                &peak_sort_keys,
+                0,
+                &peak_sorted_indices,
+                0,
+                &peak_sort_storage,
+                0,
+                Some((&pipeline_timings.query_pool, primary_peak_query)),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "radix-sort-peaks::gather",
+                commands,
+                &self.pipelines.radix_gather_by_indices,
+                &[
+                    (0, peaks.descriptor()),
+                    (1, peak_sorted_indices.descriptor()),
+                    (2, sorted_peaks.descriptor()),
+                ],
+                RadixGatherPushConstants {
+                    valid_points: selected_blob_point_capacity_u32,
+                    words_per_record: 3,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_PEAKS_GATHER_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-build-peak-extents",
+                commands,
+                &self.pipelines.build_peak_extents,
+                &[
+                    (0, sorted_peaks.descriptor()),
+                    (1, peak_extents.descriptor()),
+                    (2, control_peak_extent_desc),
+                    (3, control.descriptor()),
+                ],
+                TotalPointsPushConstants {
+                    total_points: selected_blob_point_capacity_u32,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_BUILD_PEAK_EXTENTS_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "detect-build-indirect-dispatch-args[post-peak-extents]",
+                commands,
+                &self.pipelines.build_indirect_dispatch_args,
+                &[(0, control.descriptor()), (1, control.descriptor())],
+                BuildIndirectDispatchArgsPushConstants {
+                    one_d_local_size_x: Self::ONE_D_LOCAL_SIZE_X,
+                    marker_size_with_borders: Self::MARKER_SIZE_WITH_BORDERS as u32,
+                },
+                [1, 1, 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+            commands.barrier_shader_write_to_indirect_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "filter-fit-quads",
+                commands,
+                &self.pipelines.fit_quads,
+                &[
+                    (0, sorted_peaks.descriptor()),
+                    (1, peak_extents.descriptor()),
+                    (2, line_fit_points.descriptor()),
+                    (3, filtered_blob_extent.descriptor()),
+                    (4, fitted_quads.descriptor()),
+                    (5, control_fitted_quad_desc),
+                    (6, control.descriptor()),
+                ],
+                FitQuadsPushConstants {
+                    peak_extent_count: selected_blob_point_capacity_u32,
+                    filtered_blob_extent_count: blob_diff_total_points,
+                    max_nmaxima: self.settings.quad_fit.max_nmaxima,
+                    max_line_fit_mse: self.settings.quad_fit.max_line_fit_mse,
+                    cos_critical_rad: self.settings.quad_fit.cos_critical_rad,
+                    min_tag_width,
+                    quad_decimate: decimate_factor as f32,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_FIT_QUADS_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "detect-build-indirect-dispatch-args[post-fit-quads]",
+                commands,
+                &self.pipelines.build_indirect_dispatch_args,
+                &[(0, control.descriptor()), (1, control.descriptor())],
+                BuildIndirectDispatchArgsPushConstants {
+                    one_d_local_size_x: Self::ONE_D_LOCAL_SIZE_X,
+                    marker_size_with_borders: Self::MARKER_SIZE_WITH_BORDERS as u32,
+                },
+                [1, 1, 1],
+            );
+            commands.barrier_shader_write_to_shader_read();
+            commands.barrier_shader_write_to_indirect_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "decode-prepare-decode-quads",
+                commands,
+                &self.pipelines.prepare_decode_quads,
+                &[
+                    (0, input_gpu_image.image.descriptor()),
+                    (1, fitted_quads.descriptor()),
+                    (2, quad_params.descriptor()),
+                    (3, control.descriptor()),
+                ],
+                PrepareDecodeQuadsPushConstants {
+                    image_size: input_gpu_image.size,
+                    quad_count: max_quad_capacity_u32,
+                    marker_size_with_borders: Self::MARKER_SIZE_WITH_BORDERS as u32,
+                    cell_size: self.settings.decode.cell_size,
+                    min_stddev_otsu: self.settings.decode.min_stddev_otsu,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_PREPARE_DECODE_QUADS_WORD),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut pipeline_timings,
+                "decode-extract-candidate-bits",
+                commands,
+                &self.pipelines.extract_candidate_bits,
+                &[
+                    (0, input_gpu_image.image.descriptor()),
+                    (1, quad_params.descriptor()),
+                    (2, bits.descriptor()),
+                    (3, control.descriptor()),
+                ],
+                ExtractCandidateBitsPushConstants {
+                    image_size: input_gpu_image.size,
+                    quad_count: max_quad_capacity_u32,
+                    marker_size_with_borders: Self::MARKER_SIZE_WITH_BORDERS as u32,
+                    cell_size: self.settings.decode.cell_size,
+                    cell_margin_pixels: self.settings.decode.cell_margin_pixels,
+                    cell_span: self.settings.decode.cell_span,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_EXTRACT_CANDIDATE_BITS_WORD),
+            );
+
+            commands.barrier_shader_write_to_transfer_read();
+            commands.copy_buffer_region(
+                &control,
+                0,
+                &readback_counters,
+                0,
+                (Self::CONTROL_COUNTER_WORD_COUNT * std::mem::size_of::<u32>()) as vk::DeviceSize,
+            );
+            commands.copy_buffer_region(
+                &fitted_quads,
+                0,
+                &readback_fitted_quads,
+                0,
+                fitted_quads.byte_size(),
+            );
+            commands.copy_buffer_region(&bits, 0, &readback_bits, 0, bits.byte_size());
+        });
+
+        let timing_report = pipeline_timings.summary(&self.device);
+        let counters = readback_counters.read(Self::CONTROL_COUNTER_WORD_COUNT);
+        let fitted_quad_count_value =
+            counters[Self::CONTROL_FITTED_QUAD_COUNT_WORD as usize].min(max_quad_capacity_u32);
+        if fitted_quad_count_value == 0 {
+            return Ok((Vec::new(), timing_report));
+        }
+
+        let fitted_quad_words = readback_fitted_quads
+            .read(fitted_quad_count_value as usize * fitted_quad_words_per_quad);
+        let bits_words = readback_bits.read(fitted_quad_count_value as usize * 8usize * 8usize);
+        let tags =
+            self.build_detected_tags(&fitted_quad_words, fitted_quad_count_value, &bits_words);
+        Ok((tags, timing_report))
+    }
+
+    #[allow(unreachable_code)]
     pub fn detect_gray_with_timing(
         &self,
         image: ImageBuffer<image::Luma<u8>, Vec<u8>>,
@@ -672,6 +1765,8 @@ impl Detector {
         {
             return Err(());
         }
+
+        return self.detect_gray_with_timing_single_submit(&image);
 
         let decimate_factor = self.settings.decimate.unwrap_or(1) as u32;
         let aligned_input = crop_image_to_multiple(image, 4 * decimate_factor)?;
@@ -1540,6 +2635,28 @@ impl Detector {
         );
     }
 
+    fn dispatch_indirect_with_push_constants_recorded_timed<T: Pod + Copy>(
+        &self,
+        timings: &mut PipelineTimings,
+        name: &str,
+        commands: &mut CommandRecorder<'_>,
+        compute_pipeline: &Arc<ComputePipeline>,
+        bindings: &[(u32, DescriptorBuffer)],
+        push_constants: T,
+        indirect_buffer: &GpuBuffer<u32>,
+        indirect_offset: vk::DeviceSize,
+    ) {
+        timings.dispatch_indirect_with_push_constants(
+            commands,
+            name,
+            compute_pipeline.as_ref(),
+            bindings,
+            &push_constants,
+            indirect_buffer,
+            indirect_offset,
+        );
+    }
+
     fn dispatch_with_push_constants_timed<T: Pod + Copy>(
         &self,
         timings: &mut PipelineTimings,
@@ -1566,12 +2683,38 @@ impl Detector {
         });
     }
 
+    fn control_word_offset(word_index: u32) -> vk::DeviceSize {
+        (word_index as vk::DeviceSize) * (std::mem::size_of::<u32>() as vk::DeviceSize)
+    }
+
+    fn control_counter_descriptor(control: &GpuBuffer<u32>, word_index: u32) -> DescriptorBuffer {
+        control.descriptor_range(
+            Self::control_word_offset(word_index),
+            std::mem::size_of::<u32>() as vk::DeviceSize,
+        )
+    }
+
+    fn control_dispatch_offset(word_index: u32) -> vk::DeviceSize {
+        Self::control_word_offset(word_index)
+    }
+
     fn new_u8_storage_buffer(&self, len: usize) -> GpuBuffer<u8> {
         self.device.create_buffer(
             len,
             ash::vk::BufferUsageFlags::STORAGE_BUFFER
                 | ash::vk::BufferUsageFlags::TRANSFER_SRC
                 | ash::vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemory::DeviceLocal,
+        )
+    }
+
+    fn new_u32_control_buffer(&self, len: usize) -> GpuBuffer<u32> {
+        self.device.create_buffer(
+            len,
+            ash::vk::BufferUsageFlags::STORAGE_BUFFER
+                | ash::vk::BufferUsageFlags::TRANSFER_SRC
+                | ash::vk::BufferUsageFlags::TRANSFER_DST
+                | ash::vk::BufferUsageFlags::INDIRECT_BUFFER,
             BufferMemory::DeviceLocal,
         )
     }

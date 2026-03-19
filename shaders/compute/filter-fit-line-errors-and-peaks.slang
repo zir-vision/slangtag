@@ -1,10 +1,12 @@
 import "../filter.slang";
+import "./detect-control.slang";
 
 StructuredBuffer<uint32_t> line_fit_points;
 StructuredBuffer<uint32_t> filtered_extents;
 RWStructuredBuffer<uint32_t> errs_out;
 RWStructuredBuffer<uint32_t> filtered_errs_out;
 RWStructuredBuffer<uint32_t> peaks_out;
+StructuredBuffer<uint32_t> control;
 struct PushConstants
 {
     uint32_t extent_count;
@@ -20,8 +22,8 @@ ConstantBuffer<PushConstants> pc;
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     uint32_t tid = dispatch_thread_id.x;
-    uint32_t extent_count = pc.extent_count;
-    uint32_t point_count = pc.point_count;
+    uint32_t extent_count = control[kControlBlobExtentCountWord];
+    uint32_t point_count = control[kControlSelectedBlobPointCountWord];
     uint32_t pass = pc.pass;
     if (tid >= point_count)
         return;

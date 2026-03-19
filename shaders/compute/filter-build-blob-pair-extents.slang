@@ -1,4 +1,5 @@
 import "../filter.slang";
+import "./detect-control.slang";
 
 StructuredBuffer<uint32_t> sorted_points;
 RWStructuredBuffer<uint32_t> extents_out;
@@ -7,6 +8,7 @@ RWStructuredBuffer<uint32_t> filtered_extents_out;
 RWStructuredBuffer<uint32_t> selected_extent_count_out;
 RWStructuredBuffer<uint32_t> selected_point_count_out;
 RWStructuredBuffer<uint32_t> point_extent_indices_out;
+StructuredBuffer<uint32_t> control;
 struct PushConstants
 {
     uint32_t valid_points;
@@ -25,7 +27,7 @@ ConstantBuffer<PushConstants> pc;
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     uint32_t tid = dispatch_thread_id.x;
-    uint32_t valid_points = pc.valid_points;
+    uint32_t valid_points = control[kControlBlobDiffFilteredCountWord];
     uint32_t tag_width = pc.tag_width;
     uint32_t reversed_border = pc.reversed_border;
     uint32_t normal_border = pc.normal_border;

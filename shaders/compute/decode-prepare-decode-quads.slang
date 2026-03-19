@@ -1,9 +1,11 @@
 import "./image_buffer.slang";
 import "../decode.slang";
+import "./detect-control.slang";
 
 StructuredBuffer<uint8_t> image_gray;
 StructuredBuffer<uint32_t> fitted_quads;
 RWStructuredBuffer<uint32_t> quad_params_out;
+StructuredBuffer<uint32_t> control;
 
 struct PushConstants
 {
@@ -54,7 +56,8 @@ uint8_t sample_warped_buffer(StructuredBuffer<uint8_t> image,
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     uint tid = dispatch_thread_id.x;
-    if (tid >= pc.quad_count)
+    uint32_t quad_count = control[kControlFittedQuadCountWord];
+    if (tid >= quad_count)
         return;
 
     uint32_t quad_index = tid;

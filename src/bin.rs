@@ -99,7 +99,6 @@ fn main() {
     }
     println!(
         "  {:<52} {:>9.3} ms",
-        "total timed shader execution",
-        avg_gpu_ms
+        "total timed shader execution", avg_gpu_ms
     );
 }

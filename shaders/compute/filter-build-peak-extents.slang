@@ -1,8 +1,10 @@
 import "../filter.slang";
+import "./detect-control.slang";
 
 StructuredBuffer<uint32_t> sorted_peaks;
 RWStructuredBuffer<uint32_t> peak_extents_out;
 RWStructuredBuffer<uint32_t> peak_extent_count_out;
+StructuredBuffer<uint32_t> control;
 struct PushConstants
 {
     uint32_t valid_peaks;
@@ -16,7 +18,7 @@ ConstantBuffer<PushConstants> pc;
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
     uint32_t tid = dispatch_thread_id.x;
-    uint32_t valid_peaks = pc.valid_peaks;
+    uint32_t valid_peaks = control[kControlSelectedBlobPointCountWord];
     if (tid >= valid_peaks)
         return;
 
