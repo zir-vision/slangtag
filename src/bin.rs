@@ -31,12 +31,14 @@ fn main() {
     let gray_image = image.to_luma8();
 
     let dev = ComputeDevice::new_default();
-    let det = Detector::new(
+    let image_size = slangtag::Size::new(gray_image.width(), gray_image.height());
+    let det = Detector::new_with_size(
         dev,
         DetectionSettings {
             decimate: Some(2),
             ..Default::default()
         },
+        image_size,
     );
 
     let mut total_wall_ms = 0.0f64;

@@ -181,6 +181,56 @@ pub(crate) struct CommandRecorder<'a> {
 }
 
 impl<'a> CommandRecorder<'a> {
+    fn allocate_and_write_descriptor_set(
+        &mut self,
+        bindings: &[(u32, DescriptorBuffer)],
+    ) -> vk::DescriptorSet {
+        let descriptor_set = {
+            let _pool_lock = self
+                .inner
+                .descriptor_pool_lock
+                .lock()
+                .expect("failed to lock descriptor pool");
+            let set_layouts = [self.inner.descriptor_set_layout];
+            let allocate_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.inner.descriptor_pool)
+                .set_layouts(&set_layouts);
+            unsafe {
+                self.inner
+                    .device
+                    .allocate_descriptor_sets(&allocate_info)
+                    .expect("failed to allocate descriptor set")[0]
+            }
+        };
+        self.descriptor_sets.push(descriptor_set);
+
+        let buffer_infos: Vec<_> = bindings
+            .iter()
+            .map(|(_, binding)| {
+                vk::DescriptorBufferInfo::default()
+                    .buffer(binding.buffer)
+                    .offset(binding.offset)
+                    .range(binding.range)
+            })
+            .collect();
+        let writes: Vec<_> = bindings
+            .iter()
+            .zip(buffer_infos.iter())
+            .map(|((binding_index, _), info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(*binding_index)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(info))
+            })
+            .collect();
+        unsafe {
+            self.inner.device.update_descriptor_sets(&writes, &[]);
+        }
+
+        descriptor_set
+    }
+
     pub fn reset_query_pool(
         &mut self,
         query_pool: &GpuQueryPool,
@@ -403,6 +453,21 @@ impl<'a> CommandRecorder<'a> {
         push_constants: &T,
         groups: [u32; 3],
     ) {
+        let _ = self.dispatch_with_push_constants_capture_set(
+            pipeline,
+            bindings,
+            push_constants,
+            groups,
+        );
+    }
+
+    pub fn dispatch_with_push_constants_capture_set<T: Pod + Copy>(
+        &mut self,
+        pipeline: &ComputePipeline,
+        bindings: &[(u32, DescriptorBuffer)],
+        push_constants: &T,
+        groups: [u32; 3],
+    ) -> vk::DescriptorSet {
         let push_bytes = bytemuck::bytes_of(push_constants);
         assert!(
             (push_bytes.len() as u32) <= MAX_PUSH_CONSTANT_BYTES,
@@ -411,47 +476,8 @@ impl<'a> CommandRecorder<'a> {
             MAX_PUSH_CONSTANT_BYTES
         );
 
-        let descriptor_set = {
-            let _pool_lock = self
-                .inner
-                .descriptor_pool_lock
-                .lock()
-                .expect("failed to lock descriptor pool");
-            let set_layouts = [self.inner.descriptor_set_layout];
-            let allocate_info = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(self.inner.descriptor_pool)
-                .set_layouts(&set_layouts);
-            unsafe {
-                self.inner
-                    .device
-                    .allocate_descriptor_sets(&allocate_info)
-                    .expect("failed to allocate descriptor set")[0]
-            }
-        };
-        self.descriptor_sets.push(descriptor_set);
-
-        let buffer_infos: Vec<_> = bindings
-            .iter()
-            .map(|(_, binding)| {
-                vk::DescriptorBufferInfo::default()
-                    .buffer(binding.buffer)
-                    .offset(binding.offset)
-                    .range(binding.range)
-            })
-            .collect();
-        let writes: Vec<_> = bindings
-            .iter()
-            .zip(buffer_infos.iter())
-            .map(|((binding_index, _), info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(descriptor_set)
-                    .dst_binding(*binding_index)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(info))
-            })
-            .collect();
+        let descriptor_set = self.allocate_and_write_descriptor_set(bindings);
         unsafe {
-            self.inner.device.update_descriptor_sets(&writes, &[]);
             self.inner.device.cmd_bind_pipeline(
                 self.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
@@ -476,6 +502,8 @@ impl<'a> CommandRecorder<'a> {
                 .device
                 .cmd_dispatch(self.command_buffer, groups[0], groups[1], groups[2]);
         }
+
+        descriptor_set
     }
 
     pub fn dispatch_indirect_with_push_constants<T: Pod + Copy>(
@@ -486,6 +514,23 @@ impl<'a> CommandRecorder<'a> {
         indirect_buffer: &GpuBuffer<u32>,
         indirect_offset: vk::DeviceSize,
     ) {
+        let _ = self.dispatch_indirect_with_push_constants_capture_set(
+            pipeline,
+            bindings,
+            push_constants,
+            indirect_buffer,
+            indirect_offset,
+        );
+    }
+
+    pub fn dispatch_indirect_with_push_constants_capture_set<T: Pod + Copy>(
+        &mut self,
+        pipeline: &ComputePipeline,
+        bindings: &[(u32, DescriptorBuffer)],
+        push_constants: &T,
+        indirect_buffer: &GpuBuffer<u32>,
+        indirect_offset: vk::DeviceSize,
+    ) -> vk::DescriptorSet {
         let push_bytes = bytemuck::bytes_of(push_constants);
         assert!(
             (push_bytes.len() as u32) <= MAX_PUSH_CONSTANT_BYTES,
@@ -506,47 +551,8 @@ impl<'a> CommandRecorder<'a> {
             indirect_buffer.raw.bytes
         );
 
-        let descriptor_set = {
-            let _pool_lock = self
-                .inner
-                .descriptor_pool_lock
-                .lock()
-                .expect("failed to lock descriptor pool");
-            let set_layouts = [self.inner.descriptor_set_layout];
-            let allocate_info = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(self.inner.descriptor_pool)
-                .set_layouts(&set_layouts);
-            unsafe {
-                self.inner
-                    .device
-                    .allocate_descriptor_sets(&allocate_info)
-                    .expect("failed to allocate descriptor set")[0]
-            }
-        };
-        self.descriptor_sets.push(descriptor_set);
-
-        let buffer_infos: Vec<_> = bindings
-            .iter()
-            .map(|(_, binding)| {
-                vk::DescriptorBufferInfo::default()
-                    .buffer(binding.buffer)
-                    .offset(binding.offset)
-                    .range(binding.range)
-            })
-            .collect();
-        let writes: Vec<_> = bindings
-            .iter()
-            .zip(buffer_infos.iter())
-            .map(|((binding_index, _), info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(descriptor_set)
-                    .dst_binding(*binding_index)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(info))
-            })
-            .collect();
+        let descriptor_set = self.allocate_and_write_descriptor_set(bindings);
         unsafe {
-            self.inner.device.update_descriptor_sets(&writes, &[]);
             self.inner.device.cmd_bind_pipeline(
                 self.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
@@ -573,6 +579,8 @@ impl<'a> CommandRecorder<'a> {
                 indirect_offset,
             );
         }
+
+        descriptor_set
     }
 
     #[allow(dead_code)]
@@ -655,6 +663,148 @@ impl<'a> CommandRecorder<'a> {
                 indirect_buffer.raw.buffer,
                 indirect_offset,
             );
+        }
+    }
+}
+
+pub(crate) struct CachedCommandBuffer {
+    inner: Arc<ComputeDeviceInner>,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    submit_fence: vk::Fence,
+    descriptor_sets: Vec<vk::DescriptorSet>,
+}
+
+impl Drop for CachedCommandBuffer {
+    fn drop(&mut self) {
+        let _submit_lock = self
+            .inner
+            .submit_lock
+            .lock()
+            .expect("failed to lock submit path during cached command buffer drop");
+        if !self.descriptor_sets.is_empty() {
+            let _pool_lock = self
+                .inner
+                .descriptor_pool_lock
+                .lock()
+                .expect("failed to lock descriptor pool during cached command buffer drop");
+            unsafe {
+                let _ = self
+                    .inner
+                    .device
+                    .free_descriptor_sets(self.inner.descriptor_pool, &self.descriptor_sets);
+            }
+        }
+        unsafe {
+            let _ = self.inner.device.device_wait_idle();
+            self.inner.device.destroy_fence(self.submit_fence, None);
+            self.inner
+                .device
+                .free_command_buffers(self.command_pool, &[self.command_buffer]);
+            self.inner.device.destroy_command_pool(self.command_pool, None);
+        }
+    }
+}
+
+impl CachedCommandBuffer {
+    pub(crate) fn record<F>(&mut self, record: F)
+    where
+        F: FnOnce(&mut CommandRecorder<'_>),
+    {
+        let _submit_lock = self
+            .inner
+            .submit_lock
+            .lock()
+            .expect("failed to lock submit path for command recording");
+        unsafe {
+            self.inner
+                .device
+                .reset_command_pool(self.command_pool, vk::CommandPoolResetFlags::empty())
+                .expect("failed to reset cached command pool");
+            self.inner
+                .device
+                .reset_fences(&[self.submit_fence])
+                .expect("failed to reset cached command fence");
+            let begin_info = vk::CommandBufferBeginInfo::default();
+            self.inner
+                .device
+                .begin_command_buffer(self.command_buffer, &begin_info)
+                .expect("failed to begin cached command buffer");
+        }
+
+        let mut recorder = CommandRecorder {
+            inner: self.inner.as_ref(),
+            command_buffer: self.command_buffer,
+            descriptor_sets: Vec::new(),
+        };
+        record(&mut recorder);
+
+        unsafe {
+            self.inner
+                .device
+                .end_command_buffer(self.command_buffer)
+                .expect("failed to end cached command buffer");
+        }
+
+        if !self.descriptor_sets.is_empty() {
+            let _pool_lock = self
+                .inner
+                .descriptor_pool_lock
+                .lock()
+                .expect("failed to lock descriptor pool for descriptor-set cleanup");
+            unsafe {
+                let _ = self
+                    .inner
+                    .device
+                    .free_descriptor_sets(self.inner.descriptor_pool, &self.descriptor_sets);
+            }
+        }
+        self.descriptor_sets = recorder.descriptor_sets;
+    }
+
+    pub(crate) fn submit_and_wait(&self) {
+        let _submit_lock = self
+            .inner
+            .submit_lock
+            .lock()
+            .expect("failed to lock submit path");
+        unsafe {
+            self.inner
+                .device
+                .reset_fences(&[self.submit_fence])
+                .expect("failed to reset cached command fence");
+            let command_buffers = [self.command_buffer];
+            let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+            self.inner
+                .device
+                .queue_submit(self.inner.queue, &submit_info, self.submit_fence)
+                .expect("failed to submit cached command buffer");
+            self.inner
+                .device
+                .wait_for_fences(&[self.submit_fence], true, u64::MAX)
+                .expect("failed to wait for cached command fence");
+        }
+    }
+
+    pub(crate) fn update_storage_buffer_binding(
+        &self,
+        descriptor_set: vk::DescriptorSet,
+        binding: u32,
+        buffer: DescriptorBuffer,
+    ) {
+        let info = vk::DescriptorBufferInfo::default()
+            .buffer(buffer.buffer)
+            .offset(buffer.offset)
+            .range(buffer.range);
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(binding)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&info));
+        unsafe {
+            self.inner
+                .device
+                .update_descriptor_sets(std::slice::from_ref(&write), &[]);
         }
     }
 }
@@ -881,6 +1031,42 @@ impl ComputeDevice {
         self.inner.queue_family_index
     }
 
+    pub(crate) fn create_cached_command_buffer(&self) -> CachedCommandBuffer {
+        let command_pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(self.inner.queue_family_index)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let command_pool = unsafe {
+            self.inner
+                .device
+                .create_command_pool(&command_pool_info, None)
+                .expect("failed to create cached command pool")
+        };
+        let command_buffer = unsafe {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            self.inner
+                .device
+                .allocate_command_buffers(&alloc_info)
+                .expect("failed to allocate cached command buffer")[0]
+        };
+        let submit_fence = unsafe {
+            self.inner
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .expect("failed to create cached command fence")
+        };
+
+        CachedCommandBuffer {
+            inner: Arc::clone(&self.inner),
+            command_pool,
+            command_buffer,
+            submit_fence,
+            descriptor_sets: Vec::new(),
+        }
+    }
+
     pub fn create_timestamp_query_pool(&self, query_count: u32) -> GpuQueryPool {
         assert!(query_count > 0, "query_count must be > 0");
         let create_info = vk::QueryPoolCreateInfo::default()
@@ -1086,8 +1272,40 @@ impl ComputeDevice {
         dst_offset: vk::DeviceSize,
         bytes: vk::DeviceSize,
     ) {
-        self.run_one_time_commands(|recorder| {
+        self.run_persistent_command_buffer(|recorder| {
             recorder.copy_buffer_region(src, src_offset, dst, dst_offset, bytes);
+        });
+    }
+
+    pub fn copy_descriptor_buffer_to_buffer<T: Pod + Copy>(
+        &self,
+        src: DescriptorBuffer,
+        dst: &GpuBuffer<T>,
+        bytes: vk::DeviceSize,
+    ) {
+        assert!(
+            bytes <= src.range,
+            "copy source range exceeds descriptor range: bytes={} src_range={}",
+            bytes,
+            src.range
+        );
+        assert!(
+            bytes <= dst.byte_size(),
+            "copy destination range exceeds buffer size: bytes={} dst_size={}",
+            bytes,
+            dst.byte_size()
+        );
+        self.run_persistent_command_buffer(|recorder| unsafe {
+            let copy_regions = [vk::BufferCopy::default()
+                .src_offset(src.offset)
+                .dst_offset(0)
+                .size(bytes)];
+            recorder.inner.device.cmd_copy_buffer(
+                recorder.command_buffer,
+                src.buffer,
+                dst.raw.buffer,
+                &copy_regions,
+            );
         });
     }
 
@@ -1102,7 +1320,7 @@ impl ComputeDevice {
         size: vk::DeviceSize,
         value: u32,
     ) {
-        self.run_one_time_commands(|recorder| {
+        self.run_persistent_command_buffer(|recorder| {
             recorder.fill_buffer_u32_range(buffer, offset, size, value);
         });
     }
@@ -1114,7 +1332,7 @@ impl ComputeDevice {
         push_constants: &T,
         groups: [u32; 3],
     ) {
-        self.run_one_time_commands(|recorder| {
+        self.run_persistent_command_buffer(|recorder| {
             recorder.dispatch_with_push_constants(pipeline, bindings, push_constants, groups);
         });
     }
@@ -1123,10 +1341,10 @@ impl ComputeDevice {
     where
         F: FnOnce(&mut CommandRecorder<'_>),
     {
-        self.run_one_time_commands(record);
+        self.run_persistent_command_buffer(record);
     }
 
-    fn run_one_time_commands<F>(&self, record: F)
+    fn run_persistent_command_buffer<F>(&self, record: F)
     where
         F: FnOnce(&mut CommandRecorder<'_>),
     {
@@ -1147,8 +1365,8 @@ impl ComputeDevice {
                 .device
                 .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
                 .expect("failed to reset command buffer");
-            let begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            // Reuse the same primary command buffer instance for all submissions.
+            let begin_info = vk::CommandBufferBeginInfo::default();
             self.inner
                 .device
                 .begin_command_buffer(command_buffer, &begin_info)

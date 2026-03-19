@@ -185,7 +185,14 @@ impl ViewerApp {
     }
 
     fn rebuild_detector(&mut self) {
-        self.detector = Detector::new(self.device.clone(), self.settings.to_detection_settings());
+        let detection_settings = self.settings.to_detection_settings();
+        if let Some(image) = self.loaded_image.as_ref() {
+            let size = slangtag::Size::new(image.width, image.height);
+            self.detector =
+                Detector::new_with_size(self.device.clone(), detection_settings, size);
+        } else {
+            self.detector = Detector::new(self.device.clone(), detection_settings);
+        }
     }
 
     fn load_image(&mut self, ctx: &egui::Context, path: PathBuf) {
@@ -206,6 +213,7 @@ impl ViewerApp {
                     gray: image.to_luma8(),
                     texture,
                 });
+                self.rebuild_detector();
                 self.detections.clear();
                 self.last_runtime = None;
                 self.status = format!("Loaded {}", path.display());

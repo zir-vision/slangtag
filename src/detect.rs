@@ -1,11 +1,14 @@
-use crate::gpu::{BufferMemory, CommandRecorder, ComputePipeline, DescriptorBuffer, GpuBuffer};
+use crate::gpu::{
+    BufferMemory, CachedCommandBuffer, CommandRecorder, ComputePipeline, DescriptorBuffer,
+    GpuBuffer,
+};
 use crate::sort::RadixSorter;
 use crate::{ComputeDevice, Size, compute_shader_path, include_u32};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use image::{DynamicImage, GrayImage, ImageBuffer};
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 include!("apriltag36h11_codes.rs");
 
@@ -135,6 +138,57 @@ pub struct Detector {
     settings: DetectionSettings,
     pipelines: DetectionPipelines,
     sorter: RadixSorter,
+    fixed_size: Option<Size>,
+    cached_execution: Mutex<Option<CachedDetectorExecution>>,
+}
+
+struct CachedDetectorExecution {
+    max_quad_capacity_u32: u32,
+    fitted_quad_words_per_quad: usize,
+    readback_counters: GpuBuffer<u32>,
+    readback_fitted_quads: GpuBuffer<u32>,
+    readback_bits: GpuBuffer<u32>,
+    _buffers: CachedDetectorBuffers,
+    timings: PipelineTimings,
+    command_buffer: CachedCommandBuffer,
+}
+
+struct CachedDetectorBuffers {
+    input_placeholder: GpuBuffer<u8>,
+    decimated_image: Option<GpuBuffer<u8>>,
+    thresholded_image: Option<GpuBuffer<u8>>,
+    minmax_image: GpuBuffer<u8>,
+    filtered_minmax_image: GpuBuffer<u8>,
+    labels: GpuBuffer<u32>,
+    final_labels: GpuBuffer<u32>,
+    union_markers_size: GpuBuffer<u32>,
+    blob_diff_out: GpuBuffer<u32>,
+    blob_diff_compacted: GpuBuffer<u32>,
+    blob_diff_sorted: GpuBuffer<u32>,
+    blob_extent: GpuBuffer<u32>,
+    filtered_blob_extent: GpuBuffer<u32>,
+    point_extent_indices: GpuBuffer<u32>,
+    selected_blob_points: GpuBuffer<u32>,
+    selected_blob_sorted_points: GpuBuffer<u32>,
+    line_fit_points: GpuBuffer<u32>,
+    errs: GpuBuffer<u32>,
+    filtered_errs: GpuBuffer<u32>,
+    peaks: GpuBuffer<u32>,
+    sorted_peaks: GpuBuffer<u32>,
+    peak_extents: GpuBuffer<u32>,
+    fitted_quads: GpuBuffer<u32>,
+    quad_params: GpuBuffer<u32>,
+    bits: GpuBuffer<u32>,
+    control: GpuBuffer<u32>,
+    blob_sort_keys: GpuBuffer<u32>,
+    blob_sorted_indices: GpuBuffer<u32>,
+    blob_sort_storage: GpuBuffer<u32>,
+    selected_sort_keys: GpuBuffer<u32>,
+    selected_sorted_indices: GpuBuffer<u32>,
+    selected_sort_storage: GpuBuffer<u32>,
+    peak_sort_keys: GpuBuffer<u32>,
+    peak_sorted_indices: GpuBuffer<u32>,
+    peak_sort_storage: GpuBuffer<u32>,
 }
 
 struct DetectionPipelines {
@@ -425,6 +479,41 @@ impl PipelineTimings {
         });
     }
 
+    fn dispatch_with_push_constants_capture_set<T: Pod + Copy>(
+        &mut self,
+        commands: &mut CommandRecorder<'_>,
+        name: &str,
+        compute_pipeline: &ComputePipeline,
+        bindings: &[(u32, DescriptorBuffer)],
+        push_constants: &T,
+        dispatch: [u32; 3],
+    ) -> vk::DescriptorSet {
+        let start_query = self.allocate_queries(1);
+        let end_query = self.allocate_queries(1);
+        commands.write_timestamp(
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            &self.query_pool,
+            start_query,
+        );
+        let descriptor_set = commands.dispatch_with_push_constants_capture_set(
+            compute_pipeline,
+            bindings,
+            push_constants,
+            dispatch,
+        );
+        commands.write_timestamp(
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            &self.query_pool,
+            end_query,
+        );
+        self.spans.push(TimedPass {
+            name: name.to_owned(),
+            start_query,
+            end_query,
+        });
+        descriptor_set
+    }
+
     fn dispatch_indirect_with_push_constants<T: Pod + Copy>(
         &mut self,
         commands: &mut CommandRecorder<'_>,
@@ -459,6 +548,43 @@ impl PipelineTimings {
             start_query,
             end_query,
         });
+    }
+
+    fn dispatch_indirect_with_push_constants_capture_set<T: Pod + Copy>(
+        &mut self,
+        commands: &mut CommandRecorder<'_>,
+        name: &str,
+        compute_pipeline: &ComputePipeline,
+        bindings: &[(u32, DescriptorBuffer)],
+        push_constants: &T,
+        indirect_buffer: &GpuBuffer<u32>,
+        indirect_offset: vk::DeviceSize,
+    ) -> vk::DescriptorSet {
+        let start_query = self.allocate_queries(1);
+        let end_query = self.allocate_queries(1);
+        commands.write_timestamp(
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            &self.query_pool,
+            start_query,
+        );
+        let descriptor_set = commands.dispatch_indirect_with_push_constants_capture_set(
+            compute_pipeline,
+            bindings,
+            push_constants,
+            indirect_buffer,
+            indirect_offset,
+        );
+        commands.write_timestamp(
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            &self.query_pool,
+            end_query,
+        );
+        self.spans.push(TimedPass {
+            name: name.to_owned(),
+            start_query,
+            end_query,
+        });
+        descriptor_set
     }
 
     fn reserve_radix_sort_queries(&mut self, name_prefix: &str) -> u32 {
@@ -740,65 +866,90 @@ impl Detector {
             settings,
             pipelines,
             sorter,
+            fixed_size: None,
+            cached_execution: Mutex::new(None),
         }
     }
 
-    pub fn detect(&self, image: DynamicImage) -> Result<Vec<DetectedTag>, ()> {
-        let gray_image = image.to_luma8();
-        self.detect_gray(gray_image)
+    pub fn new_with_size(device: ComputeDevice, settings: DetectionSettings, size: Size) -> Self {
+        let mut detector = Self::new(device, settings);
+        let normalized_size = detector
+            .normalize_input_size(size)
+            .expect("input size is too small after decimate alignment");
+        detector.fixed_size = Some(normalized_size);
+        detector
+            .build_cached_execution(normalized_size)
+            .map(|cached| {
+                detector.cached_execution = Mutex::new(Some(cached));
+            })
+            .expect("failed to build cached detector execution");
+        detector
     }
 
-    pub fn detect_gray(
-        &self,
-        image: ImageBuffer<image::Luma<u8>, Vec<u8>>,
-    ) -> Result<Vec<DetectedTag>, ()> {
-        self.detect_gray_with_timing(image).map(|(tags, _)| tags)
-    }
-
-    pub fn detect_gpu_buffer(
-        &self,
-        input: DescriptorBuffer,
+    fn ensure_cached_execution<'a>(
+        &'a self,
         size: Size,
-    ) -> Result<Vec<DetectedTag>, ()> {
-        self.detect_gpu_buffer_with_timing(input, size)
-            .map(|(tags, _)| tags)
+        guard: &'a mut Option<CachedDetectorExecution>,
+    ) -> Result<&'a mut CachedDetectorExecution, ()> {
+        let normalized_size = self.normalize_input_size(size).ok_or(())?;
+        if let Some(expected_size) = self.fixed_size
+            && (expected_size.width != normalized_size.width
+                || expected_size.height != normalized_size.height)
+        {
+            return Err(());
+        }
+
+        if guard.is_none() {
+            *guard = Some(self.build_cached_execution(normalized_size)?);
+        }
+
+        guard.as_mut().ok_or(())
     }
 
-    pub fn detect_gpu_buffer_with_timing(
+    fn normalize_input_size(&self, size: Size) -> Option<Size> {
+        let decimate = self.settings.decimate.unwrap_or(1) as u32;
+        let multiple = 4 * decimate;
+        let width = size.width - (size.width % multiple);
+        let height = size.height - (size.height % multiple);
+        (width > 0 && height > 0).then_some(Size::new(width, height))
+    }
+
+    fn run_cached_execution(
         &self,
+        cached: &mut CachedDetectorExecution,
         input: DescriptorBuffer,
-        size: Size,
     ) -> Result<(Vec<DetectedTag>, GpuTimingReport), ()> {
+        self.device.copy_descriptor_buffer_to_buffer(
+            input,
+            &cached._buffers.input_placeholder,
+            cached._buffers.input_placeholder.byte_size(),
+        );
+        cached.command_buffer.submit_and_wait();
+
+        let timing_report = cached.timings.summary(&self.device);
+        let counters = cached.readback_counters.read(Self::CONTROL_COUNTER_WORD_COUNT);
+        let fitted_quad_count_value = counters[Self::CONTROL_FITTED_QUAD_COUNT_WORD as usize]
+            .min(cached.max_quad_capacity_u32);
+        if fitted_quad_count_value == 0 {
+            return Ok((Vec::new(), timing_report));
+        }
+
+        let fitted_quad_words = cached
+            .readback_fitted_quads
+            .read(fitted_quad_count_value as usize * cached.fitted_quad_words_per_quad);
+        let bits_words = cached
+            .readback_bits
+            .read(fitted_quad_count_value as usize * Self::MARKER_SIZE_WITH_BORDERS.pow(2));
+        let tags =
+            self.build_detected_tags(&fitted_quad_words, fitted_quad_count_value, &bits_words);
+        Ok((tags, timing_report))
+    }
+
+    fn build_cached_execution(&self, size: Size) -> Result<CachedDetectorExecution, ()> {
         self.validate_settings()?;
-        self.detect_gpu_buffer_with_timing_single_submit(input, size)
-    }
 
-    pub fn detect_vk_buffer(
-        &self,
-        buffer: vk::Buffer,
-        offset: vk::DeviceSize,
-        range: vk::DeviceSize,
-        size: Size,
-    ) -> Result<Vec<DetectedTag>, ()> {
-        self.detect_gpu_buffer(DescriptorBuffer::new(buffer, offset, range), size)
-    }
-
-    pub fn detect_vk_buffer_with_timing(
-        &self,
-        buffer: vk::Buffer,
-        offset: vk::DeviceSize,
-        range: vk::DeviceSize,
-        size: Size,
-    ) -> Result<(Vec<DetectedTag>, GpuTimingReport), ()> {
-        self.detect_gpu_buffer_with_timing(DescriptorBuffer::new(buffer, offset, range), size)
-    }
-
-    fn detect_gpu_buffer_with_timing_single_submit(
-        &self,
-        input: DescriptorBuffer,
-        size: Size,
-    ) -> Result<(Vec<DetectedTag>, GpuTimingReport), ()> {
-        let input_gpu_image = GpuImageView::borrowed(input, size);
+        let input_placeholder = self.new_u8_storage_buffer(size.total_pixels().max(1));
+        let input_gpu_image = GpuImageView::owned(input_placeholder.clone(), size);
         let decimate_factor = self.settings.decimate.unwrap_or(1) as u32;
 
         let decimated_image = match self.settings.decimate {
@@ -942,10 +1093,10 @@ impl Detector {
                 * (thresholded_image.size.width + thresholded_image.size.height),
         );
 
-        let mut pipeline_timings = PipelineTimings::new(&self.device, 1024);
-        self.device.run_commands(|commands| {
-            pipeline_timings.reset(commands);
-
+        let mut timings = PipelineTimings::new(&self.device, 1024);
+        let mut command_buffer = self.device.create_cached_command_buffer();
+        command_buffer.record(|commands| {
+            timings.reset(commands);
             commands.fill_buffer_u32_range(&control, 0, control.byte_size(), 0);
             commands.fill_buffer_u32_range(&blob_extent, 0, blob_extent.byte_size(), 0);
             commands.fill_buffer_u32_range(
@@ -966,7 +1117,7 @@ impl Detector {
                     Self::TWO_D_LOCAL_SIZE_Y,
                 );
                 self.dispatch_with_push_constants_recorded_timed(
-                    &mut pipeline_timings,
+                    &mut timings,
                     "threshold-decimate",
                     commands,
                     &self.pipelines.decimate,
@@ -983,6 +1134,8 @@ impl Detector {
                 commands.barrier_shader_write_to_shader_read();
             }
 
+            // The rest of the graph is fixed-size and can stay pre-recorded.
+            // Keep using the existing helpers for the bulk of dispatches.
             let minmax_dispatch = dispatch_groups_2d(
                 minmax_size.width,
                 minmax_size.height,
@@ -990,7 +1143,7 @@ impl Detector {
                 Self::TWO_D_LOCAL_SIZE_Y,
             );
             self.dispatch_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "threshold-minmax",
                 commands,
                 &self.pipelines.minmax,
@@ -1007,7 +1160,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "threshold-filter-minmax",
                 commands,
                 &self.pipelines.filter_minmax,
@@ -1030,7 +1183,7 @@ impl Detector {
                 Self::TWO_D_LOCAL_SIZE_Y,
             );
             self.dispatch_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "threshold-threshold",
                 commands,
                 &self.pipelines.threshold,
@@ -1056,7 +1209,7 @@ impl Detector {
                 Self::TWO_D_LOCAL_SIZE_Y,
             );
             self.dispatch_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "ccl-init",
                 commands,
                 &self.pipelines.ccl_init,
@@ -1069,7 +1222,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "ccl-compression[first]",
                 commands,
                 &self.pipelines.ccl_compression,
@@ -1082,7 +1235,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "ccl-merge",
                 commands,
                 &self.pipelines.ccl_merge,
@@ -1095,7 +1248,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "ccl-compression[second]",
                 commands,
                 &self.pipelines.ccl_compression,
@@ -1108,7 +1261,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "ccl-final-labeling",
                 commands,
                 &self.pipelines.ccl_final_labeling,
@@ -1125,7 +1278,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "blob-blob-diff",
                 commands,
                 &self.pipelines.blob_diff,
@@ -1144,7 +1297,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "select-filter-nonzero-blob-diff-points",
                 commands,
                 &self.pipelines.filter_nonzero_blob_diff_points,
@@ -1165,7 +1318,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "detect-build-indirect-dispatch-args[initial]",
                 commands,
                 &self.pipelines.build_indirect_dispatch_args,
@@ -1180,7 +1333,7 @@ impl Detector {
             commands.barrier_shader_write_to_indirect_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "radix-sort-blob-diff-points::sort-key-init",
                 commands,
                 &self.pipelines.radix_init_keys_indices,
@@ -1200,7 +1353,7 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            let secondary_blob_query = pipeline_timings
+            let secondary_blob_query = timings
                 .reserve_radix_sort_queries("radix-sort-blob-diff-points::secondary-key-sort");
             self.sorter.record_sort_key_value_indirect_with_query_pool(
                 commands,
@@ -1213,12 +1366,12 @@ impl Detector {
                 0,
                 &blob_sort_storage,
                 0,
-                Some((&pipeline_timings.query_pool, secondary_blob_query)),
+                Some((&timings.query_pool, secondary_blob_query)),
             );
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "radix-sort-blob-diff-points::sort-key-update",
                 commands,
                 &self.pipelines.radix_keys_from_indices,
@@ -1238,7 +1391,7 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            let primary_blob_query = pipeline_timings
+            let primary_blob_query = timings
                 .reserve_radix_sort_queries("radix-sort-blob-diff-points::primary-key-sort");
             self.sorter.record_sort_key_value_indirect_with_query_pool(
                 commands,
@@ -1251,12 +1404,12 @@ impl Detector {
                 0,
                 &blob_sort_storage,
                 0,
-                Some((&pipeline_timings.query_pool, primary_blob_query)),
+                Some((&timings.query_pool, primary_blob_query)),
             );
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "radix-sort-blob-diff-points::gather",
                 commands,
                 &self.pipelines.radix_gather_by_indices,
@@ -1275,7 +1428,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "filter-build-blob-pair-extents",
                 commands,
                 &self.pipelines.build_blob_pair_extents,
@@ -1303,7 +1456,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "detect-build-indirect-dispatch-args[post-extents]",
                 commands,
                 &self.pipelines.build_indirect_dispatch_args,
@@ -1318,7 +1471,7 @@ impl Detector {
             commands.barrier_shader_write_to_indirect_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "filter-rewrite-selected-blob-points-with-theta",
                 commands,
                 &self.pipelines.rewrite_selected_blob_points_with_theta,
@@ -1342,7 +1495,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "radix-sort-selected-blob-points::sort-key-init",
                 commands,
                 &self.pipelines.radix_init_keys_indices,
@@ -1362,7 +1515,7 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            let secondary_selected_query = pipeline_timings
+            let secondary_selected_query = timings
                 .reserve_radix_sort_queries("radix-sort-selected-blob-points::secondary-key-sort");
             self.sorter.record_sort_key_value_indirect_with_query_pool(
                 commands,
@@ -1375,12 +1528,12 @@ impl Detector {
                 0,
                 &selected_sort_storage,
                 0,
-                Some((&pipeline_timings.query_pool, secondary_selected_query)),
+                Some((&timings.query_pool, secondary_selected_query)),
             );
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "radix-sort-selected-blob-points::sort-key-update",
                 commands,
                 &self.pipelines.radix_keys_from_indices,
@@ -1400,7 +1553,7 @@ impl Detector {
             );
             commands.barrier_shader_write_to_shader_read();
 
-            let primary_selected_query = pipeline_timings
+            let primary_selected_query = timings
                 .reserve_radix_sort_queries("radix-sort-selected-blob-points::primary-key-sort");
             self.sorter.record_sort_key_value_indirect_with_query_pool(
                 commands,
@@ -1413,12 +1566,12 @@ impl Detector {
                 0,
                 &selected_sort_storage,
                 0,
-                Some((&pipeline_timings.query_pool, primary_selected_query)),
+                Some((&timings.query_pool, primary_selected_query)),
             );
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "radix-sort-selected-blob-points::gather",
                 commands,
                 &self.pipelines.radix_gather_by_indices,
@@ -1437,7 +1590,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "filter-rebuild-filtered-extent-starts",
                 commands,
                 &self.pipelines.rebuild_filtered_extent_starts,
@@ -1458,7 +1611,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "filter-build-line-fit-points",
                 commands,
                 &self.pipelines.build_line_fit_points,
@@ -1481,7 +1634,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "filter-fit-line-errors-and-peaks",
                 commands,
                 &self.pipelines.fit_line_errors_and_peaks,
@@ -1504,7 +1657,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "filter-fit-line-errors-and-peaks[filter]",
                 commands,
                 &self.pipelines.fit_line_errors_and_peaks,
@@ -1527,7 +1680,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "filter-fit-line-errors-and-peaks[peaks]",
                 commands,
                 &self.pipelines.fit_line_errors_and_peaks,
@@ -1550,7 +1703,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "radix-sort-peaks::sort-key-init",
                 commands,
                 &self.pipelines.radix_init_keys_indices,
@@ -1571,7 +1724,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             let secondary_peak_query =
-                pipeline_timings.reserve_radix_sort_queries("radix-sort-peaks::secondary-key-sort");
+                timings.reserve_radix_sort_queries("radix-sort-peaks::secondary-key-sort");
             self.sorter.record_sort_key_value_indirect_with_query_pool(
                 commands,
                 selected_blob_point_capacity_u32,
@@ -1583,12 +1736,12 @@ impl Detector {
                 0,
                 &peak_sort_storage,
                 0,
-                Some((&pipeline_timings.query_pool, secondary_peak_query)),
+                Some((&timings.query_pool, secondary_peak_query)),
             );
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "radix-sort-peaks::sort-key-update",
                 commands,
                 &self.pipelines.radix_keys_from_indices,
@@ -1609,7 +1762,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             let primary_peak_query =
-                pipeline_timings.reserve_radix_sort_queries("radix-sort-peaks::primary-key-sort");
+                timings.reserve_radix_sort_queries("radix-sort-peaks::primary-key-sort");
             self.sorter.record_sort_key_value_indirect_with_query_pool(
                 commands,
                 selected_blob_point_capacity_u32,
@@ -1621,12 +1774,12 @@ impl Detector {
                 0,
                 &peak_sort_storage,
                 0,
-                Some((&pipeline_timings.query_pool, primary_peak_query)),
+                Some((&timings.query_pool, primary_peak_query)),
             );
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "radix-sort-peaks::gather",
                 commands,
                 &self.pipelines.radix_gather_by_indices,
@@ -1645,7 +1798,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "filter-build-peak-extents",
                 commands,
                 &self.pipelines.build_peak_extents,
@@ -1664,7 +1817,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "detect-build-indirect-dispatch-args[post-peak-extents]",
                 commands,
                 &self.pipelines.build_indirect_dispatch_args,
@@ -1679,7 +1832,7 @@ impl Detector {
             commands.barrier_shader_write_to_indirect_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "filter-fit-quads",
                 commands,
                 &self.pipelines.fit_quads,
@@ -1707,7 +1860,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "detect-build-indirect-dispatch-args[post-fit-quads]",
                 commands,
                 &self.pipelines.build_indirect_dispatch_args,
@@ -1722,7 +1875,7 @@ impl Detector {
             commands.barrier_shader_write_to_indirect_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "decode-prepare-decode-quads",
                 commands,
                 &self.pipelines.prepare_decode_quads,
@@ -1745,7 +1898,7 @@ impl Detector {
             commands.barrier_shader_write_to_shader_read();
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut pipeline_timings,
+                &mut timings,
                 "decode-extract-candidate-bits",
                 commands,
                 &self.pipelines.extract_candidate_bits,
@@ -1785,20 +1938,117 @@ impl Detector {
             commands.copy_buffer_region(&bits, 0, &readback_bits, 0, bits.byte_size());
         });
 
-        let timing_report = pipeline_timings.summary(&self.device);
-        let counters = readback_counters.read(Self::CONTROL_COUNTER_WORD_COUNT);
-        let fitted_quad_count_value =
-            counters[Self::CONTROL_FITTED_QUAD_COUNT_WORD as usize].min(max_quad_capacity_u32);
-        if fitted_quad_count_value == 0 {
-            return Ok((Vec::new(), timing_report));
-        }
+        let buffers = CachedDetectorBuffers {
+            input_placeholder,
+            decimated_image: decimated_image._keepalive.clone(),
+            thresholded_image: thresholded_image._keepalive.clone(),
+            minmax_image: minmax_image.clone(),
+            filtered_minmax_image: filtered_minmax_image.clone(),
+            labels: labels.clone(),
+            final_labels: final_labels.clone(),
+            union_markers_size: union_markers_size.clone(),
+            blob_diff_out: blob_diff_out.clone(),
+            blob_diff_compacted: blob_diff_compacted.clone(),
+            blob_diff_sorted: blob_diff_sorted.clone(),
+            blob_extent: blob_extent.clone(),
+            filtered_blob_extent: filtered_blob_extent.clone(),
+            point_extent_indices: point_extent_indices.clone(),
+            selected_blob_points: selected_blob_points.clone(),
+            selected_blob_sorted_points: selected_blob_sorted_points.clone(),
+            line_fit_points: line_fit_points.clone(),
+            errs: errs.clone(),
+            filtered_errs: filtered_errs.clone(),
+            peaks: peaks.clone(),
+            sorted_peaks: sorted_peaks.clone(),
+            peak_extents: peak_extents.clone(),
+            fitted_quads: fitted_quads.clone(),
+            quad_params: quad_params.clone(),
+            bits: bits.clone(),
+            control: control.clone(),
+            blob_sort_keys: blob_sort_keys.clone(),
+            blob_sorted_indices: blob_sorted_indices.clone(),
+            blob_sort_storage: blob_sort_storage.clone(),
+            selected_sort_keys: selected_sort_keys.clone(),
+            selected_sorted_indices: selected_sorted_indices.clone(),
+            selected_sort_storage: selected_sort_storage.clone(),
+            peak_sort_keys: peak_sort_keys.clone(),
+            peak_sorted_indices: peak_sorted_indices.clone(),
+            peak_sort_storage: peak_sort_storage.clone(),
+        };
 
-        let fitted_quad_words = readback_fitted_quads
-            .read(fitted_quad_count_value as usize * fitted_quad_words_per_quad);
-        let bits_words = readback_bits.read(fitted_quad_count_value as usize * 8usize * 8usize);
-        let tags =
-            self.build_detected_tags(&fitted_quad_words, fitted_quad_count_value, &bits_words);
-        Ok((tags, timing_report))
+        Ok(CachedDetectorExecution {
+            max_quad_capacity_u32,
+            fitted_quad_words_per_quad,
+            readback_counters,
+            readback_fitted_quads,
+            readback_bits,
+            _buffers: buffers,
+            timings,
+            command_buffer,
+        })
+    }
+
+    pub fn detect(&self, image: DynamicImage) -> Result<Vec<DetectedTag>, ()> {
+        let gray_image = image.to_luma8();
+        self.detect_gray(gray_image)
+    }
+
+    pub fn detect_gray(
+        &self,
+        image: ImageBuffer<image::Luma<u8>, Vec<u8>>,
+    ) -> Result<Vec<DetectedTag>, ()> {
+        self.detect_gray_with_timing(image).map(|(tags, _)| tags)
+    }
+
+    pub fn detect_gpu_buffer(
+        &self,
+        input: DescriptorBuffer,
+        size: Size,
+    ) -> Result<Vec<DetectedTag>, ()> {
+        self.detect_gpu_buffer_with_timing(input, size)
+            .map(|(tags, _)| tags)
+    }
+
+    pub fn detect_gpu_buffer_with_timing(
+        &self,
+        input: DescriptorBuffer,
+        size: Size,
+    ) -> Result<(Vec<DetectedTag>, GpuTimingReport), ()> {
+        self.validate_settings()?;
+        self.detect_gpu_buffer_with_timing_single_submit(input, size)
+    }
+
+    pub fn detect_vk_buffer(
+        &self,
+        buffer: vk::Buffer,
+        offset: vk::DeviceSize,
+        range: vk::DeviceSize,
+        size: Size,
+    ) -> Result<Vec<DetectedTag>, ()> {
+        self.detect_gpu_buffer(DescriptorBuffer::new(buffer, offset, range), size)
+    }
+
+    pub fn detect_vk_buffer_with_timing(
+        &self,
+        buffer: vk::Buffer,
+        offset: vk::DeviceSize,
+        range: vk::DeviceSize,
+        size: Size,
+    ) -> Result<(Vec<DetectedTag>, GpuTimingReport), ()> {
+        self.detect_gpu_buffer_with_timing(DescriptorBuffer::new(buffer, offset, range), size)
+    }
+
+    fn detect_gpu_buffer_with_timing_single_submit(
+        &self,
+        input: DescriptorBuffer,
+        size: Size,
+    ) -> Result<(Vec<DetectedTag>, GpuTimingReport), ()> {
+        let mut guard = self
+            .cached_execution
+            .lock()
+            .expect("failed to lock cached detector execution");
+        let cached = self.ensure_cached_execution(size, &mut guard)?;
+        self.run_cached_execution(cached, input)
     }
 
     pub fn detect_gray_with_timing(
@@ -2361,71 +2611,113 @@ impl Detector {
         let sort_keys = self.new_u32_storage_buffer(valid_records as usize);
         let sorted_indices = self.new_u32_storage_buffer(valid_records as usize);
 
-        self.radix_init_keys_and_indices(
-            input,
-            &sort_keys,
-            &sorted_indices,
-            valid_records,
-            words_per_record,
-            secondary_key_word,
-            secondary_key_transform,
-            timings,
-            &format!("{timing_prefix}::sort-key-init"),
-        );
-
         let sort_storage = self.sorter.create_key_value_storage_buffer(valid_records);
         let secondary_sort_query =
             timings.reserve_radix_sort_queries(&format!("{timing_prefix}::secondary-key-sort"));
-        self.sorter.cmd_sort_key_value_with_query_pool(
-            valid_records,
-            &sort_keys,
-            0,
-            &sorted_indices,
-            0,
-            &sort_storage,
-            0,
-            Some((&timings.query_pool, secondary_sort_query)),
-        );
-
-        self.radix_update_keys_from_indices(
-            input,
-            &sorted_indices,
-            &sort_keys,
-            valid_records,
-            words_per_record,
-            primary_key_word,
-            Self::RADIX_KEY_TRANSFORM_NONE,
-            timings,
-            &format!("{timing_prefix}::sort-key-update"),
-        );
         let primary_sort_query =
             timings.reserve_radix_sort_queries(&format!("{timing_prefix}::primary-key-sort"));
-        self.sorter.cmd_sort_key_value_with_query_pool(
-            valid_records,
-            &sort_keys,
-            0,
-            &sorted_indices,
-            0,
-            &sort_storage,
-            0,
-            Some((&timings.query_pool, primary_sort_query)),
-        );
 
-        self.radix_gather_records_by_indices(
-            input,
-            &sorted_indices,
-            &sorted_records,
-            valid_records,
-            words_per_record,
-            timings,
-            &format!("{timing_prefix}::gather"),
-        );
+        self.device.run_commands(|commands| {
+            self.radix_init_keys_and_indices_recorded(
+                commands,
+                input,
+                &sort_keys,
+                &sorted_indices,
+                valid_records,
+                words_per_record,
+                secondary_key_word,
+                secondary_key_transform,
+                timings,
+                &format!("{timing_prefix}::sort-key-init"),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.sorter.record_sort_key_value_with_query_pool(
+                commands,
+                valid_records,
+                &sort_keys,
+                0,
+                &sorted_indices,
+                0,
+                &sort_storage,
+                0,
+                Some((&timings.query_pool, secondary_sort_query)),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.radix_update_keys_from_indices_recorded(
+                commands,
+                input,
+                &sorted_indices,
+                &sort_keys,
+                valid_records,
+                words_per_record,
+                primary_key_word,
+                Self::RADIX_KEY_TRANSFORM_NONE,
+                timings,
+                &format!("{timing_prefix}::sort-key-update"),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.sorter.record_sort_key_value_with_query_pool(
+                commands,
+                valid_records,
+                &sort_keys,
+                0,
+                &sorted_indices,
+                0,
+                &sort_storage,
+                0,
+                Some((&timings.query_pool, primary_sort_query)),
+            );
+            commands.barrier_shader_write_to_shader_read();
+
+            self.radix_gather_records_by_indices_recorded(
+                commands,
+                input,
+                &sorted_indices,
+                &sorted_records,
+                valid_records,
+                words_per_record,
+                timings,
+                &format!("{timing_prefix}::gather"),
+            );
+        });
 
         sorted_records
     }
 
     fn radix_init_keys_and_indices(
         &self,
+        input_records: &GpuBuffer<u32>,
+        keys_out: &GpuBuffer<u32>,
+        indices_out: &GpuBuffer<u32>,
+        valid_points: u32,
+        words_per_record: u32,
+        key_word_index: u32,
+        key_transform: u32,
+        timings: &mut PipelineTimings,
+        timing_name: &str,
+    ) {
+        self.device.run_commands(|commands| {
+            self.radix_init_keys_and_indices_recorded(
+                commands,
+                input_records,
+                keys_out,
+                indices_out,
+                valid_points,
+                words_per_record,
+                key_word_index,
+                key_transform,
+                timings,
+                timing_name,
+            );
+        });
+    }
+
+    fn radix_init_keys_and_indices_recorded(
+        &self,
+        commands: &mut CommandRecorder<'_>,
         input_records: &GpuBuffer<u32>,
         keys_out: &GpuBuffer<u32>,
         indices_out: &GpuBuffer<u32>,
@@ -2445,9 +2737,10 @@ impl Detector {
                 WriteDescriptorSet::buffer(2, indices_out.clone()),
             ],
         );
-        self.dispatch_with_push_constants_timed(
+        self.dispatch_with_push_constants_recorded_from_descriptor_set_timed(
             timings,
             timing_name,
+            commands,
             compute_pipeline,
             descriptor_set,
             RadixExtractPushConstants {
@@ -2476,6 +2769,35 @@ impl Detector {
         timings: &mut PipelineTimings,
         timing_name: &str,
     ) {
+        self.device.run_commands(|commands| {
+            self.radix_update_keys_from_indices_recorded(
+                commands,
+                input_records,
+                sorted_indices,
+                keys_out,
+                valid_points,
+                words_per_record,
+                key_word_index,
+                key_transform,
+                timings,
+                timing_name,
+            );
+        });
+    }
+
+    fn radix_update_keys_from_indices_recorded(
+        &self,
+        commands: &mut CommandRecorder<'_>,
+        input_records: &GpuBuffer<u32>,
+        sorted_indices: &GpuBuffer<u32>,
+        keys_out: &GpuBuffer<u32>,
+        valid_points: u32,
+        words_per_record: u32,
+        key_word_index: u32,
+        key_transform: u32,
+        timings: &mut PipelineTimings,
+        timing_name: &str,
+    ) {
         let compute_pipeline = self.pipelines.radix_keys_from_indices.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
@@ -2485,9 +2807,10 @@ impl Detector {
                 WriteDescriptorSet::buffer(2, keys_out.clone()),
             ],
         );
-        self.dispatch_with_push_constants_timed(
+        self.dispatch_with_push_constants_recorded_from_descriptor_set_timed(
             timings,
             timing_name,
+            commands,
             compute_pipeline,
             descriptor_set,
             RadixExtractPushConstants {
@@ -2514,6 +2837,31 @@ impl Detector {
         timings: &mut PipelineTimings,
         timing_name: &str,
     ) {
+        self.device.run_commands(|commands| {
+            self.radix_gather_records_by_indices_recorded(
+                commands,
+                input_records,
+                sorted_indices,
+                output_records,
+                valid_points,
+                words_per_record,
+                timings,
+                timing_name,
+            );
+        });
+    }
+
+    fn radix_gather_records_by_indices_recorded(
+        &self,
+        commands: &mut CommandRecorder<'_>,
+        input_records: &GpuBuffer<u32>,
+        sorted_indices: &GpuBuffer<u32>,
+        output_records: &GpuBuffer<u32>,
+        valid_points: u32,
+        words_per_record: u32,
+        timings: &mut PipelineTimings,
+        timing_name: &str,
+    ) {
         let compute_pipeline = self.pipelines.radix_gather_by_indices.clone();
         let descriptor_set = self.create_descriptor_set(
             &compute_pipeline,
@@ -2523,9 +2871,10 @@ impl Detector {
                 WriteDescriptorSet::buffer(2, output_records.clone()),
             ],
         );
-        self.dispatch_with_push_constants_timed(
+        self.dispatch_with_push_constants_recorded_from_descriptor_set_timed(
             timings,
             timing_name,
+            commands,
             compute_pipeline,
             descriptor_set,
             RadixGatherPushConstants {
@@ -2537,6 +2886,31 @@ impl Detector {
                 1,
                 1,
             ],
+        );
+    }
+
+    fn dispatch_with_push_constants_recorded_from_descriptor_set_timed<T: Pod + Copy>(
+        &self,
+        timings: &mut PipelineTimings,
+        name: &str,
+        commands: &mut CommandRecorder<'_>,
+        compute_pipeline: Arc<ComputePipeline>,
+        descriptor_set: Arc<DescriptorSet>,
+        push_constants: T,
+        dispatch: [u32; 3],
+    ) {
+        let bindings: Vec<(u32, DescriptorBuffer)> = descriptor_set
+            .writes
+            .iter()
+            .map(|write| (write.binding, write.buffer))
+            .collect();
+        timings.dispatch_with_push_constants(
+            commands,
+            name,
+            compute_pipeline.as_ref(),
+            &bindings,
+            &push_constants,
+            dispatch,
         );
     }
 }
