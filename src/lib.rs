@@ -38,7 +38,6 @@ macro_rules! include_u32 {
 
 use bytemuck::{Pod, Zeroable};
 use gpu::{BufferMemory, GpuBuffer};
-use image::{ImageBuffer, Primitive};
 use std::fmt::Debug;
 
 pub use gpu::{ComputeDevice, ComputePipeline, DescriptorBuffer, GpuQueryPool};
@@ -67,7 +66,7 @@ pub struct GPUImage<T: Pod + Copy> {
     device: ComputeDevice,
 }
 
-impl<T: Pod + Copy + Primitive + Debug> GPUImage<T> {
+impl<T: Pod + Copy + Debug> GPUImage<T> {
     pub fn new(device: ComputeDevice, image: GpuBuffer<T>, size: Size) -> Self {
         Self {
             image,
@@ -76,16 +75,17 @@ impl<T: Pod + Copy + Primitive + Debug> GPUImage<T> {
         }
     }
 
-    pub fn from_image_buffer(
-        device: ComputeDevice,
-        image: ImageBuffer<image::Luma<T>, Vec<T>>,
-    ) -> Self {
-        let size = Size::new(image.width(), image.height());
-        let flat_data = image.into_raw();
+    pub fn from_vec(device: ComputeDevice, size: Size, data: Vec<T>) -> Self {
         let pixel_count = size.total_pixels();
+        assert_eq!(
+            data.len(),
+            pixel_count,
+            "input data length ({}) must match image size ({})",
+            data.len(),
+            pixel_count
+        );
 
-        let transfer =
-            device.upload_buffer(&flat_data, ash::vk::BufferUsageFlags::TRANSFER_SRC, false);
+        let transfer = device.upload_buffer(&data, ash::vk::BufferUsageFlags::TRANSFER_SRC, false);
         let gpu_image = device.create_buffer::<T>(
             pixel_count,
             ash::vk::BufferUsageFlags::STORAGE_BUFFER
@@ -106,14 +106,18 @@ impl<T: Pod + Copy + Primitive + Debug> GPUImage<T> {
         }
     }
 
-    pub fn from_image_buffer_fast(
-        device: ComputeDevice,
-        image: ImageBuffer<image::Luma<T>, Vec<T>>,
-    ) -> Self {
-        let size = Size::new(image.width(), image.height());
-        let flat_data = image.into_raw();
+    pub fn from_vec_fast(device: ComputeDevice, size: Size, data: Vec<T>) -> Self {
+        let pixel_count = size.total_pixels();
+        assert_eq!(
+            data.len(),
+            pixel_count,
+            "input data length ({}) must match image size ({})",
+            data.len(),
+            pixel_count
+        );
+
         let gpu_image = device.upload_buffer(
-            &flat_data,
+            &data,
             ash::vk::BufferUsageFlags::STORAGE_BUFFER | ash::vk::BufferUsageFlags::TRANSFER_SRC,
             true,
         );
@@ -138,11 +142,5 @@ impl<T: Pod + Copy + Primitive + Debug> GPUImage<T> {
             (pixel_count * std::mem::size_of::<T>()) as ash::vk::DeviceSize,
         );
         destination.read(pixel_count)
-    }
-
-    pub fn to_image_buffer(&self) -> ImageBuffer<image::Luma<T>, Vec<T>> {
-        let data = self.data();
-        ImageBuffer::from_raw(self.size.width, self.size.height, data)
-            .expect("failed to create image buffer from GPU image data")
     }
 }

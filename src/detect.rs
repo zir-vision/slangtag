@@ -6,7 +6,6 @@ use crate::sort::RadixSorter;
 use crate::{ComputeDevice, Size, compute_shader_path, include_u32};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use image::{DynamicImage, GrayImage};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -813,9 +812,9 @@ impl GpuImageView {
     }
 }
 
-fn crop_image_to_multiple(image: GrayImage, multiple: u32) -> Result<GrayImage, ()> {
-    let width = image.width();
-    let height = image.height();
+fn crop_gray_to_multiple(image: &[u8], size: Size, multiple: u32) -> Result<(Vec<u8>, Size), ()> {
+    let width = size.width;
+    let height = size.height;
     let cropped_width = width - (width % multiple);
     let cropped_height = height - (height % multiple);
 
@@ -824,10 +823,19 @@ fn crop_image_to_multiple(image: GrayImage, multiple: u32) -> Result<GrayImage, 
     }
 
     if cropped_width == width && cropped_height == height {
-        return Ok(image);
+        return Ok((image.to_vec(), size));
     }
 
-    Ok(image::imageops::crop_imm(&image, 0, 0, cropped_width, cropped_height).to_image())
+    let cropped_width_usize = cropped_width as usize;
+    let width_usize = width as usize;
+    let cropped_height_usize = cropped_height as usize;
+    let mut cropped = Vec::with_capacity(cropped_width_usize * cropped_height_usize);
+    for y in 0..cropped_height_usize {
+        let row_start = y * width_usize;
+        let row_end = row_start + cropped_width_usize;
+        cropped.extend_from_slice(&image[row_start..row_end]);
+    }
+    Ok((cropped, Size::new(cropped_width, cropped_height)))
 }
 
 impl Detector {
@@ -2001,17 +2009,10 @@ impl Detector {
         })
     }
 
-    /// Runs detection on a dynamic image by converting it to grayscale first.
+    /// Runs detection on an 8-bit grayscale image buffer.
     ///
-    /// Returns the same errors as [`Detector::detect_gray`].
-    pub fn detect_image(&self, image: DynamicImage) -> Result<DetectionOutput, DetectError> {
-        let gray_image = image.to_luma8();
-        self.detect_gray(gray_image)
-    }
-
-    /// Runs detection on a grayscale image.
-    ///
-    /// The image is aligned to `4 * decimate` pixels internally. If alignment would
+    /// `image` must contain exactly `size.width * size.height` pixels in row-major order.
+    /// The input is aligned to `4 * decimate` pixels internally. If alignment would
     /// produce a zero-sized image, returns [`DetectError::InvalidInputSize`].
     ///
     /// Returns:
@@ -2019,15 +2020,18 @@ impl Detector {
     /// - [`DetectError::InvalidInputSize`] if aligned input is empty.
     /// - [`DetectError::FixedSizeMismatch`] for fixed-size detectors with mismatched input.
     /// - [`DetectError::CacheLockPoisoned`] if cache lock is poisoned.
-    pub fn detect_gray(&self, image: GrayImage) -> Result<DetectionOutput, DetectError> {
+    pub fn detect_gray(&self, image: &[u8], size: Size) -> Result<DetectionOutput, DetectError> {
         self.validate_settings()?;
+        if image.len() != size.total_pixels() {
+            return Err(DetectError::InvalidInputSize);
+        }
 
         let decimate_factor = self.settings.decimate.unwrap_or(1) as u32;
-        let aligned_input = crop_image_to_multiple(image, 4 * decimate_factor)
+        let (aligned_input, aligned_size) = crop_gray_to_multiple(image, size, 4 * decimate_factor)
             .map_err(|_| DetectError::InvalidInputSize)?;
         let input_gpu_image =
-            crate::GPUImage::from_image_buffer(self.device.clone(), aligned_input);
-        self.detect_descriptor(input_gpu_image.image.descriptor(), input_gpu_image.size)
+            crate::GPUImage::from_vec(self.device.clone(), aligned_size, aligned_input);
+        self.detect_descriptor(input_gpu_image.image.descriptor(), aligned_size)
     }
 
     /// Runs detection on a GPU descriptor buffer containing a grayscale image.
@@ -2387,7 +2391,6 @@ impl Detector {
 mod tests {
     use super::{AprilTagSettings, DetectError, DetectedTag, DetectionSettings, Detector};
     use crate::{ComputeDevice, Size};
-    use std::path::PathBuf;
 
     #[test]
     fn identifies_apriltag_36h11_code_and_rotation() {
@@ -2426,12 +2429,6 @@ mod tests {
         .ok()
     }
 
-    fn fixture_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("input")
-            .join("test.jpg")
-    }
-
     fn tags_signature(tags: &[DetectedTag]) -> Vec<(Option<u32>, bool, Vec<u8>, [i32; 8])> {
         let mut signature = Vec::with_capacity(tags.len());
         for tag in tags {
@@ -2453,18 +2450,14 @@ mod tests {
     }
 
     #[test]
-    fn detection_is_deterministic_for_fixture_image() {
+    fn detection_is_deterministic_for_synthetic_image() {
         let Some(detector) = maybe_detector() else {
             return;
         };
-
-        let image_path = fixture_path();
-        if !image_path.exists() {
-            return;
-        }
-
-        let image = image::open(image_path).expect("failed to open fixture image");
-        let gray = image.to_luma8();
+        let size = Size::new(64, 64);
+        let gray_pixels = (0..size.total_pixels())
+            .map(|index| ((index * 37) % 251) as u8)
+            .collect::<Vec<_>>();
 
         let detector = Detector::new(
             detector.device.clone(),
@@ -2472,19 +2465,19 @@ mod tests {
                 decimate: Some(2),
                 ..DetectionSettings::default()
             },
-            Size::new(gray.width(), gray.height()),
+            size,
         )
         .expect("failed to build sized detector");
 
         let baseline = detector
-            .detect_gray(gray.clone())
+            .detect_gray(&gray_pixels, size)
             .expect("detection failed for baseline run");
         let baseline_signature = tags_signature(&baseline.tags);
         assert!(baseline.timing.total_ms >= 0.0);
 
         for _ in 0..4 {
             let output = detector
-                .detect_gray(gray.clone())
+                .detect_gray(&gray_pixels, size)
                 .expect("detection failed on repeated run");
             let signature = tags_signature(&output.tags);
             assert_eq!(signature, baseline_signature);
@@ -2518,9 +2511,9 @@ mod tests {
         let Some(detector) = maybe_detector() else {
             return;
         };
-        let image = image::GrayImage::from_pixel(1, 1, image::Luma([0]));
+        let image = vec![0u8];
         let err = detector
-            .detect_gray(image)
+            .detect_gray(&image, Size::new(1, 1))
             .expect_err("tiny image should fail alignment");
         assert_eq!(err, DetectError::InvalidInputSize);
     }
@@ -2557,11 +2550,10 @@ mod tests {
         let Some(detector) = maybe_detector() else {
             return;
         };
-        let image =
-            image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(16, 16, image::Luma([0])));
+        let image = vec![0u8; 16 * 16];
         let output = detector
-            .detect_image(image)
-            .expect("canonical detect_image API should succeed");
+            .detect_gray(&image, Size::new(16, 16))
+            .expect("canonical detect_gray API should succeed");
         let _timing_total = output.timing.total_ms;
     }
 }
