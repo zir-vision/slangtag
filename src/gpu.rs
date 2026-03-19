@@ -141,6 +141,25 @@ pub struct DescriptorBuffer {
     range: vk::DeviceSize,
 }
 
+impl DescriptorBuffer {
+    pub fn new(buffer: vk::Buffer, offset: vk::DeviceSize, range: vk::DeviceSize) -> Self {
+        assert!(
+            buffer != vk::Buffer::null(),
+            "descriptor buffer must not be null"
+        );
+        assert!(range > 0, "descriptor range must be greater than zero");
+        Self {
+            buffer,
+            offset,
+            range,
+        }
+    }
+
+    pub fn from_vk_buffer(buffer: vk::Buffer, range: vk::DeviceSize) -> Self {
+        Self::new(buffer, 0, range)
+    }
+}
+
 impl<T: Pod + Copy> From<&GpuBuffer<T>> for DescriptorBuffer {
     fn from(value: &GpuBuffer<T>) -> Self {
         Self {
