@@ -1,5 +1,6 @@
+use ash::vk;
 use slangtag::{
-    ComputeDevice,
+    ComputeDevice, Size,
     detect::{DetectionSettings, Detector},
 };
 use std::time::Instant;
@@ -16,6 +17,23 @@ fn colorize_ms(ms: f64, total_ms: f64) -> String {
     format!("\x1b[38;5;{color}m{:>9.3} ms\x1b[0m", ms)
 }
 
+fn crop_image_to_multiple(image: image::GrayImage, multiple: u32) -> Result<image::GrayImage, ()> {
+    let width = image.width();
+    let height = image.height();
+    let cropped_width = width - (width % multiple);
+    let cropped_height = height - (height % multiple);
+
+    if cropped_width == 0 || cropped_height == 0 {
+        return Err(());
+    }
+
+    if cropped_width == width && cropped_height == height {
+        return Ok(image);
+    }
+
+    Ok(image::imageops::crop_imm(&image, 0, 0, cropped_width, cropped_height).to_image())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let image_path = args
@@ -30,16 +48,23 @@ fn main() {
     let image = image::open(image_path).expect("Failed to open image");
     let gray_image = image.to_luma8();
 
+    let settings = DetectionSettings {
+        decimate: Some(2),
+        ..Default::default()
+    };
+    let decimate_factor = settings.decimate.unwrap_or(1) as u32;
+    let aligned_input = crop_image_to_multiple(gray_image, 4 * decimate_factor)
+        .expect("image is too small after decimate alignment");
+    let input_size = Size::new(aligned_input.width(), aligned_input.height());
+
     let dev = ComputeDevice::new_default();
-    let image_size = slangtag::Size::new(gray_image.width(), gray_image.height());
-    let det = Detector::new_with_size(
-        dev,
-        DetectionSettings {
-            decimate: Some(2),
-            ..Default::default()
-        },
-        image_size,
+    let input_gpu_buffer = dev.upload_buffer(
+        aligned_input.as_raw(),
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+        true,
     );
+
+    let det = Detector::new_with_size(dev, settings, input_size);
 
     let mut total_wall_ms = 0.0f64;
     let mut total_gpu_ms = 0.0f64;
@@ -51,7 +76,7 @@ fn main() {
     for _ in 0..runs {
         let start = Instant::now();
         let (tags, timing_report) = det
-            .detect_gray_with_timing(gray_image.clone())
+            .detect_gpu_buffer_with_timing(input_gpu_buffer.descriptor(), input_size)
             .expect("Detection failed");
         total_wall_ms += start.elapsed().as_secs_f64() * 1_000.0;
         total_gpu_ms += timing_report.total_ms;

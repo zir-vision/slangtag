@@ -1,3 +1,4 @@
+use ash::vk;
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use image::GrayImage;
 use slangtag::{
@@ -6,6 +7,8 @@ use slangtag::{
         AprilTagSettings, BlobPairFilterSettings, DecodeSettings, DetectedTag, DetectionSettings,
         Detector, QuadFitSettings,
     },
+    gpu::GpuBuffer,
+    Size,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -153,7 +156,14 @@ struct LoadedImage {
     width: u32,
     height: u32,
     gray: GrayImage,
+    uploaded_input: Option<UploadedInput>,
     texture: egui::TextureHandle,
+}
+
+struct UploadedInput {
+    buffer: GpuBuffer<u8>,
+    size: Size,
+    decimate: Option<u8>,
 }
 
 struct ViewerApp {
@@ -187,9 +197,14 @@ impl ViewerApp {
     fn rebuild_detector(&mut self) {
         let detection_settings = self.settings.to_detection_settings();
         if let Some(image) = self.loaded_image.as_ref() {
-            let size = slangtag::Size::new(image.width, image.height);
-            self.detector =
-                Detector::new_with_size(self.device.clone(), detection_settings, size);
+            if let Some(size) =
+                normalized_size_for_decimate(image.width, image.height, detection_settings.decimate)
+            {
+                self.detector =
+                    Detector::new_with_size(self.device.clone(), detection_settings, size);
+            } else {
+                self.detector = Detector::new(self.device.clone(), detection_settings);
+            }
         } else {
             self.detector = Detector::new(self.device.clone(), detection_settings);
         }
@@ -211,6 +226,7 @@ impl ViewerApp {
                     width,
                     height,
                     gray: image.to_luma8(),
+                    uploaded_input: None,
                     texture,
                 });
                 self.rebuild_detector();
@@ -225,12 +241,35 @@ impl ViewerApp {
     }
 
     fn run_detection(&mut self) {
-        let Some(image) = self.loaded_image.as_ref() else {
+        let Some(_) = self.loaded_image.as_ref() else {
             self.status = "Load an image first.".to_owned();
             return;
         };
+        if self.ensure_uploaded_input().is_err() {
+            self.last_runtime = None;
+            self.status =
+                "Detection failed. One or more parameter values are invalid.".to_owned();
+            self.detections.clear();
+            return;
+        }
+        let Some(image) = self.loaded_image.as_ref() else {
+            self.last_runtime = None;
+            self.status = "Load an image first.".to_owned();
+            self.detections.clear();
+            return;
+        };
+        let Some(uploaded_input) = image.uploaded_input.as_ref() else {
+            self.last_runtime = None;
+            self.status = "Failed to prepare GPU input image.".to_owned();
+            self.detections.clear();
+            return;
+        };
+
         let start = std::time::Instant::now();
-        match self.detector.detect_gray(image.gray.clone()) {
+        match self
+            .detector
+            .detect_gpu_buffer(uploaded_input.buffer.descriptor(), uploaded_input.size)
+        {
             Ok(tags) => {
                 self.last_runtime = Some(start.elapsed());
                 self.status = format!("Detected {} tags", tags.len());
@@ -243,6 +282,35 @@ impl ViewerApp {
                 self.detections.clear();
             }
         }
+    }
+
+    fn ensure_uploaded_input(&mut self) -> Result<(), ()> {
+        let decimate = self.settings.decimate.factor();
+        let Some(image) = self.loaded_image.as_mut() else {
+            return Err(());
+        };
+
+        if image
+            .uploaded_input
+            .as_ref()
+            .is_some_and(|uploaded| uploaded.decimate == decimate)
+        {
+            return Ok(());
+        }
+
+        let aligned_gray = crop_image_to_multiple(image.gray.clone(), 4 * decimate.unwrap_or(1) as u32)?;
+        let uploaded_size = Size::new(aligned_gray.width(), aligned_gray.height());
+        let uploaded_buffer = self.device.upload_buffer(
+            aligned_gray.as_raw(),
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+            true,
+        );
+        image.uploaded_input = Some(UploadedInput {
+            buffer: uploaded_buffer,
+            size: uploaded_size,
+            decimate,
+        });
+        Ok(())
     }
 
     fn show_settings(&mut self, ui: &mut egui::Ui) -> bool {
@@ -432,6 +500,32 @@ impl ViewerApp {
             );
         }
     }
+}
+
+fn normalized_size_for_decimate(width: u32, height: u32, decimate: Option<u8>) -> Option<Size> {
+    let factor = decimate.unwrap_or(1) as u32;
+    let multiple = 4 * factor;
+    let normalized_width = width - (width % multiple);
+    let normalized_height = height - (height % multiple);
+    (normalized_width > 0 && normalized_height > 0)
+        .then_some(Size::new(normalized_width, normalized_height))
+}
+
+fn crop_image_to_multiple(image: GrayImage, multiple: u32) -> Result<GrayImage, ()> {
+    let width = image.width();
+    let height = image.height();
+    let cropped_width = width - (width % multiple);
+    let cropped_height = height - (height % multiple);
+
+    if cropped_width == 0 || cropped_height == 0 {
+        return Err(());
+    }
+
+    if cropped_width == width && cropped_height == height {
+        return Ok(image);
+    }
+
+    Ok(image::imageops::crop_imm(&image, 0, 0, cropped_width, cropped_height).to_image())
 }
 
 impl eframe::App for ViewerApp {
