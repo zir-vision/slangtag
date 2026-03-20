@@ -5,9 +5,9 @@ use slangtag::{ComputeDevice, Size};
 use std::ffi::CStr;
 use std::os::raw::c_ulong;
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use turbojpeg_sys::{
     TJFLAG_FASTDCT, TJFLAG_FASTUPSAMPLE, TJPF_TJPF_GRAY, tjDecompress2, tjDecompressHeader3,
@@ -23,6 +23,7 @@ pub use slangtag::detect::{DetectedTag, DetectionSettings};
 
 const CAMERA_BUFFER_COUNT: u32 = 4;
 const PIPELINE_SLOTS: usize = 3;
+static MONOTONIC_BASE: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 #[derive(Debug, Clone)]
 pub struct CameraConfig {
@@ -30,6 +31,8 @@ pub struct CameraConfig {
     pub width: u32,
     pub height: u32,
     pub fps: Option<u32>,
+    pub timing_debug: bool,
+    pub timing_every_n_frames: u64,
 }
 
 impl CameraConfig {
@@ -39,6 +42,8 @@ impl CameraConfig {
             width,
             height,
             fps: None,
+            timing_debug: false,
+            timing_every_n_frames: 30,
         }
     }
 }
@@ -155,6 +160,8 @@ pub struct CameraTagStream {
     shared: Arc<SharedQueue>,
     worker: Option<JoinHandle<()>>,
     terminated: bool,
+    timing_debug: bool,
+    timing_every_n_frames: u64,
 }
 
 impl CameraTagStream {
@@ -207,6 +214,8 @@ impl CameraTagStream {
             shared,
             worker: Some(worker),
             terminated: false,
+            timing_debug: config.timing_debug,
+            timing_every_n_frames: config.timing_every_n_frames.max(1),
         })
     }
 }
@@ -250,11 +259,37 @@ impl Iterator for CameraTagStream {
         };
 
         let slot = &self.slots[ready.slot];
+        let detect_start = Instant::now();
+        let queue_latency_ms =
+            (monotonic_now_ns().saturating_sub(ready.timestamp_ns)) as f64 / 1_000_000.0;
         let detect_result = self
             .detector
             .detect_descriptor(slot.buffer.descriptor(), slot.size)
-            .map(|output| output.tags)
             .map_err(map_detect_error);
+
+        let detect_cpu_ms = detect_start.elapsed().as_secs_f64() * 1000.0;
+        if self.timing_debug && ready.frame_id % self.timing_every_n_frames == 0 {
+            match &detect_result {
+                Ok(output) => {
+                    eprintln!(
+                        "[slangtag-cam][timing][detect] frame={} queue_latency_ms={:.3} detect_cpu_ms={:.3} detect_gpu_ms={:.3} tags={}",
+                        ready.frame_id,
+                        queue_latency_ms,
+                        detect_cpu_ms,
+                        output.timing.total_ms,
+                        output.tags.len()
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[slangtag-cam][timing][detect] frame={} queue_latency_ms={:.3} detect_cpu_ms={:.3} error={}",
+                        ready.frame_id, queue_latency_ms, detect_cpu_ms, err
+                    );
+                }
+            }
+        }
+
+        let detect_result = detect_result.map(|output| output.tags);
 
         if let Ok(mut guard) = self.shared.state.lock() {
             guard.free_slots.push(ready.slot);
@@ -359,12 +394,14 @@ fn run_capture_decode_worker(
 
     let mut decoder = TurboJpegDecoder::new()?;
     let mut frame_id: u64 = 0;
+    let timing_every = config.timing_every_n_frames.max(1);
 
     loop {
         if should_shutdown(&shared)? {
             break;
         }
 
+        let capture_wait_start = Instant::now();
         let dqbuf = match capture_queue.try_dequeue() {
             Ok(buf) => buf,
             Err(IoctlConvertError::IoctlError(DqBufIoctlError::NotReady)) => {
@@ -378,6 +415,7 @@ fn run_capture_decode_worker(
                 return Err(CamError::V4l2Runtime(err.to_string()));
             }
         };
+        let capture_wait_ms = capture_wait_start.elapsed().as_secs_f64() * 1000.0;
 
         let bytes_used = *dqbuf.data.get_first_plane().bytesused as usize;
         if bytes_used == 0 {
@@ -392,11 +430,14 @@ fn run_capture_decode_worker(
         let bytes_used = bytes_used.min(mapping.len());
         let jpeg_bytes = &mapping.as_ref()[..bytes_used];
 
+        let slot_wait_start = Instant::now();
         let slot_index = acquire_decode_slot(&shared)?;
+        let slot_wait_ms = slot_wait_start.elapsed().as_secs_f64() * 1000.0;
         let slot = &slots[slot_index];
         let slot_width = slot.size.width;
         let slot_height = slot.size.height;
 
+        let decode_start = Instant::now();
         let decode_res = slot.buffer.with_mapped_bytes_mut(|dst, dst_len| {
             let expected = slot.size.total_pixels();
             if dst_len < expected {
@@ -413,6 +454,7 @@ fn run_capture_decode_worker(
                 slot_width as i32,
             )
         });
+        let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
         drop(mapping);
         drop(dqbuf);
@@ -426,9 +468,15 @@ fn run_capture_decode_worker(
                     ReadyFrame {
                         slot: slot_index,
                         frame_id,
-                        timestamp_ns: now_monotonicish_ns(),
+                        timestamp_ns: monotonic_now_ns(),
                     },
                 )?;
+                if config.timing_debug && frame_id % timing_every == 0 {
+                    eprintln!(
+                        "[slangtag-cam][timing][capture] frame={} capture_wait_ms={:.3} slot_wait_ms={:.3} decode_ms={:.3} jpeg_bytes={}",
+                        frame_id, capture_wait_ms, slot_wait_ms, decode_ms, bytes_used
+                    );
+                }
             }
             Err(err) => {
                 release_slot(&shared, slot_index)?;
@@ -503,11 +551,8 @@ fn publish_ready_frame(shared: &Arc<SharedQueue>, ready: ReadyFrame) -> Result<(
     Ok(())
 }
 
-fn now_monotonicish_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+fn monotonic_now_ns() -> u64 {
+    MONOTONIC_BASE.elapsed().as_nanos() as u64
 }
 
 struct TurboJpegDecoder {

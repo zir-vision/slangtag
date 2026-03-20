@@ -21,11 +21,13 @@ fn main() {
     let max_frames = args.get(4).and_then(|s| s.parse::<u64>().ok());
 
     let device = ComputeDevice::new_default();
-    let config = CameraConfig::new(device_path, width, height);
+    let mut config = CameraConfig::new(device_path, width, height);
+    config.timing_debug = true;
+    config.timing_every_n_frames = 30;
     let settings = DetectionSettings::default();
 
-    let mut stream = CameraTagStream::new(device, config, settings)
-        .expect("failed to start camera tag stream");
+    let mut stream =
+        CameraTagStream::new(device, config, settings).expect("failed to start camera tag stream");
 
     let mut frame_index = 0u64;
     for item in &mut stream {
