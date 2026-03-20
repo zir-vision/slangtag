@@ -1431,6 +1431,35 @@ impl<T: Pod + Copy> GpuBuffer<T> {
         }
     }
 
+    pub fn with_mapped_bytes_mut<E, F, R>(&self, f: F) -> Result<R, E>
+    where
+        F: FnOnce(*mut u8, usize) -> Result<R, E>,
+    {
+        let byte_len = self.raw.bytes;
+        let mut allocation = self
+            .raw
+            .allocation
+            .lock()
+            .expect("failed to lock allocation for mapped write");
+        let mapped_ptr = unsafe {
+            self.raw
+                .device
+                .allocator
+                .map_memory(&mut allocation)
+                .expect("failed to map allocation for mapped write")
+        };
+        let result = f(mapped_ptr, byte_len as usize);
+        unsafe {
+            self.raw
+                .device
+                .allocator
+                .flush_allocation(&allocation, 0, byte_len)
+                .expect("failed to flush allocation after mapped write");
+            self.raw.device.allocator.unmap_memory(&mut allocation);
+        }
+        result
+    }
+
     pub fn read(&self, len: usize) -> Vec<T> {
         let read_len = len.min(self.len);
         if read_len == 0 {
