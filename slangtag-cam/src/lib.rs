@@ -3,6 +3,7 @@ use slangtag::detect::{DetectError, Detector};
 use slangtag::gpu::{BufferMemory, GpuBuffer};
 use slangtag::{ComputeDevice, Size};
 use std::ffi::CStr;
+use std::os::fd::AsRawFd;
 use std::os::raw::c_ulong;
 use std::path::Path;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
@@ -13,6 +14,8 @@ use turbojpeg_sys::{
     TJFLAG_FASTDCT, TJFLAG_FASTUPSAMPLE, TJPF_TJPF_GRAY, tjDecompress2, tjDecompressHeader3,
     tjDestroy, tjGetErrorStr2, tjInitDecompress, tjhandle,
 };
+use v4l2r::QueueType;
+use v4l2r::bindings::{v4l2_fract, v4l2_streamparm, v4l2_streamparm__bindgen_ty_1};
 use v4l2r::device::queue::direction::Capture;
 use v4l2r::device::queue::{GetFreeCaptureBuffer, Queue};
 use v4l2r::device::{AllocatedQueue, Device, DeviceConfig, Stream, TryDequeue};
@@ -52,6 +55,8 @@ impl CameraConfig {
 pub enum CamError {
     #[error("camera width/height must be non-zero")]
     InvalidCameraSize,
+    #[error("camera fps must be non-zero when provided")]
+    InvalidCameraFps,
     #[error("camera format not accepted: expected MJPG/JPEG, got {0}")]
     UnsupportedPixelFormat(String),
     #[error(
@@ -172,6 +177,10 @@ impl CameraTagStream {
     ) -> Result<Self, CamError> {
         if config.width == 0 || config.height == 0 {
             return Err(CamError::InvalidCameraSize);
+        }
+
+        if config.fps == Some(0) {
+            return Err(CamError::InvalidCameraFps);
         }
 
         let detector_size =
@@ -376,6 +385,22 @@ fn run_capture_decode_worker(
         });
     }
 
+    if let Some(fps) = config.fps {
+        let queue_type = capture_queue.get_type();
+        let (applied_num, applied_den) = set_capture_fps(&*device, queue_type, fps)?;
+        if config.timing_debug {
+            let applied_fps = if applied_num == 0 {
+                0.0
+            } else {
+                applied_den as f64 / applied_num as f64
+            };
+            eprintln!(
+                "[slangtag-cam][timing][capture] requested_fps={} applied_timeperframe={}/{} applied_fps={:.3}",
+                fps, applied_num, applied_den, applied_fps
+            );
+        }
+    }
+
     let capture_queue = capture_queue
         .request_buffers::<Vec<MmapHandle>>(CAMERA_BUFFER_COUNT)
         .map_err(|err| CamError::V4l2Setup(err.to_string()))?;
@@ -490,6 +515,32 @@ fn run_capture_decode_worker(
         shared.cv.notify_all();
     }
     Ok(())
+}
+
+fn set_capture_fps(
+    fd: &impl AsRawFd,
+    queue_type: QueueType,
+    fps: u32,
+) -> Result<(u32, u32), CamError> {
+    if fps == 0 {
+        return Err(CamError::InvalidCameraFps);
+    }
+
+    let mut stream_parm: v4l2_streamparm = v4l2r::ioctl::g_parm(fd, queue_type)
+        .map_err(|err| CamError::V4l2Setup(format!("VIDIOC_G_PARM failed: {err}")))?;
+
+    let mut capture = unsafe { stream_parm.parm.capture };
+    capture.timeperframe = v4l2_fract {
+        numerator: 1,
+        denominator: fps,
+    };
+    stream_parm.parm = v4l2_streamparm__bindgen_ty_1 { capture };
+
+    let applied: v4l2_streamparm = v4l2r::ioctl::s_parm(fd, stream_parm)
+        .map_err(|err| CamError::V4l2Setup(format!("VIDIOC_S_PARM failed: {err}")))?;
+
+    let applied = unsafe { applied.parm.capture.timeperframe };
+    Ok((applied.numerator, applied.denominator))
 }
 
 fn requeue_capture_buffer(

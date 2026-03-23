@@ -5,7 +5,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
         eprintln!(
-            "usage: {} <device_path> <width> <height> [max_frames]",
+            "usage: {} <device_path> <width> <height> [fps] [max_frames]",
             args.first().map_or("print_tags", String::as_str)
         );
         std::process::exit(2);
@@ -18,13 +18,17 @@ fn main() {
     let height = args[3]
         .parse::<u32>()
         .expect("height must be a positive integer");
-    let max_frames = args.get(4).and_then(|s| s.parse::<u64>().ok());
+    let fps = args.get(4).and_then(|s| s.parse::<u32>().ok());
+    let max_frames = args.get(5).and_then(|s| s.parse::<u64>().ok());
 
     let device = ComputeDevice::new_default();
     let mut config = CameraConfig::new(device_path, width, height);
+    config.fps = fps;
     config.timing_debug = true;
     config.timing_every_n_frames = 30;
-    let settings = DetectionSettings::default();
+    let settings = DetectionSettings {
+        ..Default::default()
+    };
 
     let mut stream =
         CameraTagStream::new(device, config, settings).expect("failed to start camera tag stream");
