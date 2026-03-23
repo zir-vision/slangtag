@@ -1,7 +1,7 @@
 use ash::vk;
 use slangtag::detect::{DetectError, Detector};
 use slangtag::gpu::{BufferMemory, GpuBuffer};
-use slangtag::{ComputeDevice, Size};
+use slangtag::{ComputeCommandContext, ComputeDevice, Size};
 use std::ffi::CStr;
 use std::os::fd::AsRawFd;
 use std::os::raw::c_ulong;
@@ -34,6 +34,7 @@ pub struct CameraConfig {
     pub width: u32,
     pub height: u32,
     pub fps: Option<u32>,
+    pub use_device_local_input: bool,
     pub timing_debug: bool,
     pub timing_every_n_frames: u64,
 }
@@ -45,6 +46,7 @@ impl CameraConfig {
             width,
             height,
             fps: None,
+            use_device_local_input: false,
             timing_debug: false,
             timing_every_n_frames: 30,
         }
@@ -143,24 +145,94 @@ impl SharedQueue {
 
 #[derive(Clone)]
 struct FrameSlot {
-    buffer: GpuBuffer<u8>,
+    decode_buffer: GpuBuffer<u8>,
+    detect_buffer: Option<GpuBuffer<u8>>,
     size: Size,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameSlotBufferMode {
+    HostVisibleOnly,
+    HostStagingAndDeviceLocal,
+}
+
+impl FrameSlotBufferMode {
+    fn from_use_device_local_input(use_device_local_input: bool) -> Self {
+        if use_device_local_input {
+            Self::HostStagingAndDeviceLocal
+        } else {
+            Self::HostVisibleOnly
+        }
+    }
+
+    fn uses_device_local_detect_input(self) -> bool {
+        matches!(self, Self::HostStagingAndDeviceLocal)
+    }
+}
+
 impl FrameSlot {
-    fn new(device: &ComputeDevice, size: Size) -> Self {
+    fn new(device: &ComputeDevice, size: Size, mode: FrameSlotBufferMode) -> Self {
         let len = size.total_pixels();
-        let buffer = device.create_buffer(
-            len,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
-            BufferMemory::HostSequentialWrite,
-        );
-        Self { buffer, size }
+        if mode.uses_device_local_detect_input() {
+            let decode_buffer = device.create_buffer(
+                len,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                BufferMemory::HostSequentialWrite,
+            );
+            let detect_buffer = device.create_buffer(
+                len,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                BufferMemory::DeviceLocal,
+            );
+            Self {
+                decode_buffer,
+                detect_buffer: Some(detect_buffer),
+                size,
+            }
+        } else {
+            let decode_buffer = device.create_buffer(
+                len,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                BufferMemory::HostSequentialWrite,
+            );
+            Self {
+                decode_buffer,
+                detect_buffer: None,
+                size,
+            }
+        }
+    }
+
+    fn decode_target_buffer(&self) -> &GpuBuffer<u8> {
+        &self.decode_buffer
+    }
+
+    fn detect_descriptor(&self) -> slangtag::gpu::DescriptorBuffer {
+        self.detect_buffer
+            .as_ref()
+            .unwrap_or(&self.decode_buffer)
+            .descriptor()
+    }
+
+    fn copy_decode_to_detect_if_needed(
+        &self,
+        device: &ComputeDevice,
+        command_context: &mut ComputeCommandContext,
+    ) {
+        if let Some(detect_buffer) = &self.detect_buffer {
+            device.copy_buffer(
+                command_context,
+                &self.decode_buffer,
+                detect_buffer,
+                self.decode_buffer.byte_size(),
+            );
+        }
     }
 }
 
 pub struct CameraTagStream {
     detector: Detector,
+    command_context: ComputeCommandContext,
     slots: Arc<Vec<FrameSlot>>,
     shared: Arc<SharedQueue>,
     worker: Option<JoinHandle<()>>,
@@ -188,14 +260,18 @@ impl CameraTagStream {
                 .ok_or(CamError::InvalidAlignedSize)?;
         let detector = Detector::new(device.clone(), detection, detector_size)
             .map_err(|err| CamError::DetectorInit(err.to_string()))?;
+        let command_context = device.create_command_context();
 
+        let slot_mode =
+            FrameSlotBufferMode::from_use_device_local_input(config.use_device_local_input);
         let mut slots = Vec::with_capacity(PIPELINE_SLOTS);
         for _ in 0..PIPELINE_SLOTS {
-            slots.push(FrameSlot::new(&device, detector_size));
+            slots.push(FrameSlot::new(&device, detector_size, slot_mode));
         }
         let slots = Arc::new(slots);
         let shared = Arc::new(SharedQueue::new());
 
+        let worker_device = device.clone();
         let worker_shared = Arc::clone(&shared);
         let worker_slots = Arc::clone(&slots);
         let worker_config = config.clone();
@@ -203,6 +279,7 @@ impl CameraTagStream {
             .name("slangtag-cam-capture".to_string())
             .spawn(move || {
                 if let Err(err) = run_capture_decode_worker(
+                    worker_device,
                     worker_config,
                     worker_slots,
                     Arc::clone(&worker_shared),
@@ -219,6 +296,7 @@ impl CameraTagStream {
 
         Ok(Self {
             detector,
+            command_context,
             slots,
             shared,
             worker: Some(worker),
@@ -273,7 +351,11 @@ impl Iterator for CameraTagStream {
             (monotonic_now_ns().saturating_sub(ready.timestamp_ns)) as f64 / 1_000_000.0;
         let detect_result = self
             .detector
-            .detect_descriptor(slot.buffer.descriptor(), slot.size)
+            .detect_descriptor(
+                &mut self.command_context,
+                slot.detect_descriptor(),
+                slot.size,
+            )
             .map_err(map_detect_error);
 
         let detect_cpu_ms = detect_start.elapsed().as_secs_f64() * 1000.0;
@@ -341,22 +423,24 @@ fn map_detect_error(err: DetectError) -> CamError {
 }
 
 fn run_capture_decode_worker(
+    device: ComputeDevice,
     config: CameraConfig,
     slots: Arc<Vec<FrameSlot>>,
     shared: Arc<SharedQueue>,
 ) -> Result<(), CamError> {
-    let device = Device::open(
+    let mut command_context = device.create_command_context();
+    let v4l_device = Device::open(
         Path::new(&config.device_path),
         DeviceConfig::new().non_blocking_dqbuf(),
     )
     .map_err(|err| CamError::V4l2Setup(err.to_string()))?;
-    let device = Arc::new(device);
+    let v4l_device = Arc::new(v4l_device);
 
     let mut capture_queue =
-        if let Ok(q) = Queue::<Capture, _>::get_capture_queue(Arc::clone(&device)) {
+        if let Ok(q) = Queue::<Capture, _>::get_capture_queue(Arc::clone(&v4l_device)) {
             q
         } else {
-            Queue::<Capture, _>::get_capture_mplane_queue(Arc::clone(&device))
+            Queue::<Capture, _>::get_capture_mplane_queue(Arc::clone(&v4l_device))
                 .map_err(|err| CamError::V4l2Setup(err.to_string()))?
         };
 
@@ -387,7 +471,7 @@ fn run_capture_decode_worker(
 
     if let Some(fps) = config.fps {
         let queue_type = capture_queue.get_type();
-        let (applied_num, applied_den) = set_capture_fps(&*device, queue_type, fps)?;
+        let (applied_num, applied_den) = set_capture_fps(&*v4l_device, queue_type, fps)?;
         if config.timing_debug {
             let applied_fps = if applied_num == 0 {
                 0.0
@@ -463,22 +547,24 @@ fn run_capture_decode_worker(
         let slot_height = slot.size.height;
 
         let decode_start = Instant::now();
-        let decode_res = slot.buffer.with_mapped_bytes_mut(|dst, dst_len| {
-            let expected = slot.size.total_pixels();
-            if dst_len < expected {
-                return Err(CamError::JpegDecode(format!(
-                    "destination buffer too small: {} < {}",
-                    dst_len, expected
-                )));
-            }
-            decoder.decode_gray_into(
-                jpeg_bytes,
-                slot_width as i32,
-                slot_height as i32,
-                dst,
-                slot_width as i32,
-            )
-        });
+        let decode_res = slot
+            .decode_target_buffer()
+            .with_mapped_bytes_mut(|dst, dst_len| {
+                let expected = slot.size.total_pixels();
+                if dst_len < expected {
+                    return Err(CamError::JpegDecode(format!(
+                        "destination buffer too small: {} < {}",
+                        dst_len, expected
+                    )));
+                }
+                decoder.decode_gray_into(
+                    jpeg_bytes,
+                    slot_width as i32,
+                    slot_height as i32,
+                    dst,
+                    slot_width as i32,
+                )
+            });
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
         drop(mapping);
@@ -487,6 +573,9 @@ fn run_capture_decode_worker(
 
         match decode_res {
             Ok(()) => {
+                let copy_start = Instant::now();
+                slot.copy_decode_to_detect_if_needed(&device, &mut command_context);
+                let copy_ms = copy_start.elapsed().as_secs_f64() * 1000.0;
                 frame_id = frame_id.wrapping_add(1);
                 publish_ready_frame(
                     &shared,
@@ -498,8 +587,8 @@ fn run_capture_decode_worker(
                 )?;
                 if config.timing_debug && frame_id % timing_every == 0 {
                     eprintln!(
-                        "[slangtag-cam][timing][capture] frame={} capture_wait_ms={:.3} slot_wait_ms={:.3} decode_ms={:.3} jpeg_bytes={}",
-                        frame_id, capture_wait_ms, slot_wait_ms, decode_ms, bytes_used
+                        "[slangtag-cam][timing][capture] frame={} capture_wait_ms={:.3} slot_wait_ms={:.3} decode_ms={:.3} copy_ms={:.3} jpeg_bytes={}",
+                        frame_id, capture_wait_ms, slot_wait_ms, decode_ms, copy_ms, bytes_used
                     );
                 }
             }
@@ -740,5 +829,25 @@ mod tests {
         let guard = shared.state.lock().expect("state lock");
         assert_eq!(guard.latest_ready.map(|r| r.slot), Some(1));
         assert!(guard.free_slots.contains(&0));
+    }
+
+    #[test]
+    fn camera_config_defaults_device_local_input_to_false() {
+        let config = CameraConfig::new("/dev/video0", 640, 480);
+        assert!(!config.use_device_local_input);
+    }
+
+    #[test]
+    fn frame_slot_buffer_mode_tracks_config_toggle() {
+        assert_eq!(
+            FrameSlotBufferMode::from_use_device_local_input(false),
+            FrameSlotBufferMode::HostVisibleOnly
+        );
+        assert_eq!(
+            FrameSlotBufferMode::from_use_device_local_input(true),
+            FrameSlotBufferMode::HostStagingAndDeviceLocal
+        );
+        assert!(!FrameSlotBufferMode::HostVisibleOnly.uses_device_local_detect_input());
+        assert!(FrameSlotBufferMode::HostStagingAndDeviceLocal.uses_device_local_detect_input());
     }
 }

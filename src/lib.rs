@@ -40,7 +40,9 @@ use bytemuck::{Pod, Zeroable};
 use gpu::{BufferMemory, GpuBuffer};
 use std::fmt::Debug;
 
-pub use gpu::{ComputeDevice, ComputePipeline, DescriptorBuffer, GpuQueryPool};
+pub use gpu::{
+    ComputeCommandContext, ComputeDevice, ComputePipeline, DescriptorBuffer, GpuQueryPool,
+};
 
 #[repr(C)]
 #[derive(Pod, Zeroable, Clone, Copy)]
@@ -75,7 +77,12 @@ impl<T: Pod + Copy + Debug> GPUImage<T> {
         }
     }
 
-    pub fn from_vec(device: ComputeDevice, size: Size, data: Vec<T>) -> Self {
+    pub fn from_vec(
+        device: ComputeDevice,
+        command_context: &mut ComputeCommandContext,
+        size: Size,
+        data: Vec<T>,
+    ) -> Self {
         let pixel_count = size.total_pixels();
         assert_eq!(
             data.len(),
@@ -85,7 +92,12 @@ impl<T: Pod + Copy + Debug> GPUImage<T> {
             pixel_count
         );
 
-        let transfer = device.upload_buffer(&data, ash::vk::BufferUsageFlags::TRANSFER_SRC, false);
+        let transfer = device.upload_buffer(
+            command_context,
+            &data,
+            ash::vk::BufferUsageFlags::TRANSFER_SRC,
+            false,
+        );
         let gpu_image = device.create_buffer::<T>(
             pixel_count,
             ash::vk::BufferUsageFlags::STORAGE_BUFFER
@@ -94,6 +106,7 @@ impl<T: Pod + Copy + Debug> GPUImage<T> {
             BufferMemory::DeviceLocal,
         );
         device.copy_buffer(
+            command_context,
             &transfer,
             &gpu_image,
             (pixel_count * std::mem::size_of::<T>()) as ash::vk::DeviceSize,
@@ -106,7 +119,12 @@ impl<T: Pod + Copy + Debug> GPUImage<T> {
         }
     }
 
-    pub fn from_vec_fast(device: ComputeDevice, size: Size, data: Vec<T>) -> Self {
+    pub fn from_vec_fast(
+        device: ComputeDevice,
+        command_context: &mut ComputeCommandContext,
+        size: Size,
+        data: Vec<T>,
+    ) -> Self {
         let pixel_count = size.total_pixels();
         assert_eq!(
             data.len(),
@@ -117,6 +135,7 @@ impl<T: Pod + Copy + Debug> GPUImage<T> {
         );
 
         let gpu_image = device.upload_buffer(
+            command_context,
             &data,
             ash::vk::BufferUsageFlags::STORAGE_BUFFER | ash::vk::BufferUsageFlags::TRANSFER_SRC,
             true,
@@ -129,7 +148,7 @@ impl<T: Pod + Copy + Debug> GPUImage<T> {
         }
     }
 
-    pub fn data(&self) -> Vec<T> {
+    pub fn data(&self, command_context: &mut ComputeCommandContext) -> Vec<T> {
         let pixel_count = self.size.total_pixels();
         let destination = self.device.create_buffer::<T>(
             pixel_count,
@@ -137,6 +156,7 @@ impl<T: Pod + Copy + Debug> GPUImage<T> {
             BufferMemory::HostRandomAccess,
         );
         self.device.copy_buffer(
+            command_context,
             &self.image,
             &destination,
             (pixel_count * std::mem::size_of::<T>()) as ash::vk::DeviceSize,

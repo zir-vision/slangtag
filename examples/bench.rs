@@ -1,6 +1,6 @@
 use ash::vk;
 use slangtag::{
-    ComputeDevice, Size,
+    ComputeCommandContext, ComputeDevice, Size,
     detect::{DetectionSettings, Detector},
 };
 use std::time::Instant;
@@ -58,7 +58,9 @@ fn main() {
     let input_size = Size::new(aligned_input.width(), aligned_input.height());
 
     let dev = ComputeDevice::new_default();
+    let mut command_context: ComputeCommandContext = dev.create_command_context();
     let input_gpu_buffer = dev.upload_buffer(
+        &mut command_context,
         aligned_input.as_raw(),
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
         true,
@@ -77,7 +79,11 @@ fn main() {
     for _ in 0..runs {
         let start = Instant::now();
         let output = det
-            .detect_descriptor(input_gpu_buffer.descriptor(), input_size)
+            .detect_descriptor(
+                &mut command_context,
+                input_gpu_buffer.descriptor(),
+                input_size,
+            )
             .expect("Detection failed");
         let timing_report = output.timing;
         total_wall_ms += start.elapsed().as_secs_f64() * 1_000.0;

@@ -2,7 +2,7 @@ use ash::vk;
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use image::GrayImage;
 use slangtag::{
-    ComputeDevice, Size,
+    ComputeCommandContext, ComputeDevice, Size,
     detect::{
         AprilTagSettings, BlobPairFilterSettings, DecodeSettings, DetectedTag, DetectionSettings,
         Detector, QuadFitSettings,
@@ -167,6 +167,7 @@ struct UploadedInput {
 
 struct ViewerApp {
     device: ComputeDevice,
+    command_context: ComputeCommandContext,
     settings: ViewerSettings,
     detector: Option<Detector>,
     loaded_image: Option<LoadedImage>,
@@ -179,9 +180,11 @@ struct ViewerApp {
 impl ViewerApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let device = ComputeDevice::new_default();
+        let command_context = device.create_command_context();
         let settings = ViewerSettings::default();
         Self {
             device,
+            command_context,
             settings,
             detector: None,
             loaded_image: None,
@@ -267,7 +270,11 @@ impl ViewerApp {
             self.detections.clear();
             return;
         };
-        match detector.detect_descriptor(uploaded_input.buffer.descriptor(), uploaded_input.size) {
+        match detector.detect_descriptor(
+            &mut self.command_context,
+            uploaded_input.buffer.descriptor(),
+            uploaded_input.size,
+        ) {
             Ok(output) => {
                 self.last_runtime = Some(start.elapsed());
                 self.status = format!("Detected {} tags", output.tags.len());
@@ -300,6 +307,7 @@ impl ViewerApp {
             crop_image_to_multiple(image.gray.clone(), 4 * decimate.unwrap_or(1) as u32)?;
         let uploaded_size = Size::new(aligned_gray.width(), aligned_gray.height());
         let uploaded_buffer = self.device.upload_buffer(
+            &mut self.command_context,
             aligned_gray.as_raw(),
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
             true,

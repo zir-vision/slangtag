@@ -3,7 +3,7 @@ use crate::gpu::{
     GpuBuffer,
 };
 use crate::sort::RadixSorter;
-use crate::{ComputeDevice, Size, compute_shader_path, include_u32};
+use crate::{ComputeCommandContext, ComputeDevice, Size, compute_shader_path, include_u32};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
@@ -929,10 +929,12 @@ impl Detector {
 
     fn run_cached_execution(
         &self,
+        command_context: &mut ComputeCommandContext,
         cached: &mut CachedDetectorExecution,
         input: DescriptorBuffer,
     ) -> DetectionOutput {
         self.device.copy_descriptor_buffer_to_buffer(
+            command_context,
             input,
             &cached._buffers.input_placeholder,
             cached._buffers.input_placeholder.byte_size(),
@@ -2020,7 +2022,12 @@ impl Detector {
     /// - [`DetectError::InvalidInputSize`] if aligned input is empty.
     /// - [`DetectError::FixedSizeMismatch`] for fixed-size detectors with mismatched input.
     /// - [`DetectError::CacheLockPoisoned`] if cache lock is poisoned.
-    pub fn detect_gray(&self, image: &[u8], size: Size) -> Result<DetectionOutput, DetectError> {
+    pub fn detect_gray(
+        &self,
+        command_context: &mut ComputeCommandContext,
+        image: &[u8],
+        size: Size,
+    ) -> Result<DetectionOutput, DetectError> {
         self.validate_settings()?;
         if image.len() != size.total_pixels() {
             return Err(DetectError::InvalidInputSize);
@@ -2029,9 +2036,17 @@ impl Detector {
         let decimate_factor = self.settings.decimate.unwrap_or(1) as u32;
         let (aligned_input, aligned_size) = crop_gray_to_multiple(image, size, 4 * decimate_factor)
             .map_err(|_| DetectError::InvalidInputSize)?;
-        let input_gpu_image =
-            crate::GPUImage::from_vec(self.device.clone(), aligned_size, aligned_input);
-        self.detect_descriptor(input_gpu_image.image.descriptor(), aligned_size)
+        let input_gpu_image = crate::GPUImage::from_vec(
+            self.device.clone(),
+            command_context,
+            aligned_size,
+            aligned_input,
+        );
+        self.detect_descriptor(
+            command_context,
+            input_gpu_image.image.descriptor(),
+            aligned_size,
+        )
     }
 
     /// Runs detection on a GPU descriptor buffer containing a grayscale image.
@@ -2045,6 +2060,7 @@ impl Detector {
     /// - [`DetectError::CacheLockPoisoned`] if cache lock is poisoned.
     pub fn detect_descriptor(
         &self,
+        command_context: &mut ComputeCommandContext,
         input: DescriptorBuffer,
         size: Size,
     ) -> Result<DetectionOutput, DetectError> {
@@ -2062,7 +2078,7 @@ impl Detector {
             .lock()
             .map_err(|_| DetectError::CacheLockPoisoned)?;
         let cached = guard.as_mut().ok_or(DetectError::CacheBuildFailed)?;
-        Ok(self.run_cached_execution(cached, input))
+        Ok(self.run_cached_execution(command_context, cached, input))
     }
 
     fn validate_settings(&self) -> Result<(), DetectError> {
@@ -2382,7 +2398,8 @@ impl Detector {
                 | ash::vk::BufferUsageFlags::TRANSFER_DST,
             BufferMemory::HostSequentialWrite,
         );
-        self.device.fill_buffer_u32(&buf, 0);
+        let mut command_context = self.device.create_command_context();
+        self.device.fill_buffer_u32(&mut command_context, &buf, 0);
         buf
     }
 }
@@ -2468,16 +2485,17 @@ mod tests {
             size,
         )
         .expect("failed to build sized detector");
+        let mut command_context = detector.device.create_command_context();
 
         let baseline = detector
-            .detect_gray(&gray_pixels, size)
+            .detect_gray(&mut command_context, &gray_pixels, size)
             .expect("detection failed for baseline run");
         let baseline_signature = tags_signature(&baseline.tags);
         assert!(baseline.timing.total_ms >= 0.0);
 
         for _ in 0..4 {
             let output = detector
-                .detect_gray(&gray_pixels, size)
+                .detect_gray(&mut command_context, &gray_pixels, size)
                 .expect("detection failed on repeated run");
             let signature = tags_signature(&output.tags);
             assert_eq!(signature, baseline_signature);
@@ -2512,8 +2530,9 @@ mod tests {
             return;
         };
         let image = vec![0u8];
+        let mut command_context = detector.device.create_command_context();
         let err = detector
-            .detect_gray(&image, Size::new(1, 1))
+            .detect_gray(&mut command_context, &image, Size::new(1, 1))
             .expect_err("tiny image should fail alignment");
         assert_eq!(err, DetectError::InvalidInputSize);
     }
@@ -2533,14 +2552,16 @@ mod tests {
         .ok() else {
             return;
         };
+        let mut command_context = device.create_command_context();
 
         let buffer = device.upload_buffer(
+            &mut command_context,
             &[0u8; 64 * 64],
             ash::vk::BufferUsageFlags::STORAGE_BUFFER | ash::vk::BufferUsageFlags::TRANSFER_SRC,
             true,
         );
         let err = detector
-            .detect_descriptor(buffer.descriptor(), Size::new(32, 32))
+            .detect_descriptor(&mut command_context, buffer.descriptor(), Size::new(32, 32))
             .expect_err("mismatched descriptor size should fail");
         assert_eq!(err, DetectError::FixedSizeMismatch);
     }
@@ -2551,8 +2572,9 @@ mod tests {
             return;
         };
         let image = vec![0u8; 16 * 16];
+        let mut command_context = detector.device.create_command_context();
         let output = detector
-            .detect_gray(&image, Size::new(16, 16))
+            .detect_gray(&mut command_context, &image, Size::new(16, 16))
             .expect("canonical detect_gray API should succeed");
         let _timing_total = output.timing.total_ms;
     }

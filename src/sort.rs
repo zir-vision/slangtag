@@ -1,7 +1,7 @@
 use crate::gpu::{
     BufferMemory, CommandRecorder, ComputePipeline, DescriptorBuffer, GpuBuffer, GpuQueryPool,
 };
-use crate::{ComputeDevice, compute_shader_path, include_u32};
+use crate::{ComputeCommandContext, ComputeDevice, compute_shader_path, include_u32};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
@@ -125,29 +125,42 @@ impl RadixSorter {
         )
     }
 
-    pub fn sort_u32(&self, keys: &[u32]) -> Vec<u32> {
+    pub fn sort_u32(&self, command_context: &mut ComputeCommandContext, keys: &[u32]) -> Vec<u32> {
         if keys.is_empty() {
             return Vec::new();
         }
 
-        let gpu_keys = self.upload_u32_storage_buffer(keys);
+        let gpu_keys = self.upload_u32_storage_buffer(command_context, keys);
         let storage = self.create_storage_buffer(keys.len() as u32);
-        self.cmd_sort(keys.len() as u32, &gpu_keys, 0, &storage, 0);
-        self.download_u32_buffer(&gpu_keys, keys.len())
+        self.cmd_sort(
+            command_context,
+            keys.len() as u32,
+            &gpu_keys,
+            0,
+            &storage,
+            0,
+        );
+        self.download_u32_buffer(command_context, &gpu_keys, keys.len())
     }
 
-    pub fn sort_u32_do(&self, keys: &GpuBuffer<u32>, element_count: u32) -> Option<GpuBuffer<u32>> {
+    pub fn sort_u32_do(
+        &self,
+        command_context: &mut ComputeCommandContext,
+        keys: &GpuBuffer<u32>,
+        element_count: u32,
+    ) -> Option<GpuBuffer<u32>> {
         if element_count <= 1 {
             return None;
         }
 
         let storage = self.create_storage_buffer(element_count);
-        self.cmd_sort(element_count, keys, 0, &storage, 0);
+        self.cmd_sort(command_context, element_count, keys, 0, &storage, 0);
         Some(keys.clone())
     }
 
     pub fn cmd_sort(
         &self,
+        command_context: &mut ComputeCommandContext,
         element_count: u32,
         keys_buffer: &GpuBuffer<u32>,
         keys_offset: vk::DeviceSize,
@@ -155,6 +168,7 @@ impl RadixSorter {
         storage_offset: vk::DeviceSize,
     ) {
         self.cmd_sort_with_query_pool(
+            command_context,
             element_count,
             keys_buffer,
             keys_offset,
@@ -166,6 +180,7 @@ impl RadixSorter {
 
     pub fn cmd_sort_with_query_pool(
         &self,
+        command_context: &mut ComputeCommandContext,
         element_count: u32,
         keys_buffer: &GpuBuffer<u32>,
         keys_offset: vk::DeviceSize,
@@ -178,6 +193,7 @@ impl RadixSorter {
         }
 
         self.gpu_sort(
+            command_context,
             element_count,
             Some(element_count),
             None,
@@ -221,6 +237,7 @@ impl RadixSorter {
 
     pub fn cmd_sort_indirect(
         &self,
+        command_context: &mut ComputeCommandContext,
         max_element_count: u32,
         indirect_buffer: &GpuBuffer<u32>,
         indirect_offset: vk::DeviceSize,
@@ -230,6 +247,7 @@ impl RadixSorter {
         storage_offset: vk::DeviceSize,
     ) {
         self.cmd_sort_indirect_with_query_pool(
+            command_context,
             max_element_count,
             indirect_buffer,
             indirect_offset,
@@ -243,6 +261,7 @@ impl RadixSorter {
 
     pub fn cmd_sort_indirect_with_query_pool(
         &self,
+        command_context: &mut ComputeCommandContext,
         max_element_count: u32,
         indirect_buffer: &GpuBuffer<u32>,
         indirect_offset: vk::DeviceSize,
@@ -257,6 +276,7 @@ impl RadixSorter {
         }
 
         self.gpu_sort(
+            command_context,
             max_element_count,
             None,
             Some((indirect_buffer, indirect_offset)),
@@ -302,6 +322,7 @@ impl RadixSorter {
 
     pub fn cmd_sort_key_value(
         &self,
+        command_context: &mut ComputeCommandContext,
         element_count: u32,
         keys_buffer: &GpuBuffer<u32>,
         keys_offset: vk::DeviceSize,
@@ -311,6 +332,7 @@ impl RadixSorter {
         storage_offset: vk::DeviceSize,
     ) {
         self.cmd_sort_key_value_with_query_pool(
+            command_context,
             element_count,
             keys_buffer,
             keys_offset,
@@ -324,6 +346,7 @@ impl RadixSorter {
 
     pub fn cmd_sort_key_value_with_query_pool(
         &self,
+        command_context: &mut ComputeCommandContext,
         element_count: u32,
         keys_buffer: &GpuBuffer<u32>,
         keys_offset: vk::DeviceSize,
@@ -338,6 +361,7 @@ impl RadixSorter {
         }
 
         self.gpu_sort(
+            command_context,
             element_count,
             Some(element_count),
             None,
@@ -383,6 +407,7 @@ impl RadixSorter {
 
     pub fn cmd_sort_key_value_indirect(
         &self,
+        command_context: &mut ComputeCommandContext,
         max_element_count: u32,
         indirect_buffer: &GpuBuffer<u32>,
         indirect_offset: vk::DeviceSize,
@@ -394,6 +419,7 @@ impl RadixSorter {
         storage_offset: vk::DeviceSize,
     ) {
         self.cmd_sort_key_value_indirect_with_query_pool(
+            command_context,
             max_element_count,
             indirect_buffer,
             indirect_offset,
@@ -409,6 +435,7 @@ impl RadixSorter {
 
     pub fn cmd_sort_key_value_indirect_with_query_pool(
         &self,
+        command_context: &mut ComputeCommandContext,
         max_element_count: u32,
         indirect_buffer: &GpuBuffer<u32>,
         indirect_offset: vk::DeviceSize,
@@ -425,6 +452,7 @@ impl RadixSorter {
         }
 
         self.gpu_sort(
+            command_context,
             max_element_count,
             None,
             Some((indirect_buffer, indirect_offset)),
@@ -471,6 +499,7 @@ impl RadixSorter {
 
     fn gpu_sort(
         &self,
+        command_context: &mut ComputeCommandContext,
         max_element_count: u32,
         direct_element_count: Option<u32>,
         indirect_count: Option<(&GpuBuffer<u32>, vk::DeviceSize)>,
@@ -481,7 +510,7 @@ impl RadixSorter {
         storage_offset: vk::DeviceSize,
         query_pool: Option<(&GpuQueryPool, u32)>,
     ) {
-        self.device.run_commands(|commands| {
+        self.device.run_commands(command_context, |commands| {
             self.gpu_sort_recorded(
                 commands,
                 max_element_count,
@@ -790,8 +819,13 @@ impl RadixSorter {
             .create_buffer(word_len, requirements.usage, BufferMemory::DeviceLocal)
     }
 
-    fn upload_u32_storage_buffer(&self, data: &[u32]) -> GpuBuffer<u32> {
+    fn upload_u32_storage_buffer(
+        &self,
+        command_context: &mut ComputeCommandContext,
+        data: &[u32],
+    ) -> GpuBuffer<u32> {
         self.device.upload_buffer(
+            command_context,
             data,
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_SRC
@@ -800,14 +834,23 @@ impl RadixSorter {
         )
     }
 
-    fn download_u32_buffer(&self, source: &GpuBuffer<u32>, len: usize) -> Vec<u32> {
+    fn download_u32_buffer(
+        &self,
+        command_context: &mut ComputeCommandContext,
+        source: &GpuBuffer<u32>,
+        len: usize,
+    ) -> Vec<u32> {
         let destination = self.device.create_buffer(
             len,
             vk::BufferUsageFlags::TRANSFER_DST,
             BufferMemory::HostRandomAccess,
         );
-        self.device
-            .copy_buffer(source, &destination, destination.byte_size());
+        self.device.copy_buffer(
+            command_context,
+            source,
+            &destination,
+            destination.byte_size(),
+        );
         destination.read(len)
     }
 }
@@ -836,10 +879,11 @@ mod tests {
         let Some(sorter) = maybe_sorter() else {
             panic!("failed to create RadixSorter, likely due to Vulkan initialization failure");
         };
+        let mut command_context = sorter.device.create_command_context();
 
         let mut expected = input.to_vec();
         expected.sort_unstable();
-        let actual = sorter.sort_u32(input);
+        let actual = sorter.sort_u32(&mut command_context, input);
         assert_eq!(actual, expected);
     }
 
