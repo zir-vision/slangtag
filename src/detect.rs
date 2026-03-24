@@ -222,7 +222,6 @@ struct CachedDetectorExecution {
 
 #[allow(dead_code)]
 struct CachedDetectorBuffers {
-    input_placeholder: GpuBuffer<u8>,
     decimated_image: Option<GpuBuffer<u8>>,
     thresholded_image: Option<GpuBuffer<u8>>,
     minmax_image: GpuBuffer<u8>,
@@ -806,6 +805,14 @@ impl GpuImageView {
             _keepalive: Some(buffer),
         }
     }
+
+    fn borrowed(descriptor: DescriptorBuffer, size: Size) -> Self {
+        Self {
+            descriptor,
+            size,
+            _keepalive: None,
+        }
+    }
 }
 
 fn crop_gray_to_multiple(image: &[u8], size: Size, multiple: u32) -> Result<(Vec<u8>, Size), ()> {
@@ -929,14 +936,7 @@ impl Detector {
         cached: &mut CachedDetectorExecution,
         input: DescriptorBuffer,
     ) -> DetectionOutput {
-        self.device.copy_descriptor_buffer_to_buffer(
-            command_context,
-            input,
-            &cached._buffers.input_placeholder,
-            cached._buffers.input_placeholder.byte_size(),
-        );
-        let input_gpu_image =
-            GpuImageView::owned(cached._buffers.input_placeholder.clone(), self.fixed_size);
+        let input_gpu_image = GpuImageView::borrowed(input, self.fixed_size);
         let decimate_factor = self.settings.decimate.unwrap_or(1) as u32;
         let decimated_image = match self.settings.decimate {
             Some(factor) => {
@@ -1906,39 +1906,28 @@ impl Detector {
     fn build_cached_execution(&self, size: Size) -> Result<CachedDetectorExecution, DetectError> {
         self.validate_settings()?;
 
-        let input_placeholder = self.new_u8_storage_buffer(size.total_pixels().max(1));
-        let input_gpu_image = GpuImageView::owned(input_placeholder.clone(), size);
-        let decimated_image = match self.settings.decimate {
+        let decimated_size = match self.settings.decimate {
             Some(factor) => {
-                let decimated_size = crate::Size::new(
-                    input_gpu_image.size.width / factor as u32,
-                    input_gpu_image.size.height / factor as u32,
-                );
-                let decimated_image_buffer =
-                    self.new_u8_storage_buffer(decimated_size.total_pixels());
-                GpuImageView::owned(decimated_image_buffer, decimated_size)
+                crate::Size::new(size.width / factor as u32, size.height / factor as u32)
             }
-            None => input_gpu_image.clone(),
+            None => size,
         };
+        let decimated_image = self
+            .settings
+            .decimate
+            .map(|_| self.new_u8_storage_buffer(decimated_size.total_pixels()));
 
-        let minmax_size = Size::new(
-            decimated_image.size.width / 4,
-            decimated_image.size.height / 4,
-        );
+        let minmax_size = Size::new(decimated_size.width / 4, decimated_size.height / 4);
         let minmax_image = self.new_u8_storage_buffer(minmax_size.total_pixels() * 2);
         let filtered_minmax_image = self.new_u8_storage_buffer(minmax_size.total_pixels() * 2);
-        let thresholded_image = GpuImageView::owned(
-            self.new_u8_storage_buffer(decimated_image.size.total_pixels()),
-            decimated_image.size,
-        );
-        let labels = self.new_u32_storage_buffer(thresholded_image.size.total_pixels());
-        let final_labels = self.new_u32_storage_buffer(thresholded_image.size.total_pixels());
-        let union_markers_size =
-            self.new_zeroed_u32_storage_buffer(thresholded_image.size.total_pixels());
+        let thresholded_image = self.new_u8_storage_buffer(decimated_size.total_pixels());
+        let labels = self.new_u32_storage_buffer(decimated_size.total_pixels());
+        let final_labels = self.new_u32_storage_buffer(decimated_size.total_pixels());
+        let union_markers_size = self.new_zeroed_u32_storage_buffer(decimated_size.total_pixels());
 
         let blob_diff_words_per_point = 6usize;
-        let blob_diff_points_per_offset = (thresholded_image.size.width as usize - 2)
-            * (thresholded_image.size.height as usize - 2);
+        let blob_diff_points_per_offset =
+            (decimated_size.width as usize - 2) * (decimated_size.height as usize - 2);
         let blob_diff_total_points = (blob_diff_points_per_offset * 4) as u32;
         let blob_diff_total_points_capacity = usize::max(1, blob_diff_total_points as usize);
         let blob_diff_out = self
@@ -2028,9 +2017,8 @@ impl Detector {
         let timings = PipelineTimings::new(&self.device, 1024);
 
         let buffers = CachedDetectorBuffers {
-            input_placeholder,
-            decimated_image: decimated_image._keepalive.clone(),
-            thresholded_image: thresholded_image._keepalive.clone(),
+            decimated_image: decimated_image.clone(),
+            thresholded_image: Some(thresholded_image.clone()),
             minmax_image: minmax_image.clone(),
             filtered_minmax_image: filtered_minmax_image.clone(),
             labels: labels.clone(),
