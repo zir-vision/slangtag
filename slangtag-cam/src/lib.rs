@@ -143,10 +143,10 @@ impl SharedQueue {
     }
 }
 
-#[derive(Clone)]
 struct FrameSlot {
     decode_buffer: GpuBuffer<u8>,
     detect_buffer: Option<GpuBuffer<u8>>,
+    transfer_context: Mutex<ComputeCommandContext>,
     size: Size,
 }
 
@@ -173,6 +173,7 @@ impl FrameSlotBufferMode {
 impl FrameSlot {
     fn new(device: &ComputeDevice, size: Size, mode: FrameSlotBufferMode) -> Self {
         let len = size.total_pixels();
+        let transfer_context = Mutex::new(device.create_command_context());
         if mode.uses_device_local_detect_input() {
             let decode_buffer = device.create_buffer(
                 len,
@@ -187,6 +188,7 @@ impl FrameSlot {
             Self {
                 decode_buffer,
                 detect_buffer: Some(detect_buffer),
+                transfer_context,
                 size,
             }
         } else {
@@ -198,6 +200,7 @@ impl FrameSlot {
             Self {
                 decode_buffer,
                 detect_buffer: None,
+                transfer_context,
                 size,
             }
         }
@@ -214,19 +217,32 @@ impl FrameSlot {
             .descriptor()
     }
 
-    fn copy_decode_to_detect_if_needed(
+    fn wait_for_transfer_slot(&self) -> Result<(), CamError> {
+        let mut guard = self
+            .transfer_context
+            .lock()
+            .map_err(|_| CamError::WorkerStopped)?;
+        guard.wait();
+        Ok(())
+    }
+
+    fn copy_decode_to_detect_if_needed_async(
         &self,
         device: &ComputeDevice,
-        command_context: &mut ComputeCommandContext,
-    ) {
+    ) -> Result<(), CamError> {
         if let Some(detect_buffer) = &self.detect_buffer {
-            device.copy_buffer(
-                command_context,
+            let mut guard = self
+                .transfer_context
+                .lock()
+                .map_err(|_| CamError::WorkerStopped)?;
+            device.copy_buffer_async(
+                &mut guard,
                 &self.decode_buffer,
                 detect_buffer,
                 self.decode_buffer.byte_size(),
             );
         }
+        Ok(())
     }
 }
 
@@ -428,7 +444,6 @@ fn run_capture_decode_worker(
     slots: Arc<Vec<FrameSlot>>,
     shared: Arc<SharedQueue>,
 ) -> Result<(), CamError> {
-    let mut command_context = device.create_command_context();
     let v4l_device = Device::open(
         Path::new(&config.device_path),
         DeviceConfig::new().non_blocking_dqbuf(),
@@ -543,6 +558,7 @@ fn run_capture_decode_worker(
         let slot_index = acquire_decode_slot(&shared)?;
         let slot_wait_ms = slot_wait_start.elapsed().as_secs_f64() * 1000.0;
         let slot = &slots[slot_index];
+        slot.wait_for_transfer_slot()?;
         let slot_width = slot.size.width;
         let slot_height = slot.size.height;
 
@@ -574,7 +590,7 @@ fn run_capture_decode_worker(
         match decode_res {
             Ok(()) => {
                 let copy_start = Instant::now();
-                slot.copy_decode_to_detect_if_needed(&device, &mut command_context);
+                slot.copy_decode_to_detect_if_needed_async(&device)?;
                 let copy_ms = copy_start.elapsed().as_secs_f64() * 1000.0;
                 frame_id = frame_id.wrapping_add(1);
                 publish_ready_frame(

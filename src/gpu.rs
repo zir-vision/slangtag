@@ -23,6 +23,8 @@ pub struct ComputeCommandContext {
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     submit_fence: vk::Fence,
+    submission_in_flight: bool,
+    in_flight_descriptor_sets: Vec<vk::DescriptorSet>,
 }
 
 struct ComputeDeviceInner {
@@ -77,6 +79,17 @@ impl Drop for ComputeCommandContext {
             .expect("failed to lock submit path during command context drop");
         unsafe {
             let _ = self.inner.device.device_wait_idle();
+            if !self.in_flight_descriptor_sets.is_empty() {
+                let _pool_lock = self
+                    .inner
+                    .descriptor_pool_lock
+                    .lock()
+                    .expect("failed to lock descriptor pool during command context drop");
+                let _ = self.inner.device.free_descriptor_sets(
+                    self.inner.descriptor_pool,
+                    &self.in_flight_descriptor_sets,
+                );
+            }
             self.inner.device.destroy_fence(self.submit_fence, None);
             self.inner
                 .device
@@ -193,7 +206,7 @@ fn main_entry_name() -> &'static CStr {
     c"main"
 }
 
-pub(crate) struct CommandRecorder<'a> {
+pub struct CommandRecorder<'a> {
     inner: &'a ComputeDeviceInner,
     command_buffer: vk::CommandBuffer,
     descriptor_sets: Vec<vk::DescriptorSet>,
@@ -816,10 +829,14 @@ impl ComputeCommandContext {
         );
     }
 
-    fn run_commands<F>(&mut self, record: F)
+    pub fn run_and_submit_async<F>(&mut self, record: F)
     where
         F: FnOnce(&mut CommandRecorder<'_>),
     {
+        if self.submission_in_flight {
+            self.wait();
+        }
+
         let _submit_lock = self
             .inner
             .submit_lock
@@ -863,25 +880,52 @@ impl ComputeCommandContext {
                 .device
                 .queue_submit(self.inner.queue, &submit_info, self.submit_fence)
                 .expect("failed to submit command context buffer");
+        }
+
+        self.in_flight_descriptor_sets = recorder.descriptor_sets;
+        self.submission_in_flight = true;
+    }
+
+    pub fn wait(&mut self) {
+        if !self.submission_in_flight {
+            return;
+        }
+
+        let _submit_lock = self
+            .inner
+            .submit_lock
+            .lock()
+            .expect("failed to lock submit path");
+        unsafe {
             self.inner
                 .device
                 .wait_for_fences(&[self.submit_fence], true, u64::MAX)
                 .expect("failed to wait for command context fence");
         }
+        self.submission_in_flight = false;
 
-        if !recorder.descriptor_sets.is_empty() {
+        if !self.in_flight_descriptor_sets.is_empty() {
             let _pool_lock = self
                 .inner
                 .descriptor_pool_lock
                 .lock()
                 .expect("failed to lock descriptor pool");
             unsafe {
-                let _ = self
-                    .inner
-                    .device
-                    .free_descriptor_sets(self.inner.descriptor_pool, &recorder.descriptor_sets);
+                let _ = self.inner.device.free_descriptor_sets(
+                    self.inner.descriptor_pool,
+                    &self.in_flight_descriptor_sets,
+                );
             }
+            self.in_flight_descriptor_sets.clear();
         }
+    }
+
+    fn run_commands<F>(&mut self, record: F)
+    where
+        F: FnOnce(&mut CommandRecorder<'_>),
+    {
+        self.run_and_submit_async(record);
+        self.wait();
     }
 }
 
@@ -1088,6 +1132,8 @@ impl ComputeDevice {
             command_pool,
             command_buffer,
             submit_fence,
+            submission_in_flight: false,
+            in_flight_descriptor_sets: Vec::new(),
         }
     }
 
@@ -1333,6 +1379,16 @@ impl ComputeDevice {
         self.copy_buffer_region(command_context, src, 0, dst, 0, bytes);
     }
 
+    pub fn copy_buffer_async<T: Pod + Copy>(
+        &self,
+        command_context: &mut ComputeCommandContext,
+        src: &GpuBuffer<T>,
+        dst: &GpuBuffer<T>,
+        bytes: vk::DeviceSize,
+    ) {
+        self.copy_buffer_region_async(command_context, src, 0, dst, 0, bytes);
+    }
+
     pub fn copy_buffer_region<T: Pod + Copy>(
         &self,
         command_context: &mut ComputeCommandContext,
@@ -1344,6 +1400,21 @@ impl ComputeDevice {
     ) {
         command_context.assert_same_device(self);
         command_context.run_commands(|recorder| {
+            recorder.copy_buffer_region(src, src_offset, dst, dst_offset, bytes);
+        });
+    }
+
+    pub fn copy_buffer_region_async<T: Pod + Copy>(
+        &self,
+        command_context: &mut ComputeCommandContext,
+        src: &GpuBuffer<T>,
+        src_offset: vk::DeviceSize,
+        dst: &GpuBuffer<T>,
+        dst_offset: vk::DeviceSize,
+        bytes: vk::DeviceSize,
+    ) {
+        command_context.assert_same_device(self);
+        command_context.run_and_submit_async(|recorder| {
             recorder.copy_buffer_region(src, src_offset, dst, dst_offset, bytes);
         });
     }

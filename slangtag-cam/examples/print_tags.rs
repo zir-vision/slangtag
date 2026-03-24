@@ -26,6 +26,7 @@ fn main() {
     config.fps = fps;
     config.timing_debug = true;
     config.timing_every_n_frames = 30;
+    config.use_device_local_input = true;
     let settings = DetectionSettings {
         ..Default::default()
     };
