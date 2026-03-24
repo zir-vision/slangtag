@@ -71,10 +71,15 @@ fn main() {
 
     let mut total_wall_ms = 0.0f64;
     let mut total_gpu_ms = 0.0f64;
+    let mut total_cpu_ms = 0.0f64;
+    let mut total_timed_ms = 0.0f64;
     let mut tag_count = 0usize;
-    let mut ordered_span_names = Vec::<String>::new();
-    let mut span_sums_ms = Vec::<f64>::new();
-    let mut span_counts = Vec::<usize>::new();
+    let mut ordered_gpu_span_names = Vec::<String>::new();
+    let mut gpu_span_sums_ms = Vec::<f64>::new();
+    let mut gpu_span_counts = Vec::<usize>::new();
+    let mut ordered_cpu_span_names = Vec::<String>::new();
+    let mut cpu_span_sums_ms = Vec::<f64>::new();
+    let mut cpu_span_counts = Vec::<usize>::new();
 
     for _ in 0..runs {
         let start = Instant::now();
@@ -88,33 +93,62 @@ fn main() {
         let timing_report = output.timing;
         total_wall_ms += start.elapsed().as_secs_f64() * 1_000.0;
         total_gpu_ms += timing_report.total_ms;
+        total_cpu_ms += timing_report.cpu_total_ms;
+        total_timed_ms += timing_report.end_to_end_ms;
         tag_count = output.tags.len();
 
         for span in timing_report.spans {
-            let index = if let Some(existing_index) = ordered_span_names
+            let index = if let Some(existing_index) = ordered_gpu_span_names
                 .iter()
                 .position(|name| name == &span.name)
             {
                 existing_index
             } else {
-                ordered_span_names.push(span.name);
-                span_sums_ms.push(0.0);
-                span_counts.push(0);
-                ordered_span_names.len() - 1
+                ordered_gpu_span_names.push(span.name);
+                gpu_span_sums_ms.push(0.0);
+                gpu_span_counts.push(0);
+                ordered_gpu_span_names.len() - 1
             };
-            span_sums_ms[index] += span.elapsed_ms;
-            span_counts[index] += 1;
+            gpu_span_sums_ms[index] += span.elapsed_ms;
+            gpu_span_counts[index] += 1;
+        }
+
+        for span in timing_report.cpu_spans {
+            let index = if let Some(existing_index) = ordered_cpu_span_names
+                .iter()
+                .position(|name| name == &span.name)
+            {
+                existing_index
+            } else {
+                ordered_cpu_span_names.push(span.name);
+                cpu_span_sums_ms.push(0.0);
+                cpu_span_counts.push(0);
+                ordered_cpu_span_names.len() - 1
+            };
+            cpu_span_sums_ms[index] += span.elapsed_ms;
+            cpu_span_counts[index] += 1;
         }
     }
 
     let avg_wall_ms = total_wall_ms / runs as f64;
     let avg_gpu_ms = total_gpu_ms / runs as f64;
-    let averaged_spans = ordered_span_names
+    let avg_cpu_ms = total_cpu_ms / runs as f64;
+    let avg_timed_ms = total_timed_ms / runs as f64;
+    let averaged_gpu_spans = ordered_gpu_span_names
         .into_iter()
         .enumerate()
         .map(|(index, name)| {
-            let count = span_counts.get(index).copied().unwrap_or(1);
-            let sum_ms = span_sums_ms.get(index).copied().unwrap_or(0.0);
+            let count = gpu_span_counts.get(index).copied().unwrap_or(1);
+            let sum_ms = gpu_span_sums_ms.get(index).copied().unwrap_or(0.0);
+            (name, sum_ms / count as f64)
+        })
+        .collect::<Vec<_>>();
+    let averaged_cpu_spans = ordered_cpu_span_names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let count = cpu_span_counts.get(index).copied().unwrap_or(1);
+            let sum_ms = cpu_span_sums_ms.get(index).copied().unwrap_or(0.0);
             (name, sum_ms / count as f64)
         })
         .collect::<Vec<_>>();
@@ -125,15 +159,24 @@ fn main() {
     );
     println!("Detected {} tags", tag_count);
     println!(
-        "Average wall time: {:>9.3} ms | Average GPU timed shaders: {:>9.3} ms",
-        avg_wall_ms, avg_gpu_ms
+        "Average wall time: {:>9.3} ms | Average GPU timed: {:>9.3} ms | Average CPU timed: {:>9.3} ms | Average timed total: {:>9.3} ms",
+        avg_wall_ms, avg_gpu_ms, avg_cpu_ms, avg_timed_ms
     );
     println!("GPU shader timings (average):");
-    for (name, avg_ms) in averaged_spans {
+    for (name, avg_ms) in averaged_gpu_spans {
         println!("  {:<52} {}", name, colorize_ms(avg_ms, avg_gpu_ms));
     }
     println!(
         "  {:<52} {:>9.3} ms",
         "total timed shader execution", avg_gpu_ms
+    );
+    println!("CPU timings (average):");
+    for (name, avg_ms) in averaged_cpu_spans {
+        println!("  {:<52} {}", name, colorize_ms(avg_ms, avg_cpu_ms));
+    }
+    println!("  {:<52} {:>9.3} ms", "total timed cpu execution", avg_cpu_ms);
+    println!(
+        "  {:<52} {:>9.3} ms",
+        "total timed cpu+gpu execution", avg_timed_ms
     );
 }

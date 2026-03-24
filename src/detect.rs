@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Instant;
 
 include!("apriltag36h11_codes.rs");
 
@@ -152,13 +153,28 @@ pub struct GpuTimingSpan {
     pub elapsed_ms: f64,
 }
 
+#[derive(Debug, Clone)]
+/// Timing span for one CPU stage.
+pub struct CpuTimingSpan {
+    /// Stage name.
+    pub name: String,
+    /// Stage elapsed time in milliseconds.
+    pub elapsed_ms: f64,
+}
+
 #[derive(Debug, Clone, Default)]
-/// Aggregated GPU timings for a detection invocation.
+/// Aggregated GPU and CPU timings for a detection invocation.
 pub struct GpuTimingReport {
-    /// Per-stage timing spans in execution order.
+    /// Per-stage GPU timing spans in execution order.
     pub spans: Vec<GpuTimingSpan>,
-    /// Sum of all timed stage durations in milliseconds.
+    /// Sum of all timed GPU stage durations in milliseconds.
     pub total_ms: f64,
+    /// Per-stage CPU timing spans in execution order.
+    pub cpu_spans: Vec<CpuTimingSpan>,
+    /// Sum of all timed CPU stage durations in milliseconds.
+    pub cpu_total_ms: f64,
+    /// Total CPU+GPU timed duration in milliseconds.
+    pub end_to_end_ms: f64,
 }
 
 /// Detection output containing decoded tags and GPU stage timings.
@@ -168,6 +184,48 @@ pub struct DetectionOutput {
     pub tags: Vec<DetectedTag>,
     /// GPU execution timings for this invocation.
     pub timing: GpuTimingReport,
+}
+
+struct CpuTimer {
+    last: Instant,
+    spans: Vec<CpuTimingSpan>,
+}
+
+impl CpuTimer {
+    fn new() -> Self {
+        Self {
+            last: Instant::now(),
+            spans: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, name: &str) {
+        let now = Instant::now();
+        let elapsed_ms = (now - self.last).as_secs_f64() * 1_000.0;
+        self.spans.push(CpuTimingSpan {
+            name: name.to_owned(),
+            elapsed_ms,
+        });
+        self.last = now;
+    }
+
+    fn into_spans(self) -> Vec<CpuTimingSpan> {
+        self.spans
+    }
+}
+
+impl GpuTimingReport {
+    fn recompute_totals(&mut self) {
+        self.total_ms = self.spans.iter().map(|span| span.elapsed_ms).sum();
+        self.cpu_total_ms = self.cpu_spans.iter().map(|span| span.elapsed_ms).sum();
+        self.end_to_end_ms = self.total_ms + self.cpu_total_ms;
+    }
+
+    fn prepend_cpu_spans(&mut self, mut spans: Vec<CpuTimingSpan>) {
+        spans.append(&mut self.cpu_spans);
+        self.cpu_spans = spans;
+        self.recompute_totals();
+    }
 }
 
 /// Typed detection failures returned by [`Detector`] APIs.
@@ -648,7 +706,13 @@ impl PipelineTimings {
                 elapsed_ms,
             });
         }
-        GpuTimingReport { spans, total_ms }
+        GpuTimingReport {
+            spans,
+            total_ms,
+            cpu_spans: Vec::new(),
+            cpu_total_ms: 0.0,
+            end_to_end_ms: total_ms,
+        }
     }
 }
 
@@ -945,6 +1009,7 @@ impl Detector {
         cached: &mut CachedDetectorExecution,
         input: DescriptorBuffer,
     ) -> DetectionOutput {
+        let mut cpu_timer = CpuTimer::new();
         let input_gpu_image = GpuImageView::borrowed(input, self.fixed_size);
         let decimate_factor = self.settings.decimate.unwrap_or(1) as u32;
         let decimated_image = match self.settings.decimate {
@@ -1042,6 +1107,7 @@ impl Detector {
             blob_pair_filter.max_cluster_pixels_perimeter_scale
                 * (thresholded_image.size.width + thresholded_image.size.height),
         );
+        cpu_timer.mark("cpu-prepare-run-cached-execution");
 
         let mut timings = &mut cached.timings;
         self.device.run_commands(command_context, |commands| {
@@ -1934,14 +2000,18 @@ impl Detector {
                 bits.byte_size(),
             );
         });
+        cpu_timer.mark("cpu-submit-and-wait-gpu");
 
-        let timing_report = cached.timings.summary(&self.device);
+        let mut timing_report = cached.timings.summary(&self.device);
+        cpu_timer.mark("cpu-read-query-timings");
         let counters = cached
             .readback_counters
             .read(Self::CONTROL_COUNTER_WORD_COUNT);
+        cpu_timer.mark("cpu-readback-counters");
         let fitted_quad_count_value = counters[Self::CONTROL_FITTED_QUAD_COUNT_WORD as usize]
             .min(cached.max_quad_capacity_u32);
         if fitted_quad_count_value == 0 {
+            timing_report.prepend_cpu_spans(cpu_timer.into_spans());
             return DetectionOutput {
                 tags: Vec::new(),
                 timing: timing_report,
@@ -1954,8 +2024,11 @@ impl Detector {
         let bits_words = cached
             .readback_bits
             .read(fitted_quad_count_value as usize * Self::MARKER_SIZE_WITH_BORDERS.pow(2));
+        cpu_timer.mark("cpu-readback-quads-and-bits");
         let tags =
             self.build_detected_tags(&fitted_quad_words, fitted_quad_count_value, &bits_words);
+        cpu_timer.mark("cpu-build-detected-tags");
+        timing_report.prepend_cpu_spans(cpu_timer.into_spans());
         DetectionOutput {
             tags,
             timing: timing_report,
@@ -2140,25 +2213,31 @@ impl Detector {
         image: &[u8],
         size: Size,
     ) -> Result<DetectionOutput, DetectError> {
+        let mut cpu_timer = CpuTimer::new();
         self.validate_settings()?;
         if image.len() != size.total_pixels() {
             return Err(DetectError::InvalidInputSize);
         }
+        cpu_timer.mark("cpu-validate-detect-gray-input");
 
         let decimate_factor = self.settings.decimate.unwrap_or(1) as u32;
         let (aligned_input, aligned_size) = crop_gray_to_multiple(image, size, 4 * decimate_factor)
             .map_err(|_| DetectError::InvalidInputSize)?;
+        cpu_timer.mark("cpu-crop-gray-to-multiple");
         let input_gpu_image = crate::GPUImage::from_vec(
             self.device.clone(),
             command_context,
             aligned_size,
             aligned_input,
         );
-        self.detect_descriptor(
+        cpu_timer.mark("cpu-upload-gray-image");
+        let mut output = self.detect_descriptor(
             command_context,
             input_gpu_image.image.descriptor(),
             aligned_size,
-        )
+        )?;
+        output.timing.prepend_cpu_spans(cpu_timer.into_spans());
+        Ok(output)
     }
 
     /// Runs detection on a GPU descriptor buffer containing a grayscale image.
@@ -2176,10 +2255,13 @@ impl Detector {
         input: DescriptorBuffer,
         size: Size,
     ) -> Result<DetectionOutput, DetectError> {
+        let mut cpu_timer = CpuTimer::new();
         self.validate_settings()?;
+        cpu_timer.mark("cpu-validate-detect-descriptor-input");
         let normalized_size = self
             .normalize_input_size(size)
             .ok_or(DetectError::InvalidInputSize)?;
+        cpu_timer.mark("cpu-normalize-input-size");
         if normalized_size.width != self.fixed_size.width
             || normalized_size.height != self.fixed_size.height
         {
@@ -2190,7 +2272,10 @@ impl Detector {
             .lock()
             .map_err(|_| DetectError::CacheLockPoisoned)?;
         let cached = guard.as_mut().ok_or(DetectError::CacheBuildFailed)?;
-        Ok(self.run_cached_execution(command_context, cached, input))
+        cpu_timer.mark("cpu-lock-cached-execution");
+        let mut output = self.run_cached_execution(command_context, cached, input);
+        output.timing.prepend_cpu_spans(cpu_timer.into_spans());
+        Ok(output)
     }
 
     fn validate_settings(&self) -> Result<(), DetectError> {
