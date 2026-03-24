@@ -1,7 +1,4 @@
-use crate::gpu::{
-    BufferMemory, CachedCommandBuffer, CommandRecorder, ComputePipeline, DescriptorBuffer,
-    GpuBuffer,
-};
+use crate::gpu::{BufferMemory, CommandRecorder, ComputePipeline, DescriptorBuffer, GpuBuffer};
 use crate::sort::RadixSorter;
 use crate::{ComputeCommandContext, ComputeDevice, Size, compute_shader_path, include_u32};
 use ash::vk;
@@ -221,7 +218,6 @@ struct CachedDetectorExecution {
     readback_bits: GpuBuffer<u32>,
     _buffers: CachedDetectorBuffers,
     timings: PipelineTimings,
-    command_buffer: CachedCommandBuffer,
 }
 
 #[allow(dead_code)]
@@ -939,50 +935,21 @@ impl Detector {
             &cached._buffers.input_placeholder,
             cached._buffers.input_placeholder.byte_size(),
         );
-        cached.command_buffer.submit_and_wait();
-
-        let timing_report = cached.timings.summary(&self.device);
-        let counters = cached
-            .readback_counters
-            .read(Self::CONTROL_COUNTER_WORD_COUNT);
-        let fitted_quad_count_value = counters[Self::CONTROL_FITTED_QUAD_COUNT_WORD as usize]
-            .min(cached.max_quad_capacity_u32);
-        if fitted_quad_count_value == 0 {
-            return DetectionOutput {
-                tags: Vec::new(),
-                timing: timing_report,
-            };
-        }
-
-        let fitted_quad_words = cached
-            .readback_fitted_quads
-            .read(fitted_quad_count_value as usize * cached.fitted_quad_words_per_quad);
-        let bits_words = cached
-            .readback_bits
-            .read(fitted_quad_count_value as usize * Self::MARKER_SIZE_WITH_BORDERS.pow(2));
-        let tags =
-            self.build_detected_tags(&fitted_quad_words, fitted_quad_count_value, &bits_words);
-        DetectionOutput {
-            tags,
-            timing: timing_report,
-        }
-    }
-
-    fn build_cached_execution(&self, size: Size) -> Result<CachedDetectorExecution, DetectError> {
-        self.validate_settings()?;
-
-        let input_placeholder = self.new_u8_storage_buffer(size.total_pixels().max(1));
-        let input_gpu_image = GpuImageView::owned(input_placeholder.clone(), size);
+        let input_gpu_image =
+            GpuImageView::owned(cached._buffers.input_placeholder.clone(), self.fixed_size);
         let decimate_factor = self.settings.decimate.unwrap_or(1) as u32;
-
         let decimated_image = match self.settings.decimate {
             Some(factor) => {
                 let decimated_size = crate::Size::new(
                     input_gpu_image.size.width / factor as u32,
                     input_gpu_image.size.height / factor as u32,
                 );
-                let decimated_image_buffer =
-                    self.new_u8_storage_buffer(decimated_size.total_pixels());
+                let decimated_image_buffer = cached
+                    ._buffers
+                    .decimated_image
+                    .as_ref()
+                    .expect("missing cached decimated image buffer")
+                    .clone();
                 GpuImageView::owned(decimated_image_buffer, decimated_size)
             }
             None => input_gpu_image.clone(),
@@ -992,72 +959,57 @@ impl Detector {
             decimated_image.size.width / 4,
             decimated_image.size.height / 4,
         );
-        let minmax_image = self.new_u8_storage_buffer(minmax_size.total_pixels() * 2);
-        let filtered_minmax_image = self.new_u8_storage_buffer(minmax_size.total_pixels() * 2);
         let thresholded_image = GpuImageView::owned(
-            self.new_u8_storage_buffer(decimated_image.size.total_pixels()),
+            cached
+                ._buffers
+                .thresholded_image
+                .as_ref()
+                .expect("missing cached thresholded image buffer")
+                .clone(),
             decimated_image.size,
         );
-        let labels = self.new_u32_storage_buffer(thresholded_image.size.total_pixels());
-        let final_labels = self.new_u32_storage_buffer(thresholded_image.size.total_pixels());
-        let union_markers_size =
-            self.new_zeroed_u32_storage_buffer(thresholded_image.size.total_pixels());
-
-        let blob_diff_words_per_point = 6usize;
         let blob_diff_points_per_offset = (thresholded_image.size.width as usize - 2)
             * (thresholded_image.size.height as usize - 2);
         let blob_diff_total_points = (blob_diff_points_per_offset * 4) as u32;
-        let blob_diff_total_points_capacity = usize::max(1, blob_diff_total_points as usize);
-        let blob_diff_out = self
-            .new_u32_storage_buffer(blob_diff_total_points_capacity * blob_diff_words_per_point);
-        let blob_diff_compacted = self
-            .new_u32_storage_buffer(blob_diff_total_points_capacity * blob_diff_words_per_point);
-        let blob_diff_sorted = self
-            .new_u32_storage_buffer(blob_diff_total_points_capacity * blob_diff_words_per_point);
-
-        let blob_extent_words_per_extent = 11usize;
-        let blob_extent_capacity = blob_diff_total_points_capacity;
-        let blob_extent =
-            self.new_u32_storage_buffer(blob_extent_capacity * blob_extent_words_per_extent);
-        let filtered_blob_extent =
-            self.new_u32_storage_buffer(blob_extent_capacity * blob_extent_words_per_extent);
-        let point_extent_indices = self.new_u32_storage_buffer(blob_diff_total_points_capacity);
-
-        let selected_blob_point_words_per_point = 4usize;
         let selected_blob_point_capacity_u32 = blob_diff_total_points.max(1);
-        let selected_blob_point_capacity = usize::max(1, selected_blob_point_capacity_u32 as usize);
-        let selected_blob_points = self.new_u32_storage_buffer(
-            selected_blob_point_capacity * selected_blob_point_words_per_point,
-        );
-        let selected_blob_sorted_points = self.new_u32_storage_buffer(
-            selected_blob_point_capacity * selected_blob_point_words_per_point,
-        );
 
-        let line_fit_point_words_per_point = 10usize;
-        let line_fit_points = self
-            .new_u32_storage_buffer(selected_blob_point_capacity * line_fit_point_words_per_point);
-        let errs = self.new_u32_storage_buffer(selected_blob_point_capacity);
-        let filtered_errs = self.new_u32_storage_buffer(selected_blob_point_capacity);
-        let peak_words_per_peak = 3usize;
-        let peaks = self.new_u32_storage_buffer(selected_blob_point_capacity * peak_words_per_peak);
-        let sorted_peaks =
-            self.new_u32_storage_buffer(selected_blob_point_capacity * peak_words_per_peak);
-        let peak_extent_words_per_extent = 3usize;
-        let peak_extents = self
-            .new_u32_storage_buffer(selected_blob_point_capacity * peak_extent_words_per_extent);
+        let minmax_image = cached._buffers.minmax_image.clone();
+        let filtered_minmax_image = cached._buffers.filtered_minmax_image.clone();
+        let labels = cached._buffers.labels.clone();
+        let final_labels = cached._buffers.final_labels.clone();
+        let union_markers_size = cached._buffers.union_markers_size.clone();
+        let blob_diff_out = cached._buffers.blob_diff_out.clone();
+        let blob_diff_compacted = cached._buffers.blob_diff_compacted.clone();
+        let blob_diff_sorted = cached._buffers.blob_diff_sorted.clone();
+        let blob_extent = cached._buffers.blob_extent.clone();
+        let filtered_blob_extent = cached._buffers.filtered_blob_extent.clone();
+        let point_extent_indices = cached._buffers.point_extent_indices.clone();
+        let selected_blob_points = cached._buffers.selected_blob_points.clone();
+        let selected_blob_sorted_points = cached._buffers.selected_blob_sorted_points.clone();
+        let line_fit_points = cached._buffers.line_fit_points.clone();
+        let errs = cached._buffers.errs.clone();
+        let filtered_errs = cached._buffers.filtered_errs.clone();
+        let peaks = cached._buffers.peaks.clone();
+        let sorted_peaks = cached._buffers.sorted_peaks.clone();
+        let peak_extents = cached._buffers.peak_extents.clone();
+        let fitted_quads = cached._buffers.fitted_quads.clone();
+        let quad_params = cached._buffers.quad_params.clone();
+        let bits = cached._buffers.bits.clone();
+        let control = cached._buffers.control.clone();
+        let blob_sort_keys = cached._buffers.blob_sort_keys.clone();
+        let blob_sorted_indices = cached._buffers.blob_sorted_indices.clone();
+        let blob_sort_storage = cached._buffers.blob_sort_storage.clone();
+        let selected_sort_keys = cached._buffers.selected_sort_keys.clone();
+        let selected_sorted_indices = cached._buffers.selected_sorted_indices.clone();
+        let selected_sort_storage = cached._buffers.selected_sort_storage.clone();
+        let peak_sort_keys = cached._buffers.peak_sort_keys.clone();
+        let peak_sorted_indices = cached._buffers.peak_sorted_indices.clone();
+        let peak_sort_storage = cached._buffers.peak_sort_storage.clone();
+        let readback_counters = cached.readback_counters.clone();
+        let readback_fitted_quads = cached.readback_fitted_quads.clone();
+        let readback_bits = cached.readback_bits.clone();
+        let max_quad_capacity_u32 = cached.max_quad_capacity_u32;
 
-        let fitted_quad_words_per_quad = 15usize;
-        let max_quad_capacity_u32 = selected_blob_point_capacity_u32;
-        let max_quad_capacity = selected_blob_point_capacity;
-        let fitted_quads =
-            self.new_u32_storage_buffer(max_quad_capacity * fitted_quad_words_per_quad);
-        let quad_param_words_per_quad = 12usize;
-        let quad_params =
-            self.new_u32_storage_buffer(max_quad_capacity * quad_param_words_per_quad);
-        let bits_count_oversized = max_quad_capacity * 8usize * 8usize;
-        let bits = self.new_u32_storage_buffer(bits_count_oversized);
-
-        let control = self.new_u32_control_buffer(Self::CONTROL_WORD_COUNT);
         let control_blob_diff_filtered_desc =
             Self::control_counter_descriptor(&control, Self::CONTROL_BLOB_DIFF_FILTERED_COUNT_WORD);
         let control_blob_extent_desc =
@@ -1075,40 +1027,6 @@ impl Detector {
         let control_fitted_quad_desc =
             Self::control_counter_descriptor(&control, Self::CONTROL_FITTED_QUAD_COUNT_WORD);
 
-        let blob_sort_keys = self.new_u32_storage_buffer(blob_diff_total_points_capacity);
-        let blob_sorted_indices = self.new_u32_storage_buffer(blob_diff_total_points_capacity);
-        let blob_sort_storage = self
-            .sorter
-            .create_key_value_storage_buffer(blob_diff_total_points.max(1));
-
-        let selected_sort_keys = self.new_u32_storage_buffer(selected_blob_point_capacity);
-        let selected_sorted_indices = self.new_u32_storage_buffer(selected_blob_point_capacity);
-        let selected_sort_storage = self
-            .sorter
-            .create_key_value_storage_buffer(selected_blob_point_capacity_u32);
-
-        let peak_sort_keys = self.new_u32_storage_buffer(selected_blob_point_capacity);
-        let peak_sorted_indices = self.new_u32_storage_buffer(selected_blob_point_capacity);
-        let peak_sort_storage = self
-            .sorter
-            .create_key_value_storage_buffer(selected_blob_point_capacity_u32);
-
-        let readback_counters = self.device.create_buffer(
-            Self::CONTROL_COUNTER_WORD_COUNT,
-            vk::BufferUsageFlags::TRANSFER_DST,
-            BufferMemory::HostRandomAccess,
-        );
-        let readback_fitted_quads = self.device.create_buffer(
-            max_quad_capacity * fitted_quad_words_per_quad,
-            vk::BufferUsageFlags::TRANSFER_DST,
-            BufferMemory::HostRandomAccess,
-        );
-        let readback_bits = self.device.create_buffer(
-            bits_count_oversized,
-            vk::BufferUsageFlags::TRANSFER_DST,
-            BufferMemory::HostRandomAccess,
-        );
-
         let blob_pair_filter = self.settings.blob_pair_filter;
         let min_tag_width = blob_pair_filter.min_tag_width;
         let max_cluster_pixels = blob_pair_filter.max_cluster_pixels.unwrap_or(
@@ -1116,9 +1034,8 @@ impl Detector {
                 * (thresholded_image.size.width + thresholded_image.size.height),
         );
 
-        let mut timings = PipelineTimings::new(&self.device, 1024);
-        let mut command_buffer = self.device.create_cached_command_buffer();
-        command_buffer.record(|commands| {
+        let mut timings = &mut cached.timings;
+        self.device.run_commands(command_context, |commands| {
             timings.reset(commands);
             commands.fill_buffer_u32_range(&control, 0, control.byte_size(), 0);
             commands.fill_buffer_u32_range(&blob_extent, 0, blob_extent.byte_size(), 0);
@@ -1157,8 +1074,6 @@ impl Detector {
                 commands.barrier_shader_write_to_shader_read();
             }
 
-            // The rest of the graph is fixed-size and can stay pre-recorded.
-            // Keep using the existing helpers for the bulk of dispatches.
             let minmax_dispatch = dispatch_groups_2d(
                 minmax_size.width,
                 minmax_size.height,
@@ -1961,6 +1876,157 @@ impl Detector {
             commands.copy_buffer_region(&bits, 0, &readback_bits, 0, bits.byte_size());
         });
 
+        let timing_report = cached.timings.summary(&self.device);
+        let counters = cached
+            .readback_counters
+            .read(Self::CONTROL_COUNTER_WORD_COUNT);
+        let fitted_quad_count_value = counters[Self::CONTROL_FITTED_QUAD_COUNT_WORD as usize]
+            .min(cached.max_quad_capacity_u32);
+        if fitted_quad_count_value == 0 {
+            return DetectionOutput {
+                tags: Vec::new(),
+                timing: timing_report,
+            };
+        }
+
+        let fitted_quad_words = cached
+            .readback_fitted_quads
+            .read(fitted_quad_count_value as usize * cached.fitted_quad_words_per_quad);
+        let bits_words = cached
+            .readback_bits
+            .read(fitted_quad_count_value as usize * Self::MARKER_SIZE_WITH_BORDERS.pow(2));
+        let tags =
+            self.build_detected_tags(&fitted_quad_words, fitted_quad_count_value, &bits_words);
+        DetectionOutput {
+            tags,
+            timing: timing_report,
+        }
+    }
+
+    fn build_cached_execution(&self, size: Size) -> Result<CachedDetectorExecution, DetectError> {
+        self.validate_settings()?;
+
+        let input_placeholder = self.new_u8_storage_buffer(size.total_pixels().max(1));
+        let input_gpu_image = GpuImageView::owned(input_placeholder.clone(), size);
+        let decimated_image = match self.settings.decimate {
+            Some(factor) => {
+                let decimated_size = crate::Size::new(
+                    input_gpu_image.size.width / factor as u32,
+                    input_gpu_image.size.height / factor as u32,
+                );
+                let decimated_image_buffer =
+                    self.new_u8_storage_buffer(decimated_size.total_pixels());
+                GpuImageView::owned(decimated_image_buffer, decimated_size)
+            }
+            None => input_gpu_image.clone(),
+        };
+
+        let minmax_size = Size::new(
+            decimated_image.size.width / 4,
+            decimated_image.size.height / 4,
+        );
+        let minmax_image = self.new_u8_storage_buffer(minmax_size.total_pixels() * 2);
+        let filtered_minmax_image = self.new_u8_storage_buffer(minmax_size.total_pixels() * 2);
+        let thresholded_image = GpuImageView::owned(
+            self.new_u8_storage_buffer(decimated_image.size.total_pixels()),
+            decimated_image.size,
+        );
+        let labels = self.new_u32_storage_buffer(thresholded_image.size.total_pixels());
+        let final_labels = self.new_u32_storage_buffer(thresholded_image.size.total_pixels());
+        let union_markers_size =
+            self.new_zeroed_u32_storage_buffer(thresholded_image.size.total_pixels());
+
+        let blob_diff_words_per_point = 6usize;
+        let blob_diff_points_per_offset = (thresholded_image.size.width as usize - 2)
+            * (thresholded_image.size.height as usize - 2);
+        let blob_diff_total_points = (blob_diff_points_per_offset * 4) as u32;
+        let blob_diff_total_points_capacity = usize::max(1, blob_diff_total_points as usize);
+        let blob_diff_out = self
+            .new_u32_storage_buffer(blob_diff_total_points_capacity * blob_diff_words_per_point);
+        let blob_diff_compacted = self
+            .new_u32_storage_buffer(blob_diff_total_points_capacity * blob_diff_words_per_point);
+        let blob_diff_sorted = self
+            .new_u32_storage_buffer(blob_diff_total_points_capacity * blob_diff_words_per_point);
+
+        let blob_extent_words_per_extent = 11usize;
+        let blob_extent_capacity = blob_diff_total_points_capacity;
+        let blob_extent =
+            self.new_u32_storage_buffer(blob_extent_capacity * blob_extent_words_per_extent);
+        let filtered_blob_extent =
+            self.new_u32_storage_buffer(blob_extent_capacity * blob_extent_words_per_extent);
+        let point_extent_indices = self.new_u32_storage_buffer(blob_diff_total_points_capacity);
+
+        let selected_blob_point_words_per_point = 4usize;
+        let selected_blob_point_capacity_u32 = blob_diff_total_points.max(1);
+        let selected_blob_point_capacity = usize::max(1, selected_blob_point_capacity_u32 as usize);
+        let selected_blob_points = self.new_u32_storage_buffer(
+            selected_blob_point_capacity * selected_blob_point_words_per_point,
+        );
+        let selected_blob_sorted_points = self.new_u32_storage_buffer(
+            selected_blob_point_capacity * selected_blob_point_words_per_point,
+        );
+
+        let line_fit_point_words_per_point = 10usize;
+        let line_fit_points = self
+            .new_u32_storage_buffer(selected_blob_point_capacity * line_fit_point_words_per_point);
+        let errs = self.new_u32_storage_buffer(selected_blob_point_capacity);
+        let filtered_errs = self.new_u32_storage_buffer(selected_blob_point_capacity);
+        let peak_words_per_peak = 3usize;
+        let peaks = self.new_u32_storage_buffer(selected_blob_point_capacity * peak_words_per_peak);
+        let sorted_peaks =
+            self.new_u32_storage_buffer(selected_blob_point_capacity * peak_words_per_peak);
+        let peak_extent_words_per_extent = 3usize;
+        let peak_extents = self
+            .new_u32_storage_buffer(selected_blob_point_capacity * peak_extent_words_per_extent);
+
+        let fitted_quad_words_per_quad = 15usize;
+        let max_quad_capacity_u32 = selected_blob_point_capacity_u32;
+        let max_quad_capacity = selected_blob_point_capacity;
+        let fitted_quads =
+            self.new_u32_storage_buffer(max_quad_capacity * fitted_quad_words_per_quad);
+        let quad_param_words_per_quad = 12usize;
+        let quad_params =
+            self.new_u32_storage_buffer(max_quad_capacity * quad_param_words_per_quad);
+        let bits_count_oversized = max_quad_capacity * 8usize * 8usize;
+        let bits = self.new_u32_storage_buffer(bits_count_oversized);
+
+        let control = self.new_u32_control_buffer(Self::CONTROL_WORD_COUNT);
+        let blob_sort_keys = self.new_u32_storage_buffer(blob_diff_total_points_capacity);
+        let blob_sorted_indices = self.new_u32_storage_buffer(blob_diff_total_points_capacity);
+        let blob_sort_storage = self
+            .sorter
+            .create_key_value_storage_buffer(blob_diff_total_points.max(1));
+
+        let selected_sort_keys = self.new_u32_storage_buffer(selected_blob_point_capacity);
+        let selected_sorted_indices = self.new_u32_storage_buffer(selected_blob_point_capacity);
+        let selected_sort_storage = self
+            .sorter
+            .create_key_value_storage_buffer(selected_blob_point_capacity_u32);
+
+        let peak_sort_keys = self.new_u32_storage_buffer(selected_blob_point_capacity);
+        let peak_sorted_indices = self.new_u32_storage_buffer(selected_blob_point_capacity);
+        let peak_sort_storage = self
+            .sorter
+            .create_key_value_storage_buffer(selected_blob_point_capacity_u32);
+
+        let readback_counters = self.device.create_buffer(
+            Self::CONTROL_COUNTER_WORD_COUNT,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemory::HostRandomAccess,
+        );
+        let readback_fitted_quads = self.device.create_buffer(
+            max_quad_capacity * fitted_quad_words_per_quad,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemory::HostRandomAccess,
+        );
+        let readback_bits = self.device.create_buffer(
+            bits_count_oversized,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemory::HostRandomAccess,
+        );
+
+        let timings = PipelineTimings::new(&self.device, 1024);
+
         let buffers = CachedDetectorBuffers {
             input_placeholder,
             decimated_image: decimated_image._keepalive.clone(),
@@ -2007,7 +2073,6 @@ impl Detector {
             readback_bits,
             _buffers: buffers,
             timings,
-            command_buffer,
         })
     }
 
