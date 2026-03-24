@@ -541,6 +541,28 @@ impl PipelineTimings {
         base
     }
 
+    fn record_commands<F>(
+        &mut self,
+        commands: &mut CommandRecorder<'_>,
+        name: &str,
+        start_stage: vk::PipelineStageFlags2,
+        end_stage: vk::PipelineStageFlags2,
+        record: F,
+    ) where
+        F: FnOnce(&mut CommandRecorder<'_>),
+    {
+        let start_query = self.allocate_queries(1);
+        let end_query = self.allocate_queries(1);
+        commands.write_timestamp(start_stage, &self.query_pool, start_query);
+        record(commands);
+        commands.write_timestamp(end_stage, &self.query_pool, end_query);
+        self.spans.push(TimedPass {
+            name: name.to_owned(),
+            start_query,
+            end_query,
+        });
+    }
+
     fn dispatch_with_push_constants<T: Pod + Copy>(
         &mut self,
         commands: &mut CommandRecorder<'_>,
@@ -550,24 +572,20 @@ impl PipelineTimings {
         push_constants: &T,
         dispatch: [u32; 3],
     ) {
-        let start_query = self.allocate_queries(1);
-        let end_query = self.allocate_queries(1);
-        commands.write_timestamp(
+        self.record_commands(
+            commands,
+            name,
             vk::PipelineStageFlags2::COMPUTE_SHADER,
-            &self.query_pool,
-            start_query,
-        );
-        commands.dispatch_with_push_constants(compute_pipeline, bindings, push_constants, dispatch);
-        commands.write_timestamp(
             vk::PipelineStageFlags2::COMPUTE_SHADER,
-            &self.query_pool,
-            end_query,
+            |commands| {
+                commands.dispatch_with_push_constants(
+                    compute_pipeline,
+                    bindings,
+                    push_constants,
+                    dispatch,
+                );
+            },
         );
-        self.spans.push(TimedPass {
-            name: name.to_owned(),
-            start_query,
-            end_query,
-        });
     }
 
     fn dispatch_indirect_with_push_constants<T: Pod + Copy>(
@@ -580,30 +598,21 @@ impl PipelineTimings {
         indirect_buffer: &GpuBuffer<u32>,
         indirect_offset: vk::DeviceSize,
     ) {
-        let start_query = self.allocate_queries(1);
-        let end_query = self.allocate_queries(1);
-        commands.write_timestamp(
+        self.record_commands(
+            commands,
+            name,
             vk::PipelineStageFlags2::COMPUTE_SHADER,
-            &self.query_pool,
-            start_query,
-        );
-        commands.dispatch_indirect_with_push_constants(
-            compute_pipeline,
-            bindings,
-            push_constants,
-            indirect_buffer,
-            indirect_offset,
-        );
-        commands.write_timestamp(
             vk::PipelineStageFlags2::COMPUTE_SHADER,
-            &self.query_pool,
-            end_query,
+            |commands| {
+                commands.dispatch_indirect_with_push_constants(
+                    compute_pipeline,
+                    bindings,
+                    push_constants,
+                    indirect_buffer,
+                    indirect_offset,
+                );
+            },
         );
-        self.spans.push(TimedPass {
-            name: name.to_owned(),
-            start_query,
-            end_query,
-        });
     }
 
     fn reserve_radix_sort_queries(&mut self, name_prefix: &str) -> u32 {
@@ -1037,17 +1046,52 @@ impl Detector {
         let mut timings = &mut cached.timings;
         self.device.run_commands(command_context, |commands| {
             timings.reset(commands);
-            commands.fill_buffer_u32_range(&control, 0, control.byte_size(), 0);
-            commands.fill_buffer_u32_range(&blob_extent, 0, blob_extent.byte_size(), 0);
-            commands.fill_buffer_u32_range(
+            self.fill_buffer_u32_range_recorded_timed(
+                &mut timings,
+                commands,
+                "setup-fill-control",
+                &control,
+                0,
+                control.byte_size(),
+                0,
+            );
+            self.fill_buffer_u32_range_recorded_timed(
+                &mut timings,
+                commands,
+                "setup-fill-blob-extent",
+                &blob_extent,
+                0,
+                blob_extent.byte_size(),
+                0,
+            );
+            self.fill_buffer_u32_range_recorded_timed(
+                &mut timings,
+                commands,
+                "setup-fill-filtered-blob-extent",
                 &filtered_blob_extent,
                 0,
                 filtered_blob_extent.byte_size(),
                 0,
             );
-            commands.fill_buffer_u32_range(&peak_extents, 0, peak_extents.byte_size(), 0);
-            commands.fill_buffer_u32_range(&fitted_quads, 0, fitted_quads.byte_size(), 0);
-            commands.barrier_transfer_write_to_compute_read();
+            self.fill_buffer_u32_range_recorded_timed(
+                &mut timings,
+                commands,
+                "setup-fill-peak-extents",
+                &peak_extents,
+                0,
+                peak_extents.byte_size(),
+                0,
+            );
+            self.fill_buffer_u32_range_recorded_timed(
+                &mut timings,
+                commands,
+                "setup-fill-fitted-quads",
+                &fitted_quads,
+                0,
+                fitted_quads.byte_size(),
+                0,
+            );
+            self.barrier_transfer_write_to_compute_read_recorded_timed(&mut timings, commands);
 
             if self.settings.decimate.is_some() {
                 let decimate_dispatch = dispatch_groups_2d(
@@ -1071,7 +1115,7 @@ impl Detector {
                     },
                     [decimate_dispatch[0], decimate_dispatch[1], 1],
                 );
-                commands.barrier_shader_write_to_shader_read();
+                self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
             }
 
             let minmax_dispatch = dispatch_groups_2d(
@@ -1095,7 +1139,7 @@ impl Detector {
                 },
                 [minmax_dispatch[0], minmax_dispatch[1], 1],
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1112,7 +1156,7 @@ impl Detector {
                 },
                 [minmax_dispatch[0], minmax_dispatch[1], 1],
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             let threshold_dispatch = dispatch_groups_2d(
                 thresholded_image.size.width,
@@ -1138,7 +1182,7 @@ impl Detector {
                 },
                 [threshold_dispatch[0], threshold_dispatch[1], 1],
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             let ccl_dispatch = dispatch_groups_2d(
                 thresholded_image.size.width / 2,
@@ -1157,7 +1201,7 @@ impl Detector {
                 },
                 [ccl_dispatch[0], ccl_dispatch[1], 1],
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1170,7 +1214,7 @@ impl Detector {
                 },
                 [ccl_dispatch[0], ccl_dispatch[1], 1],
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1183,7 +1227,7 @@ impl Detector {
                 },
                 [ccl_dispatch[0], ccl_dispatch[1], 1],
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1196,7 +1240,7 @@ impl Detector {
                 },
                 [ccl_dispatch[0], ccl_dispatch[1], 1],
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1213,7 +1257,7 @@ impl Detector {
                 },
                 [ccl_dispatch[0], ccl_dispatch[1], 1],
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1232,7 +1276,7 @@ impl Detector {
                 },
                 [threshold_dispatch[0], threshold_dispatch[1], 1],
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1253,7 +1297,7 @@ impl Detector {
                     1,
                 ],
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1267,8 +1311,8 @@ impl Detector {
                 },
                 [1, 1, 1],
             );
-            commands.barrier_shader_write_to_shader_read();
-            commands.barrier_shader_write_to_indirect_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
+            self.barrier_shader_write_to_indirect_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1289,7 +1333,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_BLOB_INIT_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             let secondary_blob_query = timings
                 .reserve_radix_sort_queries("radix-sort-blob-diff-points::secondary-key-sort");
@@ -1306,7 +1350,7 @@ impl Detector {
                 0,
                 Some((&timings.query_pool, secondary_blob_query)),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1327,7 +1371,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_BLOB_UPDATE_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             let primary_blob_query =
                 timings.reserve_radix_sort_queries("radix-sort-blob-diff-points::primary-key-sort");
@@ -1344,7 +1388,7 @@ impl Detector {
                 0,
                 Some((&timings.query_pool, primary_blob_query)),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1363,7 +1407,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_BLOB_GATHER_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1391,7 +1435,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_BUILD_BLOB_PAIR_EXTENTS_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1405,8 +1449,8 @@ impl Detector {
                 },
                 [1, 1, 1],
             );
-            commands.barrier_shader_write_to_shader_read();
-            commands.barrier_shader_write_to_indirect_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
+            self.barrier_shader_write_to_indirect_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1430,7 +1474,7 @@ impl Detector {
                     Self::CONTROL_DISPATCH_REWRITE_SELECTED_BLOB_POINTS_WORD,
                 ),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1451,7 +1495,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_SELECTED_INIT_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             let secondary_selected_query = timings
                 .reserve_radix_sort_queries("radix-sort-selected-blob-points::secondary-key-sort");
@@ -1468,7 +1512,7 @@ impl Detector {
                 0,
                 Some((&timings.query_pool, secondary_selected_query)),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1489,7 +1533,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_SELECTED_UPDATE_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             let primary_selected_query = timings
                 .reserve_radix_sort_queries("radix-sort-selected-blob-points::primary-key-sort");
@@ -1506,7 +1550,7 @@ impl Detector {
                 0,
                 Some((&timings.query_pool, primary_selected_query)),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1525,7 +1569,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_SELECTED_GATHER_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1546,7 +1590,7 @@ impl Detector {
                     Self::CONTROL_DISPATCH_REBUILD_FILTERED_EXTENT_STARTS_WORD,
                 ),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1569,7 +1613,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_BUILD_LINE_FIT_POINTS_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1592,7 +1636,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_FIT_LINE_PASS0_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1615,7 +1659,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_FIT_LINE_PASS1_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1638,7 +1682,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_FIT_LINE_PASS2_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1659,7 +1703,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_PEAKS_INIT_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             let secondary_peak_query =
                 timings.reserve_radix_sort_queries("radix-sort-peaks::secondary-key-sort");
@@ -1676,7 +1720,7 @@ impl Detector {
                 0,
                 Some((&timings.query_pool, secondary_peak_query)),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1697,7 +1741,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_PEAKS_UPDATE_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             let primary_peak_query =
                 timings.reserve_radix_sort_queries("radix-sort-peaks::primary-key-sort");
@@ -1714,7 +1758,7 @@ impl Detector {
                 0,
                 Some((&timings.query_pool, primary_peak_query)),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1733,7 +1777,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_RADIX_PEAKS_GATHER_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1752,7 +1796,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_BUILD_PEAK_EXTENTS_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1766,8 +1810,8 @@ impl Detector {
                 },
                 [1, 1, 1],
             );
-            commands.barrier_shader_write_to_shader_read();
-            commands.barrier_shader_write_to_indirect_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
+            self.barrier_shader_write_to_indirect_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1795,7 +1839,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_FIT_QUADS_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1809,8 +1853,8 @@ impl Detector {
                 },
                 [1, 1, 1],
             );
-            commands.barrier_shader_write_to_shader_read();
-            commands.barrier_shader_write_to_indirect_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
+            self.barrier_shader_write_to_indirect_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1833,7 +1877,7 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_PREPARE_DECODE_QUADS_WORD),
             );
-            commands.barrier_shader_write_to_shader_read();
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1858,22 +1902,37 @@ impl Detector {
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_EXTRACT_CANDIDATE_BITS_WORD),
             );
 
-            commands.barrier_shader_write_to_transfer_read();
-            commands.copy_buffer_region(
+            self.barrier_shader_write_to_transfer_read_recorded_timed(&mut timings, commands);
+            self.copy_buffer_region_recorded_timed(
+                &mut timings,
+                commands,
+                "readback-copy-control",
                 &control,
                 0,
                 &readback_counters,
                 0,
                 (Self::CONTROL_COUNTER_WORD_COUNT * std::mem::size_of::<u32>()) as vk::DeviceSize,
             );
-            commands.copy_buffer_region(
+            self.copy_buffer_region_recorded_timed(
+                &mut timings,
+                commands,
+                "readback-copy-fitted-quads",
                 &fitted_quads,
                 0,
                 &readback_fitted_quads,
                 0,
                 fitted_quads.byte_size(),
             );
-            commands.copy_buffer_region(&bits, 0, &readback_bits, 0, bits.byte_size());
+            self.copy_buffer_region_recorded_timed(
+                &mut timings,
+                commands,
+                "readback-copy-bits",
+                &bits,
+                0,
+                &readback_bits,
+                0,
+                bits.byte_size(),
+            );
         });
 
         let timing_report = cached.timings.summary(&self.device);
@@ -2394,6 +2453,113 @@ impl Detector {
             &push_constants,
             indirect_buffer,
             indirect_offset,
+        );
+    }
+
+    fn fill_buffer_u32_range_recorded_timed(
+        &self,
+        timings: &mut PipelineTimings,
+        commands: &mut CommandRecorder<'_>,
+        name: &str,
+        buffer: &GpuBuffer<u32>,
+        offset: vk::DeviceSize,
+        size: vk::DeviceSize,
+        value: u32,
+    ) {
+        timings.record_commands(
+            commands,
+            name,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::PipelineStageFlags2::TRANSFER,
+            |commands| {
+                commands.fill_buffer_u32_range(buffer, offset, size, value);
+            },
+        );
+    }
+
+    fn copy_buffer_region_recorded_timed<T: Pod + Copy>(
+        &self,
+        timings: &mut PipelineTimings,
+        commands: &mut CommandRecorder<'_>,
+        name: &str,
+        src: &GpuBuffer<T>,
+        src_offset: vk::DeviceSize,
+        dst: &GpuBuffer<T>,
+        dst_offset: vk::DeviceSize,
+        bytes: vk::DeviceSize,
+    ) {
+        timings.record_commands(
+            commands,
+            name,
+            vk::PipelineStageFlags2::TRANSFER,
+            vk::PipelineStageFlags2::TRANSFER,
+            |commands| {
+                commands.copy_buffer_region(src, src_offset, dst, dst_offset, bytes);
+            },
+        );
+    }
+
+    fn barrier_transfer_write_to_compute_read_recorded_timed(
+        &self,
+        timings: &mut PipelineTimings,
+        commands: &mut CommandRecorder<'_>,
+    ) {
+        timings.record_commands(
+            commands,
+            "barrier-transfer-write-to-compute-read",
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            |commands| {
+                commands.barrier_transfer_write_to_compute_read();
+            },
+        );
+    }
+
+    fn barrier_shader_write_to_shader_read_recorded_timed(
+        &self,
+        timings: &mut PipelineTimings,
+        commands: &mut CommandRecorder<'_>,
+    ) {
+        timings.record_commands(
+            commands,
+            "barrier-shader-write-to-shader-read",
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            |commands| {
+                commands.barrier_shader_write_to_shader_read();
+            },
+        );
+    }
+
+    fn barrier_shader_write_to_indirect_read_recorded_timed(
+        &self,
+        timings: &mut PipelineTimings,
+        commands: &mut CommandRecorder<'_>,
+    ) {
+        timings.record_commands(
+            commands,
+            "barrier-shader-write-to-indirect-read",
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            |commands| {
+                commands.barrier_shader_write_to_indirect_read();
+            },
+        );
+    }
+
+    fn barrier_shader_write_to_transfer_read_recorded_timed(
+        &self,
+        timings: &mut PipelineTimings,
+        commands: &mut CommandRecorder<'_>,
+    ) {
+        timings.record_commands(
+            commands,
+            "barrier-shader-write-to-transfer-read",
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            |commands| {
+                commands.barrier_shader_write_to_transfer_read();
+            },
         );
     }
 
