@@ -222,7 +222,14 @@ impl GpuTimingReport {
     fn recompute_totals(&mut self) {
         self.total_ms = self.spans.iter().map(|span| span.elapsed_ms).sum();
         self.cpu_total_ms = self.cpu_spans.iter().map(|span| span.elapsed_ms).sum();
-        self.end_to_end_ms = self.total_ms + self.cpu_total_ms;
+        // CPU spans include the blocking submit/wait interval, so summing CPU+GPU
+        // double-counts overlapped GPU work. Treat end-to-end as the timeline
+        // duration: CPU total when available, otherwise GPU total.
+        self.end_to_end_ms = if self.cpu_spans.is_empty() {
+            self.total_ms
+        } else {
+            self.cpu_total_ms
+        };
     }
 
     fn prepend_cpu_spans(&mut self, mut spans: Vec<CpuTimingSpan>) {
@@ -578,6 +585,8 @@ struct PipelineTimings {
     query_pool: crate::GpuQueryPool,
     next_query: u32,
     spans: Vec<TimedPass>,
+    total_start_query: Option<u32>,
+    total_end_query: Option<u32>,
 }
 
 impl PipelineTimings {
@@ -586,6 +595,8 @@ impl PipelineTimings {
             query_pool: device.create_timestamp_query_pool(query_capacity),
             next_query: 0,
             spans: Vec::new(),
+            total_start_query: None,
+            total_end_query: None,
         }
     }
 
@@ -593,6 +604,20 @@ impl PipelineTimings {
         commands.reset_query_pool(&self.query_pool, 0, self.query_pool.query_count());
         self.next_query = 0;
         self.spans.clear();
+        self.total_start_query = None;
+        self.total_end_query = None;
+    }
+
+    fn mark_gpu_work_begin(&mut self, commands: &mut CommandRecorder<'_>) {
+        let query = self.allocate_queries(1);
+        commands.write_timestamp(vk::PipelineStageFlags2::ALL_COMMANDS, &self.query_pool, query);
+        self.total_start_query = Some(query);
+    }
+
+    fn mark_gpu_work_end(&mut self, commands: &mut CommandRecorder<'_>) {
+        let query = self.allocate_queries(1);
+        commands.write_timestamp(vk::PipelineStageFlags2::ALL_COMMANDS, &self.query_pool, query);
+        self.total_end_query = Some(query);
     }
 
     fn allocate_queries(&mut self, count: u32) -> u32 {
@@ -717,6 +742,24 @@ impl PipelineTimings {
                 elapsed_ms,
             });
         }
+
+        if let (Some(start_query), Some(end_query)) = (self.total_start_query, self.total_end_query)
+        {
+            let start = timestamps[start_query as usize];
+            let end = timestamps[end_query as usize];
+            if end >= start {
+                let envelope_ms = ((end - start) as f64) * timestamp_period_ns / 1_000_000.0;
+                if envelope_ms > total_ms {
+                    let unattributed_ms = envelope_ms - total_ms;
+                    spans.push(GpuTimingSpan {
+                        name: "gpu-unattributed-between-spans".to_owned(),
+                        elapsed_ms: unattributed_ms,
+                    });
+                    total_ms += unattributed_ms;
+                }
+            }
+        }
+
         GpuTimingReport {
             spans,
             total_ms,
@@ -1154,6 +1197,7 @@ impl Detector {
         let mut timings = &mut cached.timings;
         self.device.run_commands(command_context, |commands| {
             timings.reset(commands);
+            timings.mark_gpu_work_begin(commands);
             self.fill_buffer_u32_range_recorded_timed(
                 &mut timings,
                 commands,
@@ -2058,6 +2102,7 @@ impl Detector {
                 0,
                 decoded_tags.byte_size(),
             );
+            timings.mark_gpu_work_end(commands);
         });
         cpu_timer.mark("cpu-submit-and-wait-gpu");
 
