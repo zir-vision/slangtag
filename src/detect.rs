@@ -1283,42 +1283,6 @@ impl Detector {
                 control.byte_size(),
                 0,
             );
-            self.fill_buffer_u32_range_recorded_timed(
-                &mut timings,
-                commands,
-                "setup-fill-blob-extent",
-                &blob_extent,
-                0,
-                blob_extent.byte_size(),
-                0,
-            );
-            self.fill_buffer_u32_range_recorded_timed(
-                &mut timings,
-                commands,
-                "setup-fill-filtered-blob-extent",
-                &filtered_blob_extent,
-                0,
-                filtered_blob_extent.byte_size(),
-                0,
-            );
-            self.fill_buffer_u32_range_recorded_timed(
-                &mut timings,
-                commands,
-                "setup-fill-peak-extents",
-                &peak_extents,
-                0,
-                peak_extents.byte_size(),
-                0,
-            );
-            self.fill_buffer_u32_range_recorded_timed(
-                &mut timings,
-                commands,
-                "setup-fill-fitted-quads",
-                &fitted_quads,
-                0,
-                fitted_quads.byte_size(),
-                0,
-            );
             self.barrier_transfer_write_to_compute_read_recorded_timed(&mut timings, commands);
 
             if self.settings.decimate.is_some() {
@@ -2230,8 +2194,14 @@ impl Detector {
             .readback_counters
             .read(Self::CONTROL_COUNTER_WORD_COUNT);
         cpu_timer.mark("cpu-readback-counters");
-        let decoded_tag_count_value = counters[Self::CONTROL_DECODED_TAG_COUNT_WORD as usize]
-            .min(cached.max_quad_capacity_u32);
+        let raw_decoded_tag_count = counters[Self::CONTROL_DECODED_TAG_COUNT_WORD as usize];
+        debug_assert!(
+            raw_decoded_tag_count <= cached.max_quad_capacity_u32,
+            "decoded tag count exceeded capacity: {} > {}",
+            raw_decoded_tag_count,
+            cached.max_quad_capacity_u32
+        );
+        let decoded_tag_count_value = raw_decoded_tag_count.min(cached.max_quad_capacity_u32);
         if decoded_tag_count_value == 0 {
             timing_report.prepend_cpu_spans(cpu_timer.into_spans());
             return DetectionOutput {
@@ -2320,8 +2290,8 @@ impl Detector {
             .new_u32_storage_buffer(selected_blob_point_capacity * peak_extent_words_per_extent);
 
         let fitted_quad_words_per_quad = 15usize;
-        let max_quad_capacity_u32 = selected_blob_point_capacity_u32;
-        let max_quad_capacity = selected_blob_point_capacity;
+        let max_quad_capacity_u32 = blob_diff_total_points.div_ceil(24).max(1);
+        let max_quad_capacity = usize::max(1, max_quad_capacity_u32 as usize);
         let fitted_quads =
             self.new_u32_storage_buffer(max_quad_capacity * fitted_quad_words_per_quad);
         let quad_param_words_per_quad = 12usize;
@@ -2338,12 +2308,13 @@ impl Detector {
             apriltag_lookup_words.push(entry.id);
             apriltag_lookup_words.push(entry.rotation as u32);
         }
-        let apriltag_lookup = self.device.create_buffer(
-            apriltag_lookup_words.len(),
+        let mut command_context = self.device.create_command_context();
+        let apriltag_lookup = self.device.upload_buffer(
+            &mut command_context,
+            &apriltag_lookup_words,
             ash::vk::BufferUsageFlags::STORAGE_BUFFER,
-            BufferMemory::HostSequentialWrite,
+            true,
         );
-        apriltag_lookup.write(&apriltag_lookup_words);
 
         let control = self.new_u32_control_buffer(Self::CONTROL_WORD_COUNT);
         let blob_sort_keys = self.new_u32_storage_buffer(blob_diff_total_points_capacity);
@@ -2968,7 +2939,7 @@ impl Detector {
             ash::vk::BufferUsageFlags::STORAGE_BUFFER
                 | ash::vk::BufferUsageFlags::TRANSFER_SRC
                 | ash::vk::BufferUsageFlags::TRANSFER_DST,
-            BufferMemory::HostSequentialWrite,
+            BufferMemory::DeviceLocal,
         );
         let mut command_context = self.device.create_command_context();
         self.device.fill_buffer_u32(&mut command_context, &buf, 0);

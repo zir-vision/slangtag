@@ -116,6 +116,10 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
     write_extent_word(extents_out, extent_index, kExtentStartingOffsetWord, extent.start);
     write_extent_word(extents_out, extent_index, kExtentCountWord, extent.count);
 
+    // This stage now relies on per-extent initialization instead of a full
+    // pre-pass clear of filtered_extents_out.
+    write_extent_word(filtered_extents_out, extent_index, kExtentCountWord, 0u);
+
     float extent_dot = blob_extent_dot_from_moments(
         extent.pxgx_plus_pygy_sum,
         extent.gx_sum,

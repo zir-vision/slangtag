@@ -1,5 +1,6 @@
-use ash::vk;
+use ash::vk::{self, Handle};
 use bytemuck::Pod;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
@@ -24,7 +25,7 @@ pub struct ComputeCommandContext {
     command_buffer: vk::CommandBuffer,
     submit_fence: vk::Fence,
     submission_in_flight: bool,
-    in_flight_descriptor_sets: Vec<vk::DescriptorSet>,
+    descriptor_set_cache: HashMap<DescriptorSetKey, vk::DescriptorSet>,
 }
 
 struct ComputeDeviceInner {
@@ -79,7 +80,12 @@ impl Drop for ComputeCommandContext {
             .expect("failed to lock submit path during command context drop");
         unsafe {
             let _ = self.inner.device.device_wait_idle();
-            if !self.in_flight_descriptor_sets.is_empty() {
+            if !self.descriptor_set_cache.is_empty() {
+                let descriptor_sets = self
+                    .descriptor_set_cache
+                    .values()
+                    .copied()
+                    .collect::<Vec<_>>();
                 let _pool_lock = self
                     .inner
                     .descriptor_pool_lock
@@ -87,7 +93,7 @@ impl Drop for ComputeCommandContext {
                     .expect("failed to lock descriptor pool during command context drop");
                 let _ = self.inner.device.free_descriptor_sets(
                     self.inner.descriptor_pool,
-                    &self.in_flight_descriptor_sets,
+                    &descriptor_sets,
                 );
             }
             self.inner.device.destroy_fence(self.submit_fence, None);
@@ -206,10 +212,23 @@ fn main_entry_name() -> &'static CStr {
     c"main"
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct DescriptorBindingKey {
+    binding_index: u32,
+    buffer: u64,
+    offset: vk::DeviceSize,
+    range: vk::DeviceSize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DescriptorSetKey {
+    bindings: Vec<DescriptorBindingKey>,
+}
+
 pub struct CommandRecorder<'a> {
     inner: &'a ComputeDeviceInner,
     command_buffer: vk::CommandBuffer,
-    descriptor_sets: Vec<vk::DescriptorSet>,
+    descriptor_set_cache: &'a mut HashMap<DescriptorSetKey, vk::DescriptorSet>,
 }
 
 impl<'a> CommandRecorder<'a> {
@@ -217,6 +236,21 @@ impl<'a> CommandRecorder<'a> {
         &mut self,
         bindings: &[(u32, DescriptorBuffer)],
     ) -> vk::DescriptorSet {
+        let descriptor_set_key = DescriptorSetKey {
+            bindings: bindings
+                .iter()
+                .map(|(binding_index, binding)| DescriptorBindingKey {
+                    binding_index: *binding_index,
+                    buffer: binding.buffer.as_raw(),
+                    offset: binding.offset,
+                    range: binding.range,
+                })
+                .collect(),
+        };
+        if let Some(cached_set) = self.descriptor_set_cache.get(&descriptor_set_key) {
+            return *cached_set;
+        }
+
         let descriptor_set = {
             let _pool_lock = self
                 .inner
@@ -234,7 +268,6 @@ impl<'a> CommandRecorder<'a> {
                     .expect("failed to allocate descriptor set")[0]
             }
         };
-        self.descriptor_sets.push(descriptor_set);
 
         let buffer_infos: Vec<_> = bindings
             .iter()
@@ -260,6 +293,8 @@ impl<'a> CommandRecorder<'a> {
             self.inner.device.update_descriptor_sets(&writes, &[]);
         }
 
+        self.descriptor_set_cache
+            .insert(descriptor_set_key, descriptor_set);
         descriptor_set
     }
 
@@ -636,47 +671,8 @@ impl<'a> CommandRecorder<'a> {
             indirect_buffer.raw.bytes
         );
 
-        let descriptor_set = {
-            let _pool_lock = self
-                .inner
-                .descriptor_pool_lock
-                .lock()
-                .expect("failed to lock descriptor pool");
-            let set_layouts = [self.inner.descriptor_set_layout];
-            let allocate_info = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(self.inner.descriptor_pool)
-                .set_layouts(&set_layouts);
-            unsafe {
-                self.inner
-                    .device
-                    .allocate_descriptor_sets(&allocate_info)
-                    .expect("failed to allocate descriptor set")[0]
-            }
-        };
-        self.descriptor_sets.push(descriptor_set);
-
-        let buffer_infos: Vec<_> = bindings
-            .iter()
-            .map(|(_, binding)| {
-                vk::DescriptorBufferInfo::default()
-                    .buffer(binding.buffer)
-                    .offset(binding.offset)
-                    .range(binding.range)
-            })
-            .collect();
-        let writes: Vec<_> = bindings
-            .iter()
-            .zip(buffer_infos.iter())
-            .map(|((binding_index, _), info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(descriptor_set)
-                    .dst_binding(*binding_index)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(info))
-            })
-            .collect();
+        let descriptor_set = self.allocate_and_write_descriptor_set(bindings);
         unsafe {
-            self.inner.device.update_descriptor_sets(&writes, &[]);
             self.inner.device.cmd_bind_pipeline(
                 self.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
@@ -740,7 +736,7 @@ impl ComputeCommandContext {
         let mut recorder = CommandRecorder {
             inner: self.inner.as_ref(),
             command_buffer: self.command_buffer,
-            descriptor_sets: Vec::new(),
+            descriptor_set_cache: &mut self.descriptor_set_cache,
         };
         record(&mut recorder);
 
@@ -760,7 +756,6 @@ impl ComputeCommandContext {
                 .expect("failed to submit command context buffer");
         }
 
-        self.in_flight_descriptor_sets = recorder.descriptor_sets;
         self.submission_in_flight = true;
     }
 
@@ -781,21 +776,6 @@ impl ComputeCommandContext {
                 .expect("failed to wait for command context fence");
         }
         self.submission_in_flight = false;
-
-        if !self.in_flight_descriptor_sets.is_empty() {
-            let _pool_lock = self
-                .inner
-                .descriptor_pool_lock
-                .lock()
-                .expect("failed to lock descriptor pool");
-            unsafe {
-                let _ = self.inner.device.free_descriptor_sets(
-                    self.inner.descriptor_pool,
-                    &self.in_flight_descriptor_sets,
-                );
-            }
-            self.in_flight_descriptor_sets.clear();
-        }
     }
 
     fn run_commands<F>(&mut self, record: F)
@@ -1011,7 +991,7 @@ impl ComputeDevice {
             command_buffer,
             submit_fence,
             submission_in_flight: false,
-            in_flight_descriptor_sets: Vec::new(),
+            descriptor_set_cache: HashMap::new(),
         }
     }
 
