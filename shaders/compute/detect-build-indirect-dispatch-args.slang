@@ -134,4 +134,9 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
         kControlDispatchExtractCandidateBitsWord,
         total_cells,
         one_d_local_size_x);
+    write_dispatch_1d(
+        control_out,
+        kControlDispatchDecodeFinalizeWord,
+        fitted_quad_count,
+        one_d_local_size_x);
 }

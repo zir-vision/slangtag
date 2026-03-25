@@ -3,6 +3,7 @@ use crate::sort::RadixSorter;
 use crate::{ComputeCommandContext, ComputeDevice, Size, compute_shader_path, include_u32};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
+#[cfg(test)]
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -34,6 +35,7 @@ static APRILTAG_36H11_ROTATED_CODES: LazyLock<Vec<RotatedTagCode>> = LazyLock::n
     rotated_codes
 });
 
+#[cfg(test)]
 static APRILTAG_36H11_EXACT_LOOKUP: LazyLock<HashMap<u64, (u32, u8)>> = LazyLock::new(|| {
     let mut by_code = HashMap::with_capacity(APRILTAG_36H11_ROTATED_CODES.len());
     for entry in APRILTAG_36H11_ROTATED_CODES.iter().copied() {
@@ -112,6 +114,8 @@ pub struct DecodeSettings {
     pub detect_inverted_marker: bool,
     /// Allowed erroneous border bit ratio (`0.0..=1.0` is typical).
     pub max_erroneous_border_bits_rate: f32,
+    /// If true, output includes reconstructed marker bit vectors.
+    pub return_raw_bits: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -139,9 +143,9 @@ pub struct DetectedTag {
     /// Quad corners in image pixel space, clockwise order.
     pub corners: [[f32; 2]; 4],
     /// Full marker bits including border cells.
-    pub bits_with_border: Vec<u8>,
+    pub bits_with_border: Option<Vec<u8>>,
     /// Payload bits only (border removed).
-    pub payload_bits: Vec<u8>,
+    pub payload_bits: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -270,10 +274,9 @@ pub struct Detector {
 
 struct CachedDetectorExecution {
     max_quad_capacity_u32: u32,
-    fitted_quad_words_per_quad: usize,
+    decoded_tag_words_per_tag: usize,
     readback_counters: GpuBuffer<u32>,
-    readback_fitted_quads: GpuBuffer<u32>,
-    readback_bits: GpuBuffer<u32>,
+    readback_decoded_tags: GpuBuffer<u32>,
     _buffers: CachedDetectorBuffers,
     timings: PipelineTimings,
 }
@@ -304,6 +307,8 @@ struct CachedDetectorBuffers {
     fitted_quads: GpuBuffer<u32>,
     quad_params: GpuBuffer<u32>,
     bits: GpuBuffer<u32>,
+    decoded_tags: GpuBuffer<u32>,
+    apriltag_lookup: GpuBuffer<u32>,
     control: GpuBuffer<u32>,
     blob_sort_keys: GpuBuffer<u32>,
     blob_sorted_indices: GpuBuffer<u32>,
@@ -340,6 +345,7 @@ struct DetectionPipelines {
     build_indirect_dispatch_args: Arc<ComputePipeline>,
     prepare_decode_quads: Arc<ComputePipeline>,
     extract_candidate_bits: Arc<ComputePipeline>,
+    decode_finalize_tags: Arc<ComputePipeline>,
 }
 
 impl DetectionPipelines {
@@ -443,6 +449,10 @@ impl DetectionPipelines {
                 device,
                 include_u32!(compute_shader_path!("decode-extract-candidate-bits")),
             ),
+            decode_finalize_tags: Detector::create_compute_pipeline(
+                device,
+                include_u32!(compute_shader_path!("decode-finalize-tags")),
+            ),
         }
     }
 }
@@ -518,6 +528,7 @@ impl Default for DecodeSettings {
             cell_span: 4,
             detect_inverted_marker: true,
             max_erroneous_border_bits_rate: 0.35,
+            return_raw_bits: false,
         }
     }
 }
@@ -863,6 +874,19 @@ struct BuildIndirectDispatchArgsPushConstants {
     marker_size_with_borders: u32,
 }
 
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone)]
+struct DecodeFinalizeTagsPushConstants {
+    marker_size_with_borders: u32,
+    marker_border_bits: u32,
+    apriltag_marker_size: u32,
+    detect_inverted_marker: u32,
+    max_border_errors: u32,
+    max_corrected_bits: u32,
+    lookup_entry_count: u32,
+    decoded_tag_capacity: u32,
+}
+
 #[derive(Clone)]
 struct GpuImageView {
     descriptor: DescriptorBuffer,
@@ -918,11 +942,6 @@ impl Detector {
     const ONE_D_LOCAL_SIZE_X: u32 = 256;
     const TWO_D_LOCAL_SIZE_X: u32 = 16;
     const TWO_D_LOCAL_SIZE_Y: u32 = 16;
-    const FITTED_QUAD_WORDS_PER_QUAD: usize = 15;
-    const FITTED_QUAD_BLOB_INDEX_WORD: usize = 0;
-    const FITTED_QUAD_REVERSED_BORDER_WORD: usize = 1;
-    const FITTED_QUAD_SCORE_WORD: usize = 2;
-    const FITTED_QUAD_CORNERS_START_WORD: usize = 3;
     const MARKER_SIZE_WITH_BORDERS: usize = 8;
     const MARKER_BORDER_BITS: usize = 1;
     const APRILTAG_MARKER_SIZE: usize =
@@ -935,6 +954,7 @@ impl Detector {
     const CONTROL_SELECTED_BLOB_POINT_COUNT_WORD: u32 = 3;
     const CONTROL_PEAK_EXTENT_COUNT_WORD: u32 = 4;
     const CONTROL_FITTED_QUAD_COUNT_WORD: u32 = 5;
+    const CONTROL_DECODED_TAG_COUNT_WORD: u32 = 6;
 
     const CONTROL_DISPATCH_BUILD_BLOB_PAIR_EXTENTS_WORD: u32 = 16;
     const CONTROL_DISPATCH_RADIX_BLOB_INIT_WORD: u32 = 19;
@@ -956,8 +976,21 @@ impl Detector {
     const CONTROL_DISPATCH_FIT_QUADS_WORD: u32 = 67;
     const CONTROL_DISPATCH_PREPARE_DECODE_QUADS_WORD: u32 = 70;
     const CONTROL_DISPATCH_EXTRACT_CANDIDATE_BITS_WORD: u32 = 73;
-    const CONTROL_WORD_COUNT: usize = 80;
-    const CONTROL_COUNTER_WORD_COUNT: usize = 6;
+    const CONTROL_DISPATCH_DECODE_FINALIZE_WORD: u32 = 76;
+    const CONTROL_WORD_COUNT: usize = 83;
+    const CONTROL_COUNTER_WORD_COUNT: usize = 7;
+    const DECODED_TAG_WORDS_PER_TAG: usize = 19;
+    const DECODED_TAG_QUAD_INDEX_WORD: usize = 0;
+    const DECODED_TAG_BLOB_INDEX_WORD: usize = 1;
+    const DECODED_TAG_REVERSED_BORDER_WORD: usize = 2;
+    const DECODED_TAG_SCORE_WORD: usize = 3;
+    const DECODED_TAG_CORNERS_START_WORD: usize = 4;
+    const DECODED_TAG_ID_WORD: usize = 12;
+    const DECODED_TAG_ROTATION_WORD: usize = 13;
+    const DECODED_TAG_PAYLOAD_LO_WORD: usize = 14;
+    const DECODED_TAG_PAYLOAD_HI_WORD: usize = 15;
+    const DECODED_TAG_BITS_LO_WORD: usize = 16;
+    const DECODED_TAG_BITS_HI_WORD: usize = 17;
 
     /// Creates a fixed-size detector with explicit settings and pre-built GPU cache.
     ///
@@ -1069,6 +1102,8 @@ impl Detector {
         let fitted_quads = cached._buffers.fitted_quads.clone();
         let quad_params = cached._buffers.quad_params.clone();
         let bits = cached._buffers.bits.clone();
+        let decoded_tags = cached._buffers.decoded_tags.clone();
+        let apriltag_lookup = cached._buffers.apriltag_lookup.clone();
         let control = cached._buffers.control.clone();
         let blob_sort_keys = cached._buffers.blob_sort_keys.clone();
         let blob_sorted_indices = cached._buffers.blob_sorted_indices.clone();
@@ -1080,8 +1115,7 @@ impl Detector {
         let peak_sorted_indices = cached._buffers.peak_sorted_indices.clone();
         let peak_sort_storage = cached._buffers.peak_sort_storage.clone();
         let readback_counters = cached.readback_counters.clone();
-        let readback_fitted_quads = cached.readback_fitted_quads.clone();
-        let readback_bits = cached.readback_bits.clone();
+        let readback_decoded_tags = cached.readback_decoded_tags.clone();
         let max_quad_capacity_u32 = cached.max_quad_capacity_u32;
 
         let control_blob_diff_filtered_desc =
@@ -1107,6 +1141,14 @@ impl Detector {
             blob_pair_filter.max_cluster_pixels_perimeter_scale
                 * (thresholded_image.size.width + thresholded_image.size.height),
         );
+        let max_border_errors = ((Self::APRILTAG_MARKER_SIZE * Self::APRILTAG_MARKER_SIZE) as f32
+            * self.settings.decode.max_erroneous_border_bits_rate)
+            .floor() as u32;
+        let max_corrected_bits = ((self.settings.apriltag.max_correction_bits as f32
+            * self.settings.apriltag.error_correction_rate)
+            .floor() as u32)
+            .min((Self::APRILTAG_MARKER_SIZE * Self::APRILTAG_MARKER_SIZE) as u32);
+        let lookup_entry_count = APRILTAG_36H11_ROTATED_CODES.len() as u32;
         cpu_timer.mark("cpu-prepare-run-cached-execution");
 
         let mut timings = &mut cached.timings;
@@ -1967,6 +2009,33 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_EXTRACT_CANDIDATE_BITS_WORD),
             );
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
+
+            self.dispatch_indirect_with_push_constants_recorded_timed(
+                &mut timings,
+                "decode-finalize-tags",
+                commands,
+                &self.pipelines.decode_finalize_tags,
+                &[
+                    (0, bits.descriptor()),
+                    (1, fitted_quads.descriptor()),
+                    (2, apriltag_lookup.descriptor()),
+                    (3, decoded_tags.descriptor()),
+                    (4, control.descriptor()),
+                ],
+                DecodeFinalizeTagsPushConstants {
+                    marker_size_with_borders: Self::MARKER_SIZE_WITH_BORDERS as u32,
+                    marker_border_bits: Self::MARKER_BORDER_BITS as u32,
+                    apriltag_marker_size: Self::APRILTAG_MARKER_SIZE as u32,
+                    detect_inverted_marker: u32::from(self.settings.decode.detect_inverted_marker),
+                    max_border_errors,
+                    max_corrected_bits,
+                    lookup_entry_count,
+                    decoded_tag_capacity: max_quad_capacity_u32,
+                },
+                &control,
+                Self::control_dispatch_offset(Self::CONTROL_DISPATCH_DECODE_FINALIZE_WORD),
+            );
 
             self.barrier_shader_write_to_transfer_read_recorded_timed(&mut timings, commands);
             self.copy_buffer_region_recorded_timed(
@@ -1982,22 +2051,12 @@ impl Detector {
             self.copy_buffer_region_recorded_timed(
                 &mut timings,
                 commands,
-                "readback-copy-fitted-quads",
-                &fitted_quads,
+                "readback-copy-decoded-tags",
+                &decoded_tags,
                 0,
-                &readback_fitted_quads,
+                &readback_decoded_tags,
                 0,
-                fitted_quads.byte_size(),
-            );
-            self.copy_buffer_region_recorded_timed(
-                &mut timings,
-                commands,
-                "readback-copy-bits",
-                &bits,
-                0,
-                &readback_bits,
-                0,
-                bits.byte_size(),
+                decoded_tags.byte_size(),
             );
         });
         cpu_timer.mark("cpu-submit-and-wait-gpu");
@@ -2008,9 +2067,9 @@ impl Detector {
             .readback_counters
             .read(Self::CONTROL_COUNTER_WORD_COUNT);
         cpu_timer.mark("cpu-readback-counters");
-        let fitted_quad_count_value = counters[Self::CONTROL_FITTED_QUAD_COUNT_WORD as usize]
+        let decoded_tag_count_value = counters[Self::CONTROL_DECODED_TAG_COUNT_WORD as usize]
             .min(cached.max_quad_capacity_u32);
-        if fitted_quad_count_value == 0 {
+        if decoded_tag_count_value == 0 {
             timing_report.prepend_cpu_spans(cpu_timer.into_spans());
             return DetectionOutput {
                 tags: Vec::new(),
@@ -2018,15 +2077,12 @@ impl Detector {
             };
         }
 
-        let fitted_quad_words = cached
-            .readback_fitted_quads
-            .read(fitted_quad_count_value as usize * cached.fitted_quad_words_per_quad);
-        let bits_words = cached
-            .readback_bits
-            .read(fitted_quad_count_value as usize * Self::MARKER_SIZE_WITH_BORDERS.pow(2));
-        cpu_timer.mark("cpu-readback-quads-and-bits");
+        let decoded_words = cached
+            .readback_decoded_tags
+            .read(decoded_tag_count_value as usize * cached.decoded_tag_words_per_tag);
+        cpu_timer.mark("cpu-readback-decoded-tags");
         let tags =
-            self.build_detected_tags(&fitted_quad_words, fitted_quad_count_value, &bits_words);
+            self.build_detected_tags_from_decoded_records(&decoded_words, decoded_tag_count_value);
         cpu_timer.mark("cpu-build-detected-tags");
         timing_report.prepend_cpu_spans(cpu_timer.into_spans());
         DetectionOutput {
@@ -2110,6 +2166,21 @@ impl Detector {
             self.new_u32_storage_buffer(max_quad_capacity * quad_param_words_per_quad);
         let bits_count_oversized = max_quad_capacity * 8usize * 8usize;
         let bits = self.new_u32_storage_buffer(bits_count_oversized);
+        let decoded_tags =
+            self.new_u32_storage_buffer(max_quad_capacity * Self::DECODED_TAG_WORDS_PER_TAG);
+        let mut apriltag_lookup_words = Vec::with_capacity(APRILTAG_36H11_ROTATED_CODES.len() * 4);
+        for entry in APRILTAG_36H11_ROTATED_CODES.iter().copied() {
+            apriltag_lookup_words.push((entry.code & 0xFFFF_FFFF) as u32);
+            apriltag_lookup_words.push((entry.code >> 32) as u32);
+            apriltag_lookup_words.push(entry.id);
+            apriltag_lookup_words.push(entry.rotation as u32);
+        }
+        let apriltag_lookup = self.device.create_buffer(
+            apriltag_lookup_words.len(),
+            ash::vk::BufferUsageFlags::STORAGE_BUFFER,
+            BufferMemory::HostSequentialWrite,
+        );
+        apriltag_lookup.write(&apriltag_lookup_words);
 
         let control = self.new_u32_control_buffer(Self::CONTROL_WORD_COUNT);
         let blob_sort_keys = self.new_u32_storage_buffer(blob_diff_total_points_capacity);
@@ -2135,13 +2206,8 @@ impl Detector {
             vk::BufferUsageFlags::TRANSFER_DST,
             BufferMemory::HostRandomAccess,
         );
-        let readback_fitted_quads = self.device.create_buffer(
-            max_quad_capacity * fitted_quad_words_per_quad,
-            vk::BufferUsageFlags::TRANSFER_DST,
-            BufferMemory::HostRandomAccess,
-        );
-        let readback_bits = self.device.create_buffer(
-            bits_count_oversized,
+        let readback_decoded_tags = self.device.create_buffer(
+            max_quad_capacity * Self::DECODED_TAG_WORDS_PER_TAG,
             vk::BufferUsageFlags::TRANSFER_DST,
             BufferMemory::HostRandomAccess,
         );
@@ -2173,6 +2239,8 @@ impl Detector {
             fitted_quads: fitted_quads.clone(),
             quad_params: quad_params.clone(),
             bits: bits.clone(),
+            decoded_tags: decoded_tags.clone(),
+            apriltag_lookup: apriltag_lookup.clone(),
             control: control.clone(),
             blob_sort_keys: blob_sort_keys.clone(),
             blob_sorted_indices: blob_sorted_indices.clone(),
@@ -2187,10 +2255,9 @@ impl Detector {
 
         Ok(CachedDetectorExecution {
             max_quad_capacity_u32,
-            fitted_quad_words_per_quad,
+            decoded_tag_words_per_tag: Self::DECODED_TAG_WORDS_PER_TAG,
             readback_counters,
-            readback_fitted_quads,
-            readback_bits,
+            readback_decoded_tags,
             _buffers: buffers,
             timings,
         })
@@ -2299,57 +2366,73 @@ impl Detector {
         Ok(())
     }
 
-    fn build_detected_tags(
+    fn build_detected_tags_from_decoded_records(
         &self,
-        fitted_quad_words: &[u32],
-        fitted_quad_count: u32,
-        bits_words: &[u32],
+        decoded_tag_words: &[u32],
+        decoded_tag_count: u32,
     ) -> Vec<DetectedTag> {
-        let cells_per_tag = Self::MARKER_SIZE_WITH_BORDERS * Self::MARKER_SIZE_WITH_BORDERS;
-
-        let mut tags = Vec::with_capacity(fitted_quad_count as usize);
-        for i in 0..(fitted_quad_count as usize) {
-            let base = i * Self::FITTED_QUAD_WORDS_PER_QUAD;
-            if base + Self::FITTED_QUAD_WORDS_PER_QUAD > fitted_quad_words.len() {
+        let mut tags = Vec::with_capacity(decoded_tag_count as usize);
+        for i in 0..decoded_tag_count as usize {
+            let base = i * Self::DECODED_TAG_WORDS_PER_TAG;
+            if base + Self::DECODED_TAG_WORDS_PER_TAG > decoded_tag_words.len() {
                 break;
             }
 
             let mut corners = [[0.0f32; 2]; 4];
             for (corner_idx, corner) in corners.iter_mut().enumerate() {
                 let x_word =
-                    fitted_quad_words[base + Self::FITTED_QUAD_CORNERS_START_WORD + corner_idx * 2];
-                let y_word = fitted_quad_words
-                    [base + Self::FITTED_QUAD_CORNERS_START_WORD + corner_idx * 2 + 1];
+                    decoded_tag_words[base + Self::DECODED_TAG_CORNERS_START_WORD + corner_idx * 2];
+                let y_word = decoded_tag_words
+                    [base + Self::DECODED_TAG_CORNERS_START_WORD + corner_idx * 2 + 1];
                 *corner = [f32::from_bits(x_word), f32::from_bits(y_word)];
             }
+            let rotation = decoded_tag_words[base + Self::DECODED_TAG_ROTATION_WORD] as usize;
 
-            let bits_base = i * cells_per_tag;
-            if bits_base + cells_per_tag > bits_words.len() {
-                continue;
-            }
-            let quad_bits_words = &bits_words[bits_base..(bits_base + cells_per_tag)];
-            let Some((id, rotation, bits_with_border, payload_bits)) =
-                self.decode_quad_candidate_bits(quad_bits_words)
-            else {
-                continue;
+            let (bits_with_border, payload_bits) = if self.settings.decode.return_raw_bits {
+                let bits = Self::unpack_bitset_64(
+                    decoded_tag_words[base + Self::DECODED_TAG_BITS_LO_WORD],
+                    decoded_tag_words[base + Self::DECODED_TAG_BITS_HI_WORD],
+                    Self::MARKER_SIZE_WITH_BORDERS * Self::MARKER_SIZE_WITH_BORDERS,
+                );
+                let payload = Self::unpack_bitset_64(
+                    decoded_tag_words[base + Self::DECODED_TAG_PAYLOAD_LO_WORD],
+                    decoded_tag_words[base + Self::DECODED_TAG_PAYLOAD_HI_WORD],
+                    Self::APRILTAG_MARKER_SIZE * Self::APRILTAG_MARKER_SIZE,
+                );
+                (Some(bits), Some(payload))
+            } else {
+                (None, None)
             };
 
             tags.push(DetectedTag {
-                quad_index: i as u32,
-                id: Some(id),
-                blob_index: fitted_quad_words[base + Self::FITTED_QUAD_BLOB_INDEX_WORD],
-                reversed_border: fitted_quad_words[base + Self::FITTED_QUAD_REVERSED_BORDER_WORD]
+                quad_index: decoded_tag_words[base + Self::DECODED_TAG_QUAD_INDEX_WORD],
+                id: Some(decoded_tag_words[base + Self::DECODED_TAG_ID_WORD]),
+                blob_index: decoded_tag_words[base + Self::DECODED_TAG_BLOB_INDEX_WORD],
+                reversed_border: decoded_tag_words[base + Self::DECODED_TAG_REVERSED_BORDER_WORD]
                     != 0,
-                score: f32::from_bits(fitted_quad_words[base + Self::FITTED_QUAD_SCORE_WORD]),
-                corners: Self::roll_corners(corners, rotation as usize),
+                score: f32::from_bits(decoded_tag_words[base + Self::DECODED_TAG_SCORE_WORD]),
+                corners: Self::roll_corners(corners, rotation),
                 bits_with_border,
                 payload_bits,
             });
         }
-
         tags
     }
 
+    fn unpack_bitset_64(lo: u32, hi: u32, count: usize) -> Vec<u8> {
+        let mut bits = Vec::with_capacity(count);
+        for idx in 0..count {
+            let value = if idx < 32 {
+                (lo >> idx) & 1
+            } else {
+                (hi >> (idx - 32)) & 1
+            };
+            bits.push(value as u8);
+        }
+        bits
+    }
+
+    #[cfg(test)]
     fn decode_quad_candidate_bits(
         &self,
         quad_bits_words: &[u32],
@@ -2385,6 +2468,7 @@ impl Detector {
         Some((id, rotation, candidate_bits, payload_bits))
     }
 
+    #[cfg(test)]
     fn get_border_errors(bits_with_border: &[u8]) -> usize {
         let size_with_borders = Self::MARKER_SIZE_WITH_BORDERS;
         let border_size = Self::MARKER_BORDER_BITS;
@@ -2412,6 +2496,7 @@ impl Detector {
         total
     }
 
+    #[cfg(test)]
     fn extract_payload_bits(bits_with_border: &[u8]) -> Vec<u8> {
         let marker_size_with_borders = Self::MARKER_SIZE_WITH_BORDERS;
         let marker_border_bits = Self::MARKER_BORDER_BITS;
@@ -2425,6 +2510,7 @@ impl Detector {
         payload_bits
     }
 
+    #[cfg(test)]
     fn bits_to_code(payload_bits: &[u8]) -> u64 {
         payload_bits
             .iter()
@@ -2438,6 +2524,7 @@ impl Detector {
             )
     }
 
+    #[cfg(test)]
     fn identify_apriltag_36h11(
         payload_code: u64,
         apriltag_settings: AprilTagSettings,
@@ -2750,7 +2837,7 @@ mod tests {
         .ok()
     }
 
-    fn tags_signature(tags: &[DetectedTag]) -> Vec<(Option<u32>, bool, Vec<u8>, [i32; 8])> {
+    fn tags_signature(tags: &[DetectedTag]) -> Vec<(Option<u32>, bool, Option<Vec<u8>>, [i32; 8])> {
         let mut signature = Vec::with_capacity(tags.len());
         for tag in tags {
             let mut corners = [0i32; 8];
@@ -2803,6 +2890,48 @@ mod tests {
                 .expect("detection failed on repeated run");
             let signature = tags_signature(&output.tags);
             assert_eq!(signature, baseline_signature);
+        }
+    }
+
+    #[test]
+    fn gpu_decode_matches_cpu_reference_for_returned_bits() {
+        let Some(detector) = maybe_detector() else {
+            return;
+        };
+        let size = Size::new(64, 64);
+        let gray_pixels = (0..size.total_pixels())
+            .map(|index| ((index * 37) % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let detector = Detector::new(
+            detector.device.clone(),
+            DetectionSettings {
+                decimate: Some(2),
+                decode: super::DecodeSettings {
+                    return_raw_bits: true,
+                    ..Default::default()
+                },
+                ..DetectionSettings::default()
+            },
+            size,
+        )
+        .expect("failed to build sized detector");
+        let mut command_context = detector.device.create_command_context();
+        let output = detector
+            .detect_gray(&mut command_context, &gray_pixels, size)
+            .expect("detection failed");
+
+        for tag in &output.tags {
+            let bits = tag
+                .bits_with_border
+                .as_ref()
+                .expect("raw bits should be present when return_raw_bits=true");
+            let words = bits
+                .iter()
+                .map(|&bit| u32::from(bit != 0))
+                .collect::<Vec<_>>();
+            let decoded = detector.decode_quad_candidate_bits(&words);
+            assert_eq!(decoded.map(|(id, _, _, _)| id), tag.id);
         }
     }
 

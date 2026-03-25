@@ -174,7 +174,10 @@ fn main() {
     for (name, avg_ms) in averaged_cpu_spans {
         println!("  {:<52} {}", name, colorize_ms(avg_ms, avg_cpu_ms));
     }
-    println!("  {:<52} {:>9.3} ms", "total timed cpu execution", avg_cpu_ms);
+    println!(
+        "  {:<52} {:>9.3} ms",
+        "total timed cpu execution", avg_cpu_ms
+    );
     println!(
         "  {:<52} {:>9.3} ms",
         "total timed cpu+gpu execution", avg_timed_ms

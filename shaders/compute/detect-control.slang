@@ -4,6 +4,7 @@ static const uint32_t kControlSelectedBlobExtentCountWord = 2u;
 static const uint32_t kControlSelectedBlobPointCountWord = 3u;
 static const uint32_t kControlPeakExtentCountWord = 4u;
 static const uint32_t kControlFittedQuadCountWord = 5u;
+static const uint32_t kControlDecodedTagCountWord = 6u;
 
 static const uint32_t kControlDispatchBuildBlobPairExtentsWord = 16u;
 static const uint32_t kControlDispatchRadixBlobInitWord = 19u;
@@ -25,6 +26,7 @@ static const uint32_t kControlDispatchBuildPeakExtentsWord = 64u;
 static const uint32_t kControlDispatchFitQuadsWord = 67u;
 static const uint32_t kControlDispatchPrepareDecodeQuadsWord = 70u;
 static const uint32_t kControlDispatchExtractCandidateBitsWord = 73u;
+static const uint32_t kControlDispatchDecodeFinalizeWord = 76u;
 
 [ForceInline]
 uint32_t detect_dispatch_groups_1d(uint32_t total_invocations, uint32_t local_size_x)

@@ -141,6 +141,7 @@ impl ViewerSettings {
                 cell_span: self.cell_span,
                 detect_inverted_marker: self.detect_inverted_marker,
                 max_erroneous_border_bits_rate: self.max_erroneous_border_bits_rate,
+                return_raw_bits: false,
             },
             apriltag: AprilTagSettings {
                 error_correction_rate: self.error_correction_rate,
