@@ -44,39 +44,24 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
     if (extent_index >= extent_count)
         return;
 
-    uint32_t selected_count = read_extent_word(filtered_extents, extent_index, kExtentCountWord);
-    if (selected_count == 0u)
+    BlobExtent selected_extent = read_blob_extent(filtered_extents, extent_index);
+    if (selected_extent.count == 0u)
         return;
 
-    uint32_t original_start = read_extent_word(extents_in, extent_index, kExtentStartingOffsetWord);
+    BlobExtent original_extent = read_blob_extent(extents_in, extent_index);
+    uint32_t original_start = original_extent.start;
     uint32_t local_offset = tid - original_start;
-    if (local_offset >= selected_count)
+    if (local_offset >= selected_extent.count)
         return;
 
-    uint32_t selected_start = read_extent_word(filtered_extents, extent_index, kExtentStartingOffsetWord);
-    uint32_t selected_index = selected_start + local_offset;
+    uint32_t selected_index = selected_extent.start + local_offset;
 
-    uint32_t x = read_blob_diff_point_word(sorted_points, tid, kPointXWord);
-    uint32_t y = read_blob_diff_point_word(sorted_points, tid, kPointYWord);
+    BlobDiffPoint source_point = read_blob_diff_point(sorted_points, tid);
 
-    write_selected_blob_point_word(
-        selected_points_out,
-        selected_index,
-        kSelectedPointBlobIndexWord,
-        extent_index);
-    write_selected_blob_point_word(
-        selected_points_out,
-        selected_index,
-        kSelectedPointThetaWord,
-        point_theta_from_extent(extents_in, extent_index, x, y));
-    write_selected_blob_point_word(
-        selected_points_out,
-        selected_index,
-        kSelectedPointXWord,
-        x);
-    write_selected_blob_point_word(
-        selected_points_out,
-        selected_index,
-        kSelectedPointYWord,
-        y);
+    SelectedBlobPoint selected_point;
+    selected_point.blob_index = extent_index;
+    selected_point.theta = point_theta_from_extent(extents_in, extent_index, source_point.x, source_point.y);
+    selected_point.x = source_point.x;
+    selected_point.y = source_point.y;
+    write_selected_blob_point(selected_points_out, selected_index, selected_point);
 }

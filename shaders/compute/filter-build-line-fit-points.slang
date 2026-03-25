@@ -23,6 +23,8 @@ ConstantBuffer<PushConstants> pc;
 [numthreads(256, 1, 1)]
 void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 {
+    static const int kOne = 1;
+
     uint tid = dispatch_thread_id.x;
     uint32_t extent_count = control[kControlBlobExtentCountWord];
     uint32_t point_count = control[kControlSelectedBlobPointCountWord];
@@ -30,36 +32,35 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
         return;
 
     uint32_t blob_index = tid;
-    uint32_t start = read_extent_word(filtered_extents, blob_index, kExtentStartingOffsetWord);
-    uint32_t count = read_extent_word(filtered_extents, blob_index, kExtentCountWord);
-    if (count == 0u)
+    BlobExtent extent = read_blob_extent(filtered_extents, blob_index);
+    if (extent.count == 0u)
         return;
 
-    int running_Mx = 0;
-    int running_My = 0;
-    int running_W = 0;
-    int64_t running_Mxx = 0;
-    int64_t running_Myy = 0;
-    int64_t running_Mxy = 0;
+    LineFitPoint running;
+    running.Mx = 0;
+    running.My = 0;
+    running.W = 0;
+    running.blob_index = blob_index;
+    running.Mxx = 0;
+    running.Myy = 0;
+    running.Mxy = 0;
 
-    for (uint32_t local_index = 0u; local_index < count; ++local_index)
+    for (uint32_t local_index = 0u; local_index < extent.count; ++local_index)
     {
-        uint32_t i = start + local_index;
+        uint32_t i = extent.start + local_index;
         if (i >= point_count)
             return;
 
-        uint32_t point_blob_index = read_selected_blob_point_word(sorted_selected_points, i, kSelectedPointBlobIndexWord);
-        uint32_t x = read_selected_blob_point_word(sorted_selected_points, i, kSelectedPointXWord);
-        uint32_t y = read_selected_blob_point_word(sorted_selected_points, i, kSelectedPointYWord);
+        SelectedBlobPoint point = read_selected_blob_point(sorted_selected_points, i);
 
         // Keep line-fit moments in fixed x2 coordinates (2*x+1) regardless of decimation.
         // Decimation-to-fullres scaling is handled later in fit-quads.
-        int ix2 = int(x) * 2 + 1;
-        int iy2 = int(y) * 2 + 1;
+        int ix2 = int(point.x) * 2 + 1;
+        int iy2 = int(point.y) * 2 + 1;
         int ix = ix2 / 2;
         int iy = iy2 / 2;
 
-        int W = 1;
+        int W = kOne;
         if (ix > 0 && uint32_t(ix + 1) < pc.decimated_size.width && iy > 0 && uint32_t(iy + 1) < pc.decimated_size.height)
         {
             int grad_x = int(image_u8_read(decimated_image, pc.decimated_size, uint2(uint32_t(ix + 1), uint32_t(iy))))
@@ -67,31 +68,16 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
             int grad_y = int(image_u8_read(decimated_image, pc.decimated_size, uint2(uint32_t(ix), uint32_t(iy + 1))))
                 - int(image_u8_read(decimated_image, pc.decimated_size, uint2(uint32_t(ix), uint32_t(iy - 1))));
 
-            W = int(sqrt(float(grad_x * grad_x + grad_y * grad_y))) + 1;
+            W = int(sqrt(float(grad_x * grad_x + grad_y * grad_y))) + kOne;
         }
 
-        int point_Mx = W * ix2;
-        int point_My = W * iy2;
-        int64_t point_Mxx = int64_t(W) * int64_t(ix2) * int64_t(ix2);
-        int64_t point_Mxy = int64_t(W) * int64_t(ix2) * int64_t(iy2);
-        int64_t point_Myy = int64_t(W) * int64_t(iy2) * int64_t(iy2);
+        running.Mx += W * ix2;
+        running.My += W * iy2;
+        running.W += W;
+        running.Mxx += int64_t(W) * int64_t(ix2) * int64_t(ix2);
+        running.Mxy += int64_t(W) * int64_t(ix2) * int64_t(iy2);
+        running.Myy += int64_t(W) * int64_t(iy2) * int64_t(iy2);
 
-        running_Mx += point_Mx;
-        running_My += point_My;
-        running_W += W;
-        running_Mxx += point_Mxx;
-        running_Myy += point_Myy;
-        running_Mxy += point_Mxy;
-
-        write_line_fit_point(
-            line_fit_points_out,
-            i,
-            running_Mx,
-            running_My,
-            running_W,
-            point_blob_index,
-            running_Mxx,
-            running_Myy,
-            running_Mxy);
+        write_line_fit_point(line_fit_points_out, i, running);
     }
 }

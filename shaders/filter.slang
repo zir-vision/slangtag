@@ -64,6 +64,55 @@ static const uint32_t kFittedQuadCornerIndex1Word = 12u;
 static const uint32_t kFittedQuadCornerIndex2Word = 13u;
 static const uint32_t kFittedQuadCornerIndex3Word = 14u;
 
+struct BlobDiffPoint
+{
+    uint32_t rep0;
+    uint32_t rep1;
+    uint32_t x;
+    uint32_t y;
+    uint32_t dxy;
+    uint32_t black_to_white;
+};
+
+struct BlobExtent
+{
+    uint32_t min_x;
+    uint32_t max_x;
+    uint32_t min_y;
+    uint32_t max_y;
+    uint32_t start;
+    uint32_t count;
+    int pxgx_plus_pygy_sum;
+    int gx_sum;
+    int gy_sum;
+};
+
+struct SelectedBlobPoint
+{
+    uint32_t blob_index;
+    uint32_t theta;
+    uint32_t x;
+    uint32_t y;
+};
+
+struct LineFitPoint
+{
+    int Mx;
+    int My;
+    int W;
+    uint32_t blob_index;
+    int64_t Mxx;
+    int64_t Myy;
+    int64_t Mxy;
+};
+
+struct PeakPoint
+{
+    uint32_t blob_index;
+    uint32_t error;
+    uint32_t point_index;
+};
+
 [ForceInline]
 uint32_t read_blob_diff_point_word(StructuredBuffer<uint32_t> points, uint32_t point_index, uint32_t word_index)
 {
@@ -71,9 +120,38 @@ uint32_t read_blob_diff_point_word(StructuredBuffer<uint32_t> points, uint32_t p
 }
 
 [ForceInline]
+BlobDiffPoint read_blob_diff_point(StructuredBuffer<uint32_t> points, uint32_t point_index)
+{
+    BlobDiffPoint point;
+    point.rep0 = read_blob_diff_point_word(points, point_index, kPointRep0Word);
+    point.rep1 = read_blob_diff_point_word(points, point_index, kPointRep1Word);
+    point.x = read_blob_diff_point_word(points, point_index, kPointXWord);
+    point.y = read_blob_diff_point_word(points, point_index, kPointYWord);
+    point.dxy = read_blob_diff_point_word(points, point_index, kPointDxyWord);
+    point.black_to_white = read_blob_diff_point_word(points, point_index, kPointBlackToWhiteWord);
+    return point;
+}
+
+[ForceInline]
 uint32_t read_extent_word<T : IArray<uint32_t>>(T extents, uint32_t extent_index, uint32_t word_index)
 {
     return extents[extent_index * kBlobExtentWordsPerExtent + word_index];
+}
+
+[ForceInline]
+BlobExtent read_blob_extent<T : IArray<uint32_t>>(T extents, uint32_t extent_index)
+{
+    BlobExtent extent;
+    extent.min_x = read_extent_word(extents, extent_index, kExtentMinXWord);
+    extent.max_x = read_extent_word(extents, extent_index, kExtentMaxXWord);
+    extent.min_y = read_extent_word(extents, extent_index, kExtentMinYWord);
+    extent.max_y = read_extent_word(extents, extent_index, kExtentMaxYWord);
+    extent.start = read_extent_word(extents, extent_index, kExtentStartingOffsetWord);
+    extent.count = read_extent_word(extents, extent_index, kExtentCountWord);
+    extent.pxgx_plus_pygy_sum = asint(read_extent_word(extents, extent_index, kExtentPxGxPyGySumWord));
+    extent.gx_sum = asint(read_extent_word(extents, extent_index, kExtentGxSumWord));
+    extent.gy_sum = asint(read_extent_word(extents, extent_index, kExtentGySumWord));
+    return extent;
 }
 
 void dxy_to_gradient(uint32_t dxy, out int gx, out int gy)
@@ -116,9 +194,29 @@ void write_selected_blob_point_word(RWStructuredBuffer<uint32_t> points, uint32_
 }
 
 [ForceInline]
+void write_selected_blob_point(RWStructuredBuffer<uint32_t> points, uint32_t point_index, SelectedBlobPoint point)
+{
+    write_selected_blob_point_word(points, point_index, kSelectedPointBlobIndexWord, point.blob_index);
+    write_selected_blob_point_word(points, point_index, kSelectedPointThetaWord, point.theta);
+    write_selected_blob_point_word(points, point_index, kSelectedPointXWord, point.x);
+    write_selected_blob_point_word(points, point_index, kSelectedPointYWord, point.y);
+}
+
+[ForceInline]
 uint32_t read_selected_blob_point_word(StructuredBuffer<uint32_t> points, uint32_t point_index, uint32_t word_index)
 {
     return points[point_index * kSelectedBlobPointWordsPerPoint + word_index];
+}
+
+[ForceInline]
+SelectedBlobPoint read_selected_blob_point(StructuredBuffer<uint32_t> points, uint32_t point_index)
+{
+    SelectedBlobPoint point;
+    point.blob_index = read_selected_blob_point_word(points, point_index, kSelectedPointBlobIndexWord);
+    point.theta = read_selected_blob_point_word(points, point_index, kSelectedPointThetaWord);
+    point.x = read_selected_blob_point_word(points, point_index, kSelectedPointXWord);
+    point.y = read_selected_blob_point_word(points, point_index, kSelectedPointYWord);
+    return point;
 }
 
 [ForceInline]
@@ -143,6 +241,14 @@ void write_peak_word(RWStructuredBuffer<uint32_t> peaks, uint32_t peak_index, ui
 uint32_t read_peak_word(StructuredBuffer<uint32_t> peaks, uint32_t peak_index, uint32_t word_index)
 {
     return peaks[peak_index * kPeakWordsPerPeak + word_index];
+}
+
+[ForceInline]
+void write_peak(RWStructuredBuffer<uint32_t> peaks, uint32_t peak_index, PeakPoint peak)
+{
+    write_peak_word(peaks, peak_index, kPeakBlobIndexWord, peak.blob_index);
+    write_peak_word(peaks, peak_index, kPeakErrorWord, peak.error);
+    write_peak_word(peaks, peak_index, kPeakPointIndexWord, peak.point_index);
 }
 
 [ForceInline]
@@ -298,6 +404,21 @@ void write_line_fit_point(
     write_int64_words(line_fit_points, point_word_index + kLineFitMxyLoWord, Mxy);
 }
 
+[ForceInline]
+void write_line_fit_point(RWStructuredBuffer<uint32_t> line_fit_points, uint32_t point_index, LineFitPoint point)
+{
+    write_line_fit_point(
+        line_fit_points,
+        point_index,
+        point.Mx,
+        point.My,
+        point.W,
+        point.blob_index,
+        point.Mxx,
+        point.Myy,
+        point.Mxy);
+}
+
 void read_line_fit_point(
     StructuredBuffer<uint32_t> line_fit_points,
     uint32_t point_index,
@@ -317,6 +438,23 @@ void read_line_fit_point(
     Mxx = read_int64_words(line_fit_points, point_word_index + kLineFitMxxLoWord);
     Myy = read_int64_words(line_fit_points, point_word_index + kLineFitMyyLoWord);
     Mxy = read_int64_words(line_fit_points, point_word_index + kLineFitMxyLoWord);
+}
+
+[ForceInline]
+LineFitPoint read_line_fit_point(StructuredBuffer<uint32_t> line_fit_points, uint32_t point_index)
+{
+    LineFitPoint point;
+    read_line_fit_point(
+        line_fit_points,
+        point_index,
+        point.Mx,
+        point.My,
+        point.W,
+        point.blob_index,
+        point.Mxx,
+        point.Myy,
+        point.Mxy);
+    return point;
 }
 
 float fit_line_error(int N, int Mx, int My, int64_t Mxx, int64_t Myy, int64_t Mxy, int W)

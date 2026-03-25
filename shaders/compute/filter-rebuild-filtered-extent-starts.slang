@@ -24,20 +24,19 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
     if (tid >= point_count)
         return;
 
-    uint32_t blob_index =
-        read_selected_blob_point_word(sorted_selected_points, tid, kSelectedPointBlobIndexWord);
+    SelectedBlobPoint point = read_selected_blob_point(sorted_selected_points, tid);
+    uint32_t blob_index = point.blob_index;
     if (blob_index >= extent_count)
         return;
 
     if (tid > 0u)
     {
-        uint32_t previous_blob_index = read_selected_blob_point_word(
-            sorted_selected_points, tid - 1u, kSelectedPointBlobIndexWord);
+        uint32_t previous_blob_index = read_selected_blob_point(sorted_selected_points, tid - 1u).blob_index;
         if (previous_blob_index == blob_index)
             return;
     }
 
-    if (read_extent_word(filtered_extents, blob_index, kExtentCountWord) == 0u)
+    if (read_blob_extent(filtered_extents, blob_index).count == 0u)
         return;
 
     write_extent_word(filtered_extents, blob_index, kExtentStartingOffsetWord, tid);
