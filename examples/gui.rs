@@ -4,8 +4,8 @@ use image::GrayImage;
 use slangtag::{
     ComputeCommandContext, ComputeDevice, Size,
     detect::{
-        AprilTagSettings, BlobPairFilterSettings, DecodeSettings, DetectedTag, DetectionSettings,
-        Detector, QuadFitSettings,
+        AprilTagSettings, BlobPairFilterSettings, CornerRefineSettings, DecodeSettings,
+        DetectedTag, DetectionSettings, Detector, QuadFitSettings,
     },
     gpu::GpuBuffer,
 };
@@ -70,6 +70,7 @@ struct ViewerSettings {
     max_nmaxima: u32,
     max_line_fit_mse: f32,
     cos_critical_rad: f32,
+    corner_refine_enabled: bool,
     cell_size: u32,
     min_stddev_otsu: f32,
     cell_margin_pixels: u32,
@@ -100,6 +101,7 @@ impl Default for ViewerSettings {
             max_nmaxima: defaults.quad_fit.max_nmaxima,
             max_line_fit_mse: defaults.quad_fit.max_line_fit_mse,
             cos_critical_rad: defaults.quad_fit.cos_critical_rad,
+            corner_refine_enabled: defaults.quad_fit.corner_refine.enabled,
             cell_size: defaults.decode.cell_size,
             min_stddev_otsu: defaults.decode.min_stddev_otsu,
             cell_margin_pixels: defaults.decode.cell_margin_pixels,
@@ -133,6 +135,11 @@ impl ViewerSettings {
                 max_nmaxima: self.max_nmaxima,
                 max_line_fit_mse: self.max_line_fit_mse,
                 cos_critical_rad: self.cos_critical_rad,
+                corner_refine: CornerRefineSettings {
+                    enabled: self.corner_refine_enabled,
+                    ..CornerRefineSettings::default()
+                },
+                ..QuadFitSettings::default()
             },
             decode: DecodeSettings {
                 cell_size: self.cell_size,
@@ -421,6 +428,12 @@ impl ViewerApp {
             .add(
                 egui::Slider::new(&mut self.settings.cos_critical_rad, 0.0..=1.0)
                     .text("cos_critical_rad"),
+            )
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.corner_refine_enabled,
+                "enable_corner_refine",
             )
             .changed();
 

@@ -27,6 +27,7 @@ static const uint32_t kControlDispatchFitQuadsWord = 67u;
 static const uint32_t kControlDispatchPrepareDecodeQuadsWord = 70u;
 static const uint32_t kControlDispatchExtractCandidateBitsWord = 73u;
 static const uint32_t kControlDispatchDecodeFinalizeWord = 76u;
+static const uint32_t kControlDispatchDecodeRefineCornersWord = 79u;
 
 [ForceInline]
 uint32_t detect_dispatch_groups_1d(uint32_t total_invocations, uint32_t local_size_x)

@@ -97,6 +97,25 @@ pub struct QuadFitSettings {
     pub max_line_fit_mse: f32,
     /// Corner cosine threshold in radians domain.
     pub cos_critical_rad: f32,
+    /// Post-decode corner refinement parameters.
+    pub corner_refine: CornerRefineSettings,
+}
+
+#[derive(Clone, Copy)]
+/// Apriltag2-style post-decode corner refinement controls.
+pub struct CornerRefineSettings {
+    /// Enable post-decode corner refinement on GPU.
+    pub enabled: bool,
+    /// Number of iterative line-refit passes.
+    pub max_iterations: u32,
+    /// Number of samples along each edge per iteration.
+    pub samples_per_edge: u32,
+    /// Search distance in pixels along edge normal for strongest gradient.
+    pub search_radius_px: f32,
+    /// Minimum gradient magnitude required for a sample to contribute.
+    pub min_gradient: f32,
+    /// Minimum determinant threshold for line/corner intersection solves.
+    pub min_det: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -350,9 +369,11 @@ struct DetectionPipelines {
     build_peak_extents: Arc<ComputePipeline>,
     fit_quads: Arc<ComputePipeline>,
     build_indirect_dispatch_args: Arc<ComputePipeline>,
+    build_post_decode_dispatch_args: Arc<ComputePipeline>,
     prepare_decode_quads: Arc<ComputePipeline>,
     extract_candidate_bits: Arc<ComputePipeline>,
     decode_finalize_tags: Arc<ComputePipeline>,
+    decode_refine_corners: Arc<ComputePipeline>,
 }
 
 impl DetectionPipelines {
@@ -448,6 +469,12 @@ impl DetectionPipelines {
                 device,
                 include_u32!(compute_shader_path!("detect-build-indirect-dispatch-args")),
             ),
+            build_post_decode_dispatch_args: Detector::create_compute_pipeline(
+                device,
+                include_u32!(compute_shader_path!(
+                    "detect-build-post-decode-dispatch-args"
+                )),
+            ),
             prepare_decode_quads: Detector::create_compute_pipeline(
                 device,
                 include_u32!(compute_shader_path!("decode-prepare-decode-quads")),
@@ -459,6 +486,10 @@ impl DetectionPipelines {
             decode_finalize_tags: Detector::create_compute_pipeline(
                 device,
                 include_u32!(compute_shader_path!("decode-finalize-tags")),
+            ),
+            decode_refine_corners: Detector::create_compute_pipeline(
+                device,
+                include_u32!(compute_shader_path!("decode-refine-corners")),
             ),
         }
     }
@@ -487,6 +518,8 @@ impl DetectionSettings {
         };
         settings.quad_fit.max_nmaxima = 8;
         settings.quad_fit.max_line_fit_mse = 14.0;
+        settings.quad_fit.corner_refine.max_iterations = 1;
+        settings.quad_fit.corner_refine.samples_per_edge = 6;
         settings
     }
 
@@ -497,6 +530,9 @@ impl DetectionSettings {
             ..Self::default()
         };
         settings.quad_fit.max_line_fit_mse = 8.0;
+        settings.quad_fit.corner_refine.max_iterations = 3;
+        settings.quad_fit.corner_refine.samples_per_edge = 10;
+        settings.quad_fit.corner_refine.search_radius_px = 2.5;
         settings.decode.min_stddev_otsu = 4.0;
         settings
     }
@@ -522,6 +558,20 @@ impl Default for QuadFitSettings {
             max_nmaxima: 10,
             max_line_fit_mse: 10.0,
             cos_critical_rad: 0.984_807_73,
+            corner_refine: CornerRefineSettings::default(),
+        }
+    }
+}
+
+impl Default for CornerRefineSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_iterations: 2,
+            samples_per_edge: 8,
+            search_radius_px: 2.0,
+            min_gradient: 8.0,
+            min_det: 1e-3,
         }
     }
 }
@@ -610,13 +660,21 @@ impl PipelineTimings {
 
     fn mark_gpu_work_begin(&mut self, commands: &mut CommandRecorder<'_>) {
         let query = self.allocate_queries(1);
-        commands.write_timestamp(vk::PipelineStageFlags2::ALL_COMMANDS, &self.query_pool, query);
+        commands.write_timestamp(
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            &self.query_pool,
+            query,
+        );
         self.total_start_query = Some(query);
     }
 
     fn mark_gpu_work_end(&mut self, commands: &mut CommandRecorder<'_>) {
         let query = self.allocate_queries(1);
-        commands.write_timestamp(vk::PipelineStageFlags2::ALL_COMMANDS, &self.query_pool, query);
+        commands.write_timestamp(
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            &self.query_pool,
+            query,
+        );
         self.total_end_query = Some(query);
     }
 
@@ -919,6 +977,12 @@ struct BuildIndirectDispatchArgsPushConstants {
 
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone)]
+struct BuildPostDecodeDispatchArgsPushConstants {
+    one_d_local_size_x: u32,
+}
+
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone)]
 struct DecodeFinalizeTagsPushConstants {
     marker_size_with_borders: u32,
     marker_border_bits: u32,
@@ -928,6 +992,17 @@ struct DecodeFinalizeTagsPushConstants {
     max_corrected_bits: u32,
     lookup_entry_count: u32,
     decoded_tag_capacity: u32,
+}
+
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone)]
+struct DecodeRefineCornersPushConstants {
+    image_size: Size,
+    max_iterations: u32,
+    samples_per_edge: u32,
+    search_radius_px: f32,
+    min_gradient: f32,
+    min_det: f32,
 }
 
 #[derive(Clone)]
@@ -1020,7 +1095,8 @@ impl Detector {
     const CONTROL_DISPATCH_PREPARE_DECODE_QUADS_WORD: u32 = 70;
     const CONTROL_DISPATCH_EXTRACT_CANDIDATE_BITS_WORD: u32 = 73;
     const CONTROL_DISPATCH_DECODE_FINALIZE_WORD: u32 = 76;
-    const CONTROL_WORD_COUNT: usize = 83;
+    const CONTROL_DISPATCH_DECODE_REFINE_CORNERS_WORD: u32 = 79;
+    const CONTROL_WORD_COUNT: usize = 86;
     const CONTROL_COUNTER_WORD_COUNT: usize = 7;
     const DECODED_TAG_WORDS_PER_TAG: usize = 19;
     const DECODED_TAG_QUAD_INDEX_WORD: usize = 0;
@@ -2080,6 +2156,48 @@ impl Detector {
                 &control,
                 Self::control_dispatch_offset(Self::CONTROL_DISPATCH_DECODE_FINALIZE_WORD),
             );
+            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
+
+            if self.settings.quad_fit.corner_refine.enabled {
+                let corner_refine = self.settings.quad_fit.corner_refine;
+                self.dispatch_with_push_constants_recorded_timed(
+                    &mut timings,
+                    "detect-build-post-decode-dispatch-args",
+                    commands,
+                    &self.pipelines.build_post_decode_dispatch_args,
+                    &[(0, control.descriptor()), (1, control.descriptor())],
+                    BuildPostDecodeDispatchArgsPushConstants {
+                        one_d_local_size_x: Self::ONE_D_LOCAL_SIZE_X,
+                    },
+                    [1, 1, 1],
+                );
+                self.barrier_shader_write_to_indirect_read_recorded_timed(&mut timings, commands);
+
+                self.dispatch_indirect_with_push_constants_recorded_timed(
+                    &mut timings,
+                    "decode-refine-corners",
+                    commands,
+                    &self.pipelines.decode_refine_corners,
+                    &[
+                        (0, input_gpu_image.descriptor),
+                        (1, decoded_tags.descriptor()),
+                        (2, control.descriptor()),
+                    ],
+                    DecodeRefineCornersPushConstants {
+                        image_size: input_gpu_image.size,
+                        max_iterations: corner_refine.max_iterations,
+                        samples_per_edge: corner_refine.samples_per_edge,
+                        search_radius_px: corner_refine.search_radius_px,
+                        min_gradient: corner_refine.min_gradient,
+                        min_det: corner_refine.min_det,
+                    },
+                    &control,
+                    Self::control_dispatch_offset(
+                        Self::CONTROL_DISPATCH_DECODE_REFINE_CORNERS_WORD,
+                    ),
+                );
+                self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
+            }
 
             self.barrier_shader_write_to_transfer_read_recorded_timed(&mut timings, commands);
             self.copy_buffer_region_recorded_timed(
@@ -2404,6 +2522,24 @@ impl Detector {
                 .blob_pair_filter
                 .max_cluster_pixels_perimeter_scale
                 == 0
+            || self.settings.quad_fit.corner_refine.max_iterations == 0
+            || self.settings.quad_fit.corner_refine.samples_per_edge < 2
+            || !self
+                .settings
+                .quad_fit
+                .corner_refine
+                .search_radius_px
+                .is_finite()
+            || self.settings.quad_fit.corner_refine.search_radius_px <= 0.0
+            || !self
+                .settings
+                .quad_fit
+                .corner_refine
+                .min_gradient
+                .is_finite()
+            || self.settings.quad_fit.corner_refine.min_gradient < 0.0
+            || !self.settings.quad_fit.corner_refine.min_det.is_finite()
+            || self.settings.quad_fit.corner_refine.min_det <= 0.0
         {
             return Err(DetectError::InvalidSettings);
         }
@@ -2842,7 +2978,10 @@ impl Detector {
 
 #[cfg(test)]
 mod tests {
-    use super::{AprilTagSettings, DetectError, DetectedTag, DetectionSettings, Detector};
+    use super::{
+        AprilTagSettings, CornerRefineSettings, DetectError, DetectedTag, DetectionSettings,
+        Detector,
+    };
     use crate::{ComputeDevice, Size};
 
     #[test]
@@ -2900,6 +3039,43 @@ mod tests {
         }
         signature.sort_unstable();
         signature
+    }
+
+    #[test]
+    fn corner_refine_defaults_match_presets() {
+        let default_settings = DetectionSettings::default();
+        let fast_settings = DetectionSettings::fast();
+        let high_quality_settings = DetectionSettings::high_quality();
+
+        let default_refine = default_settings.quad_fit.corner_refine;
+        assert!(default_refine.enabled);
+        assert_eq!(default_refine.max_iterations, 2);
+        assert_eq!(default_refine.samples_per_edge, 8);
+        assert_eq!(default_refine.search_radius_px, 2.0);
+        assert_eq!(default_refine.min_gradient, 8.0);
+        assert_eq!(default_refine.min_det, 1e-3);
+
+        assert_eq!(fast_settings.quad_fit.corner_refine.max_iterations, 1);
+        assert_eq!(fast_settings.quad_fit.corner_refine.samples_per_edge, 6);
+
+        assert_eq!(
+            high_quality_settings.quad_fit.corner_refine.max_iterations,
+            3
+        );
+        assert_eq!(
+            high_quality_settings
+                .quad_fit
+                .corner_refine
+                .samples_per_edge,
+            10
+        );
+        assert_eq!(
+            high_quality_settings
+                .quad_fit
+                .corner_refine
+                .search_radius_px,
+            2.5
+        );
     }
 
     #[test]
@@ -3000,6 +3176,172 @@ mod tests {
             return;
         };
         assert_eq!(err, DetectError::InvalidSettings);
+    }
+
+    #[test]
+    fn detect_returns_invalid_settings_for_corner_refine_guards() {
+        let Some(device) = std::panic::catch_unwind(ComputeDevice::new_default).ok() else {
+            return;
+        };
+        let size = Size::new(16, 16);
+
+        let cases = [
+            CornerRefineSettings {
+                max_iterations: 0,
+                ..CornerRefineSettings::default()
+            },
+            CornerRefineSettings {
+                samples_per_edge: 1,
+                ..CornerRefineSettings::default()
+            },
+            CornerRefineSettings {
+                search_radius_px: 0.0,
+                ..CornerRefineSettings::default()
+            },
+            CornerRefineSettings {
+                min_gradient: -1.0,
+                ..CornerRefineSettings::default()
+            },
+            CornerRefineSettings {
+                min_det: 0.0,
+                ..CornerRefineSettings::default()
+            },
+        ];
+
+        for corner_refine in cases {
+            let result = Detector::new(
+                device.clone(),
+                DetectionSettings {
+                    quad_fit: super::QuadFitSettings {
+                        corner_refine,
+                        ..super::QuadFitSettings::default()
+                    },
+                    ..DetectionSettings::default()
+                },
+                size,
+            );
+            match result {
+                Ok(_) => panic!("invalid corner refine settings should fail"),
+                Err(err) => assert_eq!(err, DetectError::InvalidSettings),
+            }
+        }
+    }
+
+    #[test]
+    fn disabling_corner_refine_ignores_refine_tuning_parameters() {
+        let Some(detector) = maybe_detector() else {
+            return;
+        };
+        let size = Size::new(64, 64);
+        let gray_pixels = (0..size.total_pixels())
+            .map(|index| ((index * 37) % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let disabled_default = Detector::new(
+            detector.device.clone(),
+            DetectionSettings {
+                decimate: Some(2),
+                quad_fit: super::QuadFitSettings {
+                    corner_refine: CornerRefineSettings {
+                        enabled: false,
+                        ..CornerRefineSettings::default()
+                    },
+                    ..super::QuadFitSettings::default()
+                },
+                ..DetectionSettings::default()
+            },
+            size,
+        )
+        .expect("failed to build disabled detector");
+        let disabled_extreme = Detector::new(
+            detector.device.clone(),
+            DetectionSettings {
+                decimate: Some(2),
+                quad_fit: super::QuadFitSettings {
+                    corner_refine: CornerRefineSettings {
+                        enabled: false,
+                        max_iterations: 6,
+                        samples_per_edge: 24,
+                        search_radius_px: 6.0,
+                        min_gradient: 0.0,
+                        min_det: 0.25,
+                    },
+                    ..super::QuadFitSettings::default()
+                },
+                ..DetectionSettings::default()
+            },
+            size,
+        )
+        .expect("failed to build disabled detector with extreme tune");
+
+        let mut command_context = detector.device.create_command_context();
+        let out_default = disabled_default
+            .detect_gray(&mut command_context, &gray_pixels, size)
+            .expect("detection failed");
+        let out_extreme = disabled_extreme
+            .detect_gray(&mut command_context, &gray_pixels, size)
+            .expect("detection failed");
+        assert_eq!(
+            tags_signature(&out_default.tags),
+            tags_signature(&out_extreme.tags)
+        );
+    }
+
+    #[test]
+    fn huge_min_det_forces_fallback_to_unrefined_corners() {
+        let Some(detector) = maybe_detector() else {
+            return;
+        };
+        let size = Size::new(64, 64);
+        let gray_pixels = (0..size.total_pixels())
+            .map(|index| ((index * 37) % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let disabled = Detector::new(
+            detector.device.clone(),
+            DetectionSettings {
+                decimate: Some(2),
+                quad_fit: super::QuadFitSettings {
+                    corner_refine: CornerRefineSettings {
+                        enabled: false,
+                        ..CornerRefineSettings::default()
+                    },
+                    ..super::QuadFitSettings::default()
+                },
+                ..DetectionSettings::default()
+            },
+            size,
+        )
+        .expect("failed to build disabled detector");
+        let forced_fallback = Detector::new(
+            detector.device.clone(),
+            DetectionSettings {
+                decimate: Some(2),
+                quad_fit: super::QuadFitSettings {
+                    corner_refine: CornerRefineSettings {
+                        enabled: true,
+                        min_det: 1e6,
+                        ..CornerRefineSettings::default()
+                    },
+                    ..super::QuadFitSettings::default()
+                },
+                ..DetectionSettings::default()
+            },
+            size,
+        )
+        .expect("failed to build forced-fallback detector");
+
+        let mut command_context = detector.device.create_command_context();
+        let out_disabled = disabled
+            .detect_gray(&mut command_context, &gray_pixels, size)
+            .expect("detection failed");
+        let out_forced = forced_fallback
+            .detect_gray(&mut command_context, &gray_pixels, size)
+            .expect("detection failed");
+        assert_eq!(
+            tags_signature(&out_disabled.tags),
+            tags_signature(&out_forced.tags)
+        );
     }
 
     #[test]
