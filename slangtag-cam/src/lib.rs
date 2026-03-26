@@ -367,7 +367,7 @@ impl Iterator for CameraTagStream {
             (monotonic_now_ns().saturating_sub(ready.timestamp_ns)) as f64 / 1_000_000.0;
         let detect_result = self
             .detector
-            .detect_descriptor(
+            .detect_buffer(
                 &mut self.command_context,
                 slot.detect_descriptor(),
                 slot.size,

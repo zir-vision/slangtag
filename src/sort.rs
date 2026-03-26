@@ -143,7 +143,7 @@ impl RadixSorter {
         self.download_u32_buffer(command_context, &gpu_keys, keys.len())
     }
 
-    pub fn sort_u32_do(
+    pub fn sort_u32_in_place(
         &self,
         command_context: &mut ComputeCommandContext,
         keys: &GpuBuffer<u32>,
@@ -194,35 +194,6 @@ impl RadixSorter {
 
         self.gpu_sort(
             command_context,
-            element_count,
-            Some(element_count),
-            None,
-            keys_buffer,
-            keys_offset,
-            None,
-            storage_buffer,
-            storage_offset,
-            query_pool,
-        );
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn record_sort_with_query_pool(
-        &self,
-        commands: &mut CommandRecorder<'_>,
-        element_count: u32,
-        keys_buffer: &GpuBuffer<u32>,
-        keys_offset: vk::DeviceSize,
-        storage_buffer: &GpuBuffer<u32>,
-        storage_offset: vk::DeviceSize,
-        query_pool: Option<(&GpuQueryPool, u32)>,
-    ) {
-        if element_count <= 1 {
-            return;
-        }
-
-        self.gpu_sort_recorded(
-            commands,
             element_count,
             Some(element_count),
             None,
@@ -289,37 +260,6 @@ impl RadixSorter {
         );
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn record_sort_indirect_with_query_pool(
-        &self,
-        commands: &mut CommandRecorder<'_>,
-        max_element_count: u32,
-        indirect_buffer: &GpuBuffer<u32>,
-        indirect_offset: vk::DeviceSize,
-        keys_buffer: &GpuBuffer<u32>,
-        keys_offset: vk::DeviceSize,
-        storage_buffer: &GpuBuffer<u32>,
-        storage_offset: vk::DeviceSize,
-        query_pool: Option<(&GpuQueryPool, u32)>,
-    ) {
-        if max_element_count <= 1 {
-            return;
-        }
-
-        self.gpu_sort_recorded(
-            commands,
-            max_element_count,
-            None,
-            Some((indirect_buffer, indirect_offset)),
-            keys_buffer,
-            keys_offset,
-            None,
-            storage_buffer,
-            storage_offset,
-            query_pool,
-        );
-    }
-
     pub fn cmd_sort_key_value(
         &self,
         command_context: &mut ComputeCommandContext,
@@ -362,37 +302,6 @@ impl RadixSorter {
 
         self.gpu_sort(
             command_context,
-            element_count,
-            Some(element_count),
-            None,
-            keys_buffer,
-            keys_offset,
-            Some((values_buffer, values_offset)),
-            storage_buffer,
-            storage_offset,
-            query_pool,
-        );
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn record_sort_key_value_with_query_pool(
-        &self,
-        commands: &mut CommandRecorder<'_>,
-        element_count: u32,
-        keys_buffer: &GpuBuffer<u32>,
-        keys_offset: vk::DeviceSize,
-        values_buffer: &GpuBuffer<u32>,
-        values_offset: vk::DeviceSize,
-        storage_buffer: &GpuBuffer<u32>,
-        storage_offset: vk::DeviceSize,
-        query_pool: Option<(&GpuQueryPool, u32)>,
-    ) {
-        if element_count <= 1 {
-            return;
-        }
-
-        self.gpu_sort_recorded(
-            commands,
             element_count,
             Some(element_count),
             None,
@@ -602,7 +511,7 @@ impl RadixSorter {
 
         if let Some((query_pool, query)) = query_pool {
             commands.reset_query_pool(query_pool, query, Self::TIMESTAMP_QUERY_COUNT);
-            commands.write_timestamp(vk::PipelineStageFlags2::ALL_COMMANDS, query_pool, query + 0);
+            commands.write_timestamp(vk::PipelineStageFlags2::ALL_COMMANDS, query_pool, query);
         }
 
         if let Some(element_count) = direct_element_count {
@@ -696,7 +605,7 @@ impl RadixSorter {
                 commands.write_timestamp(
                     vk::PipelineStageFlags2::COMPUTE_SHADER,
                     query_pool,
-                    query + 2 + 3 * pass + 0,
+                    query + 2 + 3 * pass,
                 );
             }
             commands.barrier_shader_write_to_shader_read();
@@ -782,7 +691,7 @@ impl RadixSorter {
 
     fn assert_alignment(offset: vk::DeviceSize, align: vk::DeviceSize, label: &str) {
         assert!(
-            offset % align == 0,
+            offset.is_multiple_of(align),
             "{label} ({offset}) must be aligned to {align} bytes"
         );
     }
@@ -807,7 +716,9 @@ impl RadixSorter {
         requirements: RadixSorterStorageRequirements,
     ) -> GpuBuffer<u32> {
         assert!(
-            requirements.size % (std::mem::size_of::<u32>() as vk::DeviceSize) == 0,
+            requirements
+                .size
+                .is_multiple_of(std::mem::size_of::<u32>() as vk::DeviceSize),
             "storage requirement size ({}) is not aligned to u32",
             requirements.size
         );

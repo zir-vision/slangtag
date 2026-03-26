@@ -10,7 +10,6 @@ static const uint32_t kControlDispatchBuildBlobPairExtentsWord = 16u;
 static const uint32_t kControlDispatchRadixBlobInitWord = 19u;
 static const uint32_t kControlDispatchRadixBlobUpdateWord = 22u;
 static const uint32_t kControlDispatchRadixBlobGatherWord = 25u;
-static const uint32_t kControlDispatchRewriteSelectedBlobPointsWord = 28u;
 static const uint32_t kControlDispatchRadixSelectedInitWord = 31u;
 static const uint32_t kControlDispatchRadixSelectedUpdateWord = 34u;
 static const uint32_t kControlDispatchRadixSelectedGatherWord = 37u;

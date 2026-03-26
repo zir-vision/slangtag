@@ -85,7 +85,7 @@ fn main() {
     for _ in 0..runs {
         let start = Instant::now();
         let output = det
-            .detect_descriptor(
+            .detect_buffer(
                 &mut command_context,
                 input_gpu_buffer.descriptor(),
                 input_size,

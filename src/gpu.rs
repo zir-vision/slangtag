@@ -91,10 +91,10 @@ impl Drop for ComputeCommandContext {
                     .descriptor_pool_lock
                     .lock()
                     .expect("failed to lock descriptor pool during command context drop");
-                let _ = self.inner.device.free_descriptor_sets(
-                    self.inner.descriptor_pool,
-                    &descriptor_sets,
-                );
+                let _ = self
+                    .inner
+                    .device
+                    .free_descriptor_sets(self.inner.descriptor_pool, &descriptor_sets);
             }
             self.inner.device.destroy_fence(self.submit_fence, None);
             self.inner
@@ -406,7 +406,7 @@ impl<'a> CommandRecorder<'a> {
         value: u32,
     ) {
         assert!(
-            offset % (std::mem::size_of::<u32>() as vk::DeviceSize) == 0,
+            offset.is_multiple_of(std::mem::size_of::<u32>() as vk::DeviceSize),
             "update offset ({offset}) must be aligned to 4 bytes"
         );
         assert!(
@@ -606,7 +606,7 @@ impl<'a> CommandRecorder<'a> {
             MAX_PUSH_CONSTANT_BYTES
         );
         assert!(
-            indirect_offset % (std::mem::size_of::<u32>() as vk::DeviceSize) == 0,
+            indirect_offset.is_multiple_of(std::mem::size_of::<u32>() as vk::DeviceSize),
             "indirect_offset ({indirect_offset}) must be aligned to 4 bytes"
         );
         assert!(
@@ -659,7 +659,7 @@ impl<'a> CommandRecorder<'a> {
         indirect_offset: vk::DeviceSize,
     ) {
         assert!(
-            indirect_offset % (std::mem::size_of::<u32>() as vk::DeviceSize) == 0,
+            indirect_offset.is_multiple_of(std::mem::size_of::<u32>() as vk::DeviceSize),
             "indirect_offset ({indirect_offset}) must be aligned to 4 bytes"
         );
         assert!(
@@ -1204,7 +1204,7 @@ impl ComputeDevice {
                 command_context,
                 &staging,
                 &gpu_buffer,
-                (data.len() * std::mem::size_of::<T>()) as vk::DeviceSize,
+                std::mem::size_of_val(data) as vk::DeviceSize,
             );
             gpu_buffer
         } else {
@@ -1350,8 +1350,12 @@ impl<T: Pod + Copy> GpuBuffer<T> {
         self.len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn write(&self, data: &[T]) {
-        let byte_len = (data.len() * std::mem::size_of::<T>()) as vk::DeviceSize;
+        let byte_len = std::mem::size_of_val(data) as vk::DeviceSize;
         assert!(
             byte_len <= self.raw.bytes,
             "write exceeds allocation: {} > {} bytes",

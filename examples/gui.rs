@@ -140,7 +140,6 @@ impl ViewerSettings {
                     enabled: self.corner_refine_enabled,
                     ..CornerRefineSettings::default()
                 },
-                ..QuadFitSettings::default()
             },
             decode: DecodeSettings {
                 cell_size: self.cell_size,
@@ -279,7 +278,7 @@ impl ViewerApp {
             self.detections.clear();
             return;
         };
-        match detector.detect_descriptor(
+        match detector.detect_buffer(
             &mut self.command_context,
             uploaded_input.buffer.descriptor(),
             uploaded_input.size,
