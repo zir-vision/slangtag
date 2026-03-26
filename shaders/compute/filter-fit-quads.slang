@@ -6,8 +6,7 @@ StructuredBuffer<uint32_t> peak_extents;
 StructuredBuffer<uint32_t> line_fit_points;
 StructuredBuffer<uint32_t> filtered_blob_extents;
 RWStructuredBuffer<uint32_t> fitted_quads_out;
-RWStructuredBuffer<uint32_t> fitted_quad_count_out;
-StructuredBuffer<uint32_t> control;
+RWStructuredBuffer<uint32_t> control;
 
 struct PushConstants
 {
@@ -499,7 +498,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
     }
 
     uint32_t fitted_quad_index;
-    InterlockedAdd(fitted_quad_count_out[0], 1u, fitted_quad_index);
+    InterlockedAdd(control[kControlFittedQuadCountWord], 1u, fitted_quad_index);
     write_fitted_quad_word(fitted_quads_out, fitted_quad_index, kFittedQuadBlobIndexWord, blob_index);
     write_fitted_quad_word(
         fitted_quads_out,

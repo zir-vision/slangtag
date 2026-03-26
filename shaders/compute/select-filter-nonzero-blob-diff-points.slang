@@ -1,8 +1,9 @@
 import "../select.slang";
+import "./detect-control.slang";
 
 StructuredBuffer<uint32_t> input;
 RWStructuredBuffer<uint32_t> output;
-RWStructuredBuffer<uint32_t> output_count;
+RWStructuredBuffer<uint32_t> control;
 
 struct PushConstants
 {
@@ -23,7 +24,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
         return;
 
     uint32_t output_index;
-    InterlockedAdd(output_count[0], 1u, output_index);
+    InterlockedAdd(control[kControlBlobDiffFilteredCountWord], 1u, output_index);
     uint32_t input_word_index = tid * kBlobDiffWordsPerPoint;
     uint32_t output_word_index = output_index * kBlobDiffWordsPerPoint;
     [ForceUnroll]

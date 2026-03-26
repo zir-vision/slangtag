@@ -3,12 +3,9 @@ import "./detect-control.slang";
 
 StructuredBuffer<uint32_t> sorted_points;
 RWStructuredBuffer<uint32_t> extents_out;
-RWStructuredBuffer<uint32_t> extent_count_out;
 RWStructuredBuffer<uint32_t> filtered_extents_out;
-RWStructuredBuffer<uint32_t> selected_extent_count_out;
-RWStructuredBuffer<uint32_t> selected_point_count_out;
 RWStructuredBuffer<uint32_t> selected_points_out;
-StructuredBuffer<uint32_t> control;
+RWStructuredBuffer<uint32_t> control;
 struct PushConstants
 {
     uint32_t valid_points;
@@ -106,7 +103,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
     }
 
     uint32_t extent_index;
-    InterlockedAdd(extent_count_out[0], 1u, extent_index);
+    InterlockedAdd(control[kControlBlobExtentCountWord], 1u, extent_index);
 
     BlobExtent extent;
     extent.min_x = min_x;
@@ -156,7 +153,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
         return;
 
     uint32_t selected_point_start;
-    InterlockedAdd(selected_point_count_out[0], extent.count, selected_point_start);
+    InterlockedAdd(control[kControlSelectedBlobPointCountWord], extent.count, selected_point_start);
     write_extent_word(filtered_extents_out, extent_index, kExtentMinXWord, extent.min_x);
     write_extent_word(filtered_extents_out, extent_index, kExtentMaxXWord, extent.max_x);
     write_extent_word(filtered_extents_out, extent_index, kExtentMinYWord, extent.min_y);
@@ -187,5 +184,5 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
     }
 
     uint32_t selected_extent_index;
-    InterlockedAdd(selected_extent_count_out[0], 1u, selected_extent_index);
+    InterlockedAdd(control[kControlSelectedBlobExtentCountWord], 1u, selected_extent_index);
 }

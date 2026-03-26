@@ -1094,11 +1094,7 @@ impl Detector {
     const RADIX_KEY_TRANSFORM_NONE: u32 = 0;
     const RADIX_KEY_TRANSFORM_F32_ASC: u32 = 1;
     const CONTROL_BLOB_DIFF_FILTERED_COUNT_WORD: u32 = 0;
-    const CONTROL_BLOB_EXTENT_COUNT_WORD: u32 = 1;
-    const CONTROL_SELECTED_BLOB_EXTENT_COUNT_WORD: u32 = 2;
     const CONTROL_SELECTED_BLOB_POINT_COUNT_WORD: u32 = 3;
-    const CONTROL_PEAK_EXTENT_COUNT_WORD: u32 = 4;
-    const CONTROL_FITTED_QUAD_COUNT_WORD: u32 = 5;
     const CONTROL_DECODED_TAG_COUNT_WORD: u32 = 6;
 
     const CONTROL_DISPATCH_BUILD_BLOB_PAIR_EXTENTS_WORD: u32 = 16;
@@ -1262,23 +1258,6 @@ impl Detector {
         let readback_counters = cached.readback_counters.clone();
         let readback_decoded_tags = cached.readback_decoded_tags.clone();
         let max_quad_capacity_u32 = cached.max_quad_capacity_u32;
-
-        let control_blob_diff_filtered_desc =
-            Self::control_counter_descriptor(&control, Self::CONTROL_BLOB_DIFF_FILTERED_COUNT_WORD);
-        let control_blob_extent_desc =
-            Self::control_counter_descriptor(&control, Self::CONTROL_BLOB_EXTENT_COUNT_WORD);
-        let control_selected_blob_extent_desc = Self::control_counter_descriptor(
-            &control,
-            Self::CONTROL_SELECTED_BLOB_EXTENT_COUNT_WORD,
-        );
-        let control_selected_blob_point_desc = Self::control_counter_descriptor(
-            &control,
-            Self::CONTROL_SELECTED_BLOB_POINT_COUNT_WORD,
-        );
-        let control_peak_extent_desc =
-            Self::control_counter_descriptor(&control, Self::CONTROL_PEAK_EXTENT_COUNT_WORD);
-        let control_fitted_quad_desc =
-            Self::control_counter_descriptor(&control, Self::CONTROL_FITTED_QUAD_COUNT_WORD);
 
         let blob_pair_filter = self.settings.blob_pair_filter;
         let min_tag_width = blob_pair_filter.min_tag_width;
@@ -1504,7 +1483,7 @@ impl Detector {
                 &[
                     (0, blob_diff_out.descriptor()),
                     (1, blob_diff_compacted.descriptor()),
-                    (2, control_blob_diff_filtered_desc),
+                    (2, control.descriptor()),
                 ],
                 TotalPointsPushConstants {
                     total_points: blob_diff_total_points,
@@ -1635,12 +1614,9 @@ impl Detector {
                 &[
                     (0, blob_diff_sorted.descriptor()),
                     (1, blob_extent.descriptor()),
-                    (2, control_blob_extent_desc),
-                    (3, filtered_blob_extent.descriptor()),
-                    (4, control_selected_blob_extent_desc),
-                    (5, control_selected_blob_point_desc),
-                    (6, selected_blob_points.descriptor()),
-                    (7, control.descriptor()),
+                    (2, filtered_blob_extent.descriptor()),
+                    (3, selected_blob_points.descriptor()),
+                    (4, control.descriptor()),
                 ],
                 BuildBlobPairExtentsPushConstants {
                     valid_points: blob_diff_total_points,
@@ -1981,8 +1957,7 @@ impl Detector {
                 &[
                     (0, sorted_peaks.descriptor()),
                     (1, peak_extents.descriptor()),
-                    (2, control_peak_extent_desc),
-                    (3, control.descriptor()),
+                    (2, control.descriptor()),
                 ],
                 TotalPointsPushConstants {
                     total_points: selected_blob_point_capacity_u32,
@@ -2018,8 +1993,7 @@ impl Detector {
                     (2, line_fit_points.descriptor()),
                     (3, filtered_blob_extent.descriptor()),
                     (4, fitted_quads.descriptor()),
-                    (5, control_fitted_quad_desc),
-                    (6, control.descriptor()),
+                    (5, control.descriptor()),
                 ],
                 FitQuadsPushConstants {
                     peak_extent_count: selected_blob_point_capacity_u32,
@@ -2907,13 +2881,6 @@ impl Detector {
 
     fn control_word_offset(word_index: u32) -> vk::DeviceSize {
         (word_index as vk::DeviceSize) * (std::mem::size_of::<u32>() as vk::DeviceSize)
-    }
-
-    fn control_counter_descriptor(control: &GpuBuffer<u32>, word_index: u32) -> DescriptorBuffer {
-        control.descriptor_range(
-            Self::control_word_offset(word_index),
-            std::mem::size_of::<u32>() as vk::DeviceSize,
-        )
     }
 
     fn control_dispatch_offset(word_index: u32) -> vk::DeviceSize {

@@ -3,8 +3,7 @@ import "./detect-control.slang";
 
 StructuredBuffer<uint32_t> sorted_peaks;
 RWStructuredBuffer<uint32_t> peak_extents_out;
-RWStructuredBuffer<uint32_t> peak_extent_count_out;
-StructuredBuffer<uint32_t> control;
+RWStructuredBuffer<uint32_t> control;
 struct PushConstants
 {
     uint32_t valid_peaks;
@@ -42,7 +41,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
     }
 
     uint32_t peak_extent_index;
-    InterlockedAdd(peak_extent_count_out[0], 1u, peak_extent_index);
+    InterlockedAdd(control[kControlPeakExtentCountWord], 1u, peak_extent_index);
     write_peak_extent_word(peak_extents_out, peak_extent_index, kPeakExtentBlobIndexWord, blob_index);
     write_peak_extent_word(peak_extents_out, peak_extent_index, kPeakExtentStartingOffsetWord, start);
     write_peak_extent_word(peak_extents_out, peak_extent_index, kPeakExtentCountWord, count);
