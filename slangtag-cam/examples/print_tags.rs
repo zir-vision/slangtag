@@ -1,5 +1,6 @@
 use slangtag::ComputeDevice;
 use slangtag_cam::{CameraConfig, CameraTagStream, DetectionSettings};
+use std::time::{Duration, Instant};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -28,6 +29,8 @@ fn main() {
     config.timing_every_n_frames = 30;
     config.use_device_local_input = true;
     let settings = DetectionSettings {
+        decimate: Some(2),
+        min_white_black_diff: 70,
         ..Default::default()
     };
 
@@ -35,14 +38,16 @@ fn main() {
         CameraTagStream::new(device, config, settings).expect("failed to start camera tag stream");
 
     let mut frame_index = 0u64;
+    let start_time = Instant::now();
+    let mut fps_window_start = start_time;
+    let mut fps_window_frames = 0u64;
     for item in &mut stream {
         frame_index = frame_index.wrapping_add(1);
+        fps_window_frames = fps_window_frames.wrapping_add(1);
 
         match item {
             Ok(tags) => {
-                if tags.is_empty() {
-                    println!("frame {frame_index}: no tags");
-                } else {
+                if !tags.is_empty() {
                     println!("frame {frame_index}: {} tag(s)", tags.len());
                     for tag in &tags {
                         println!(
@@ -63,10 +68,29 @@ fn main() {
             }
         }
 
+        let now = Instant::now();
+        let window_elapsed = now.duration_since(fps_window_start);
+        if window_elapsed >= Duration::from_secs(1) {
+            let fps = fps_window_frames as f64 / window_elapsed.as_secs_f64();
+            println!("fps: {:.2}", fps);
+            fps_window_start = now;
+            fps_window_frames = 0;
+        }
+
         if let Some(limit) = max_frames
             && frame_index >= limit
         {
             break;
         }
+    }
+
+    let total_elapsed = start_time.elapsed();
+    if frame_index > 0 && total_elapsed > Duration::ZERO {
+        let avg_fps = frame_index as f64 / total_elapsed.as_secs_f64();
+        println!(
+            "processed {frame_index} frame(s) in {:.2}s (avg fps: {:.2})",
+            total_elapsed.as_secs_f64(),
+            avg_fps
+        );
     }
 }
