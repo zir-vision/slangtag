@@ -7,7 +7,7 @@ RWStructuredBuffer<uint32_t> extent_count_out;
 RWStructuredBuffer<uint32_t> filtered_extents_out;
 RWStructuredBuffer<uint32_t> selected_extent_count_out;
 RWStructuredBuffer<uint32_t> selected_point_count_out;
-RWStructuredBuffer<uint32_t> point_extent_indices_out;
+RWStructuredBuffer<uint32_t> selected_points_out;
 StructuredBuffer<uint32_t> control;
 struct PushConstants
 {
@@ -21,6 +21,21 @@ struct PushConstants
 
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc;
+
+uint32_t point_theta_from_extent_values(uint32_t min_x,
+                                        uint32_t max_x,
+                                        uint32_t min_y,
+                                        uint32_t max_y,
+                                        uint32_t x,
+                                        uint32_t y)
+{
+    static const float kThetaScale = 8.0e6f;
+
+    float cx = 0.5f * (float(min_x) + float(max_x)) + 0.05118f;
+    float cy = 0.5f * (float(min_y) + float(max_y)) - 0.028581f;
+    float theta = (atan2(float(y) - cy, float(x) - cx) + float::getPi()) * kThetaScale;
+    return uint32_t(max(0.0f, theta) + 0.5f);
+}
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -93,11 +108,6 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
     uint32_t extent_index;
     InterlockedAdd(extent_count_out[0], 1u, extent_index);
 
-    for (uint32_t point_index = tid; point_index < i; ++point_index)
-    {
-        point_extent_indices_out[point_index] = extent_index;
-    }
-
     BlobExtent extent;
     extent.min_x = min_x;
     extent.max_x = max_x;
@@ -156,6 +166,25 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
     write_extent_word(filtered_extents_out, extent_index, kExtentPxGxPyGySumWord, asuint(extent.pxgx_plus_pygy_sum));
     write_extent_word(filtered_extents_out, extent_index, kExtentGxSumWord, asuint(extent.gx_sum));
     write_extent_word(filtered_extents_out, extent_index, kExtentGySumWord, asuint(extent.gy_sum));
+
+    for (uint32_t point_index = tid; point_index < i; ++point_index)
+    {
+        BlobDiffPoint source_point = read_blob_diff_point(sorted_points, point_index);
+        uint32_t selected_index = selected_point_start + (point_index - tid);
+
+        SelectedBlobPoint selected_point;
+        selected_point.blob_index = extent_index;
+        selected_point.theta = point_theta_from_extent_values(
+            extent.min_x,
+            extent.max_x,
+            extent.min_y,
+            extent.max_y,
+            source_point.x,
+            source_point.y);
+        selected_point.x = source_point.x;
+        selected_point.y = source_point.y;
+        write_selected_blob_point(selected_points_out, selected_index, selected_point);
+    }
 
     uint32_t selected_extent_index;
     InterlockedAdd(selected_extent_count_out[0], 1u, selected_extent_index);

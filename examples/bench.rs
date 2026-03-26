@@ -1,7 +1,7 @@
 use ash::vk;
 use slangtag::{
     ComputeCommandContext, ComputeDevice, Size,
-    detect::{DetectionSettings, Detector},
+    detect::{DetectionSettings, DetectionTimingMode, Detector},
 };
 use std::time::Instant;
 
@@ -49,6 +49,7 @@ fn main() {
     let gray_image = image.to_luma8();
 
     let settings = DetectionSettings {
+        timing_mode: DetectionTimingMode::Detailed,
         decimate: Some(2),
         ..Default::default()
     };

@@ -5,7 +5,7 @@ use slangtag::{
     ComputeCommandContext, ComputeDevice, Size,
     detect::{
         AprilTagSettings, BlobPairFilterSettings, CornerRefineSettings, DecodeSettings,
-        DetectedTag, DetectionSettings, Detector, QuadFitSettings,
+        DetectedTag, DetectionSettings, DetectionTimingMode, Detector, QuadFitSettings,
     },
     gpu::GpuBuffer,
 };
@@ -117,6 +117,7 @@ impl Default for ViewerSettings {
 impl ViewerSettings {
     fn to_detection_settings(self) -> DetectionSettings {
         DetectionSettings {
+            timing_mode: DetectionTimingMode::Disabled,
             decimate: self.decimate.factor(),
             min_white_black_diff: self.min_white_black_diff,
             min_blob_size: self.min_blob_size,

@@ -301,10 +301,41 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
     if (local_peak_count < 4u)
         return;
 
+    uint edge_valid[kMaxQuadLocalPeakIndices * kMaxQuadLocalPeakIndices];
+    float edge_mse[kMaxQuadLocalPeakIndices * kMaxQuadLocalPeakIndices];
+    for (uint32_t start_slot = 0u; start_slot < local_peak_count; ++start_slot)
+    {
+        for (uint32_t end_slot = 0u; end_slot < local_peak_count; ++end_slot)
+        {
+            uint32_t edge_cache_index = start_slot * kMaxQuadLocalPeakIndices + end_slot;
+            edge_valid[edge_cache_index] = 0u;
+
+            if (start_slot == end_slot)
+                continue;
+
+            QuadLineFitMoments moments;
+            segment_moments(
+                line_fit_points,
+                blob_start,
+                blob_count,
+                local_peak_indices[start_slot],
+                local_peak_indices[end_slot],
+                moments);
+            if (moments.N < 2)
+                continue;
+
+            float mse = line_fit_mse(moments);
+            if (!(mse == mse) || mse > max_line_fit_mse)
+                continue;
+
+            edge_valid[edge_cache_index] = 1u;
+            edge_mse[edge_cache_index] = mse;
+        }
+    }
+
     bool has_best = false;
     float best_score = 0.0f;
     uint32_t best_corner_indices[4];
-    QuadLineFitMoments best_edge_moments[4];
 
     for (uint32_t i0 = 0u; i0 + 3u < local_peak_count; ++i0)
     {
@@ -314,53 +345,30 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
             {
                 for (uint32_t i3 = i2 + 1u; i3 < local_peak_count; ++i3)
                 {
-                    uint32_t corner_indices[4];
-                    corner_indices[0] = local_peak_indices[i0];
-                    corner_indices[1] = local_peak_indices[i1];
-                    corner_indices[2] = local_peak_indices[i2];
-                    corner_indices[3] = local_peak_indices[i3];
-
-                    uint32_t edge_start[4];
-                    uint32_t edge_end[4];
-                    edge_start[0] = corner_indices[0];
-                    edge_start[1] = corner_indices[1];
-                    edge_start[2] = corner_indices[2];
-                    edge_start[3] = corner_indices[3];
-                    edge_end[0] = corner_indices[1];
-                    edge_end[1] = corner_indices[2];
-                    edge_end[2] = corner_indices[3];
-                    edge_end[3] = corner_indices[0];
+                    uint32_t edge_start_slot[4];
+                    uint32_t edge_end_slot[4];
+                    edge_start_slot[0] = i0;
+                    edge_start_slot[1] = i1;
+                    edge_start_slot[2] = i2;
+                    edge_start_slot[3] = i3;
+                    edge_end_slot[0] = i1;
+                    edge_end_slot[1] = i2;
+                    edge_end_slot[2] = i3;
+                    edge_end_slot[3] = i0;
 
                     bool valid = true;
                     float total_mse = 0.0f;
-                    QuadLineFitMoments edge_moments[4];
 
                     for (uint32_t edge_index = 0u; edge_index < 4u; ++edge_index)
                     {
-                        QuadLineFitMoments moments;
-                        segment_moments(
-                            line_fit_points,
-                            blob_start,
-                            blob_count,
-                            edge_start[edge_index],
-                            edge_end[edge_index],
-                            moments);
-
-                        if (moments.N < 2)
+                        uint32_t edge_cache_index = edge_start_slot[edge_index] * kMaxQuadLocalPeakIndices
+                            + edge_end_slot[edge_index];
+                        if (edge_valid[edge_cache_index] == 0u)
                         {
                             valid = false;
                             break;
                         }
-
-                        float mse = line_fit_mse(moments);
-                        if (!(mse == mse) || mse > max_line_fit_mse)
-                        {
-                            valid = false;
-                            break;
-                        }
-
-                        edge_moments[edge_index] = moments;
-                        total_mse += mse;
+                        total_mse += edge_mse[edge_cache_index];
                     }
 
                     if (!valid)
@@ -370,11 +378,10 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
                     {
                         has_best = true;
                         best_score = total_mse;
-                        for (uint32_t c = 0u; c < 4u; ++c)
-                        {
-                            best_corner_indices[c] = corner_indices[c];
-                            best_edge_moments[c] = edge_moments[c];
-                        }
+                        best_corner_indices[0] = local_peak_indices[i0];
+                        best_corner_indices[1] = local_peak_indices[i1];
+                        best_corner_indices[2] = local_peak_indices[i2];
+                        best_corner_indices[3] = local_peak_indices[i3];
                     }
                 }
             }
@@ -383,6 +390,18 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
 
     if (!has_best)
         return;
+
+    QuadLineFitMoments best_edge_moments[4];
+    for (uint32_t edge_index = 0u; edge_index < 4u; ++edge_index)
+    {
+        segment_moments(
+            line_fit_points,
+            blob_start,
+            blob_count,
+            best_corner_indices[edge_index],
+            best_corner_indices[(edge_index + 1u) & 3u],
+            best_edge_moments[edge_index]);
+    }
 
     float4 lines[4];
     bool valid_lines = true;

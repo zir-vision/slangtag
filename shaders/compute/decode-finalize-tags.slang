@@ -151,6 +151,8 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID)
             best_distance = distance;
             best_id = id;
             best_rotation = rotation;
+            if (distance == 0u)
+                break;
         }
     }
     if (best_distance > pc.max_corrected_bits)

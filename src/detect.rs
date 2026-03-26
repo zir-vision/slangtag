@@ -51,6 +51,8 @@ static APRILTAG_36H11_EXACT_LOOKUP: LazyLock<HashMap<u64, (u32, u8)>> = LazyLock
 /// Use [`DetectionSettings::default`] for a balanced preset, or one of the
 /// convenience constructors to bias speed/quality.
 pub struct DetectionSettings {
+    /// GPU timing instrumentation mode.
+    pub timing_mode: DetectionTimingMode,
     /// Optional downsample factor (`None` means no downsampling, equivalent to `1`).
     ///
     /// When set, this must be a power of two (for example `1`, `2`, `4`, `8`).
@@ -67,6 +69,15 @@ pub struct DetectionSettings {
     pub decode: DecodeSettings,
     /// AprilTag id decode/error-correction parameters.
     pub apriltag: AprilTagSettings,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DetectionTimingMode {
+    /// Skip per-stage timestamp instrumentation and return an empty timing report.
+    #[default]
+    Disabled,
+    /// Collect detailed per-stage GPU/CPU timings.
+    Detailed,
 }
 
 #[derive(Clone, Copy)]
@@ -321,7 +332,6 @@ struct CachedDetectorBuffers {
     blob_diff_sorted: GpuBuffer<u32>,
     blob_extent: GpuBuffer<u32>,
     filtered_blob_extent: GpuBuffer<u32>,
-    point_extent_indices: GpuBuffer<u32>,
     selected_blob_points: GpuBuffer<u32>,
     selected_blob_sorted_points: GpuBuffer<u32>,
     line_fit_points: GpuBuffer<u32>,
@@ -362,7 +372,6 @@ struct DetectionPipelines {
     radix_keys_from_indices: Arc<ComputePipeline>,
     radix_gather_by_indices: Arc<ComputePipeline>,
     build_blob_pair_extents: Arc<ComputePipeline>,
-    rewrite_selected_blob_points_with_theta: Arc<ComputePipeline>,
     rebuild_filtered_extent_starts: Arc<ComputePipeline>,
     build_line_fit_points: Arc<ComputePipeline>,
     fit_line_errors_and_peaks: Arc<ComputePipeline>,
@@ -437,12 +446,6 @@ impl DetectionPipelines {
                 device,
                 include_u32!(compute_shader_path!("filter-build-blob-pair-extents")),
             ),
-            rewrite_selected_blob_points_with_theta: Detector::create_compute_pipeline(
-                device,
-                include_u32!(compute_shader_path!(
-                    "filter-rewrite-selected-blob-points-with-theta"
-                )),
-            ),
             rebuild_filtered_extent_starts: Detector::create_compute_pipeline(
                 device,
                 include_u32!(compute_shader_path!(
@@ -498,6 +501,7 @@ impl DetectionPipelines {
 impl Default for DetectionSettings {
     fn default() -> Self {
         Self {
+            timing_mode: DetectionTimingMode::Disabled,
             decimate: Some(2),
             min_white_black_diff: 25,
             min_blob_size: 25,
@@ -632,6 +636,7 @@ struct TimedPass {
 }
 
 struct PipelineTimings {
+    enabled: bool,
     query_pool: crate::GpuQueryPool,
     next_query: u32,
     spans: Vec<TimedPass>,
@@ -640,8 +645,9 @@ struct PipelineTimings {
 }
 
 impl PipelineTimings {
-    fn new(device: &ComputeDevice, query_capacity: u32) -> Self {
+    fn new(device: &ComputeDevice, query_capacity: u32, enabled: bool) -> Self {
         Self {
+            enabled,
             query_pool: device.create_timestamp_query_pool(query_capacity),
             next_query: 0,
             spans: Vec::new(),
@@ -650,8 +656,19 @@ impl PipelineTimings {
         }
     }
 
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     fn reset(&mut self, commands: &mut CommandRecorder<'_>) {
-        commands.reset_query_pool(&self.query_pool, 0, self.query_pool.query_count());
+        if self.enabled {
+            let query_count = if self.next_query == 0 {
+                self.query_pool.query_count()
+            } else {
+                self.next_query
+            };
+            commands.reset_query_pool(&self.query_pool, 0, query_count);
+        }
         self.next_query = 0;
         self.spans.clear();
         self.total_start_query = None;
@@ -659,6 +676,9 @@ impl PipelineTimings {
     }
 
     fn mark_gpu_work_begin(&mut self, commands: &mut CommandRecorder<'_>) {
+        if !self.enabled {
+            return;
+        }
         let query = self.allocate_queries(1);
         commands.write_timestamp(
             vk::PipelineStageFlags2::ALL_COMMANDS,
@@ -669,6 +689,9 @@ impl PipelineTimings {
     }
 
     fn mark_gpu_work_end(&mut self, commands: &mut CommandRecorder<'_>) {
+        if !self.enabled {
+            return;
+        }
         let query = self.allocate_queries(1);
         commands.write_timestamp(
             vk::PipelineStageFlags2::ALL_COMMANDS,
@@ -703,6 +726,10 @@ impl PipelineTimings {
     ) where
         F: FnOnce(&mut CommandRecorder<'_>),
     {
+        if !self.enabled {
+            record(commands);
+            return;
+        }
         let start_query = self.allocate_queries(1);
         let end_query = self.allocate_queries(1);
         commands.write_timestamp(start_stage, &self.query_pool, start_query);
@@ -768,6 +795,9 @@ impl PipelineTimings {
     }
 
     fn reserve_radix_sort_queries(&mut self, name_prefix: &str) -> u32 {
+        if !self.enabled {
+            return 0;
+        }
         let base_query = self.allocate_queries(RadixSorter::TIMESTAMP_QUERY_COUNT);
         self.spans.push(TimedPass {
             name: name_prefix.to_owned(),
@@ -777,8 +807,12 @@ impl PipelineTimings {
         base_query
     }
 
+    fn radix_sort_query_pool(&self, base_query: u32) -> Option<(&crate::GpuQueryPool, u32)> {
+        self.enabled.then_some((&self.query_pool, base_query))
+    }
+
     fn summary(&self, device: &ComputeDevice) -> GpuTimingReport {
-        if self.next_query == 0 {
+        if !self.enabled || self.next_query == 0 {
             return GpuTimingReport::default();
         }
 
@@ -902,13 +936,6 @@ struct RadixExtractPushConstants {
 struct RadixGatherPushConstants {
     valid_points: u32,
     words_per_record: u32,
-}
-
-#[repr(C)]
-#[derive(Pod, Zeroable, Copy, Clone)]
-struct RewriteSelectedBlobPointsPushConstants {
-    extent_count: u32,
-    valid_points: u32,
 }
 
 #[repr(C)]
@@ -1078,7 +1105,6 @@ impl Detector {
     const CONTROL_DISPATCH_RADIX_BLOB_INIT_WORD: u32 = 19;
     const CONTROL_DISPATCH_RADIX_BLOB_UPDATE_WORD: u32 = 22;
     const CONTROL_DISPATCH_RADIX_BLOB_GATHER_WORD: u32 = 25;
-    const CONTROL_DISPATCH_REWRITE_SELECTED_BLOB_POINTS_WORD: u32 = 28;
     const CONTROL_DISPATCH_RADIX_SELECTED_INIT_WORD: u32 = 31;
     const CONTROL_DISPATCH_RADIX_SELECTED_UPDATE_WORD: u32 = 34;
     const CONTROL_DISPATCH_RADIX_SELECTED_GATHER_WORD: u32 = 37;
@@ -1209,7 +1235,6 @@ impl Detector {
         let blob_diff_sorted = cached._buffers.blob_diff_sorted.clone();
         let blob_extent = cached._buffers.blob_extent.clone();
         let filtered_blob_extent = cached._buffers.filtered_blob_extent.clone();
-        let point_extent_indices = cached._buffers.point_extent_indices.clone();
         let selected_blob_points = cached._buffers.selected_blob_points.clone();
         let selected_blob_sorted_points = cached._buffers.selected_blob_sorted_points.clone();
         let line_fit_points = cached._buffers.line_fit_points.clone();
@@ -1540,7 +1565,7 @@ impl Detector {
                 0,
                 &blob_sort_storage,
                 0,
-                Some((&timings.query_pool, secondary_blob_query)),
+                timings.radix_sort_query_pool(secondary_blob_query),
             );
             self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
@@ -1578,7 +1603,7 @@ impl Detector {
                 0,
                 &blob_sort_storage,
                 0,
-                Some((&timings.query_pool, primary_blob_query)),
+                timings.radix_sort_query_pool(primary_blob_query),
             );
             self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
@@ -1613,7 +1638,7 @@ impl Detector {
                     (3, filtered_blob_extent.descriptor()),
                     (4, control_selected_blob_extent_desc),
                     (5, control_selected_blob_point_desc),
-                    (6, point_extent_indices.descriptor()),
+                    (6, selected_blob_points.descriptor()),
                     (7, control.descriptor()),
                 ],
                 BuildBlobPairExtentsPushConstants {
@@ -1643,30 +1668,6 @@ impl Detector {
             );
             self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
             self.barrier_shader_write_to_indirect_read_recorded_timed(&mut timings, commands);
-
-            self.dispatch_indirect_with_push_constants_recorded_timed(
-                &mut timings,
-                "filter-rewrite-selected-blob-points-with-theta",
-                commands,
-                &self.pipelines.rewrite_selected_blob_points_with_theta,
-                &[
-                    (0, blob_diff_sorted.descriptor()),
-                    (1, blob_extent.descriptor()),
-                    (2, point_extent_indices.descriptor()),
-                    (3, filtered_blob_extent.descriptor()),
-                    (4, selected_blob_points.descriptor()),
-                    (5, control.descriptor()),
-                ],
-                RewriteSelectedBlobPointsPushConstants {
-                    extent_count: blob_diff_total_points,
-                    valid_points: blob_diff_total_points,
-                },
-                &control,
-                Self::control_dispatch_offset(
-                    Self::CONTROL_DISPATCH_REWRITE_SELECTED_BLOB_POINTS_WORD,
-                ),
-            );
-            self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
             self.dispatch_indirect_with_push_constants_recorded_timed(
                 &mut timings,
@@ -1702,7 +1703,7 @@ impl Detector {
                 0,
                 &selected_sort_storage,
                 0,
-                Some((&timings.query_pool, secondary_selected_query)),
+                timings.radix_sort_query_pool(secondary_selected_query),
             );
             self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
@@ -1740,7 +1741,7 @@ impl Detector {
                 0,
                 &selected_sort_storage,
                 0,
-                Some((&timings.query_pool, primary_selected_query)),
+                timings.radix_sort_query_pool(primary_selected_query),
             );
             self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
@@ -1910,7 +1911,7 @@ impl Detector {
                 0,
                 &peak_sort_storage,
                 0,
-                Some((&timings.query_pool, secondary_peak_query)),
+                timings.radix_sort_query_pool(secondary_peak_query),
             );
             self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
@@ -1948,7 +1949,7 @@ impl Detector {
                 0,
                 &peak_sort_storage,
                 0,
-                Some((&timings.query_pool, primary_peak_query)),
+                timings.radix_sort_query_pool(primary_peak_query),
             );
             self.barrier_shader_write_to_shader_read_recorded_timed(&mut timings, commands);
 
@@ -2188,8 +2189,14 @@ impl Detector {
         });
         cpu_timer.mark("cpu-submit-and-wait-gpu");
 
-        let mut timing_report = cached.timings.summary(&self.device);
-        cpu_timer.mark("cpu-read-query-timings");
+        let timing_enabled = cached.timings.is_enabled();
+        let mut timing_report = if timing_enabled {
+            let report = cached.timings.summary(&self.device);
+            cpu_timer.mark("cpu-read-query-timings");
+            report
+        } else {
+            GpuTimingReport::default()
+        };
         let counters = cached
             .readback_counters
             .read(Self::CONTROL_COUNTER_WORD_COUNT);
@@ -2203,7 +2210,9 @@ impl Detector {
         );
         let decoded_tag_count_value = raw_decoded_tag_count.min(cached.max_quad_capacity_u32);
         if decoded_tag_count_value == 0 {
-            timing_report.prepend_cpu_spans(cpu_timer.into_spans());
+            if timing_enabled {
+                timing_report.prepend_cpu_spans(cpu_timer.into_spans());
+            }
             return DetectionOutput {
                 tags: Vec::new(),
                 timing: timing_report,
@@ -2217,7 +2226,9 @@ impl Detector {
         let tags =
             self.build_detected_tags_from_decoded_records(&decoded_words, decoded_tag_count_value);
         cpu_timer.mark("cpu-build-detected-tags");
-        timing_report.prepend_cpu_spans(cpu_timer.into_spans());
+        if timing_enabled {
+            timing_report.prepend_cpu_spans(cpu_timer.into_spans());
+        }
         DetectionOutput {
             tags,
             timing: timing_report,
@@ -2264,7 +2275,6 @@ impl Detector {
             self.new_u32_storage_buffer(blob_extent_capacity * blob_extent_words_per_extent);
         let filtered_blob_extent =
             self.new_u32_storage_buffer(blob_extent_capacity * blob_extent_words_per_extent);
-        let point_extent_indices = self.new_u32_storage_buffer(blob_diff_total_points_capacity);
 
         let selected_blob_point_words_per_point = 4usize;
         let selected_blob_point_capacity_u32 = blob_diff_total_points.max(1);
@@ -2346,7 +2356,11 @@ impl Detector {
             BufferMemory::HostRandomAccess,
         );
 
-        let timings = PipelineTimings::new(&self.device, 1024);
+        let timings = PipelineTimings::new(
+            &self.device,
+            1024,
+            self.settings.timing_mode == DetectionTimingMode::Detailed,
+        );
 
         let buffers = CachedDetectorBuffers {
             decimated_image: decimated_image.clone(),
@@ -2361,7 +2375,6 @@ impl Detector {
             blob_diff_sorted: blob_diff_sorted.clone(),
             blob_extent: blob_extent.clone(),
             filtered_blob_extent: filtered_blob_extent.clone(),
-            point_extent_indices: point_extent_indices.clone(),
             selected_blob_points: selected_blob_points.clone(),
             selected_blob_sorted_points: selected_blob_sorted_points.clone(),
             line_fit_points: line_fit_points.clone(),
@@ -2437,7 +2450,9 @@ impl Detector {
             input_gpu_image.image.descriptor(),
             aligned_size,
         )?;
-        output.timing.prepend_cpu_spans(cpu_timer.into_spans());
+        if self.settings.timing_mode == DetectionTimingMode::Detailed {
+            output.timing.prepend_cpu_spans(cpu_timer.into_spans());
+        }
         Ok(output)
     }
 
@@ -2475,7 +2490,9 @@ impl Detector {
         let cached = guard.as_mut().ok_or(DetectError::CacheBuildFailed)?;
         cpu_timer.mark("cpu-lock-cached-execution");
         let mut output = self.run_cached_execution(command_context, cached, input);
-        output.timing.prepend_cpu_spans(cpu_timer.into_spans());
+        if self.settings.timing_mode == DetectionTimingMode::Detailed {
+            output.timing.prepend_cpu_spans(cpu_timer.into_spans());
+        }
         Ok(output)
     }
 
